@@ -1,10 +1,13 @@
 """
 Plasticity rules operating on vectorized synapse arrays.
 
-- STDP (Spike-Timing Dependent Plasticity)
-- Reward-Modulated STDP (three-factor: STDP × dopamine)
-- Homeostatic plasticity (synaptic scaling)
-- Metaplasticity (BCM theory — plasticity of plasticity)
+- STDP (Spike-Timing Dependent Plasticity): event-driven. dw is computed
+  *only* on the step where pre or post just fired — not every step.
+- RewardModulatedSTDP: three-factor rule (STDP × dopamine). Dopamine
+  is per-target (region or projection), so reward signals can be
+  targeted at a specific pathway instead of flooding the whole brain.
+- HomeostaticPlasticity: synaptic scaling to maintain target firing rates.
+- Metaplasticity (BCM-inspired): shifts STDP thresholds with activity.
 """
 
 from __future__ import annotations
@@ -18,103 +21,166 @@ if TYPE_CHECKING:
 
 
 class STDP:
-    """Vectorized STDP across arrays of synapses."""
+    """Event-driven, vectorized STDP across arrays of synapses.
 
-    def __init__(self, learning_rate: float = 1.0):
-        self.learning_rate = learning_rate
-        self.stdp_window: float = 50.0
-        self.tau_plus: float = 20.0
-        self.tau_minus: float = 20.0
+    Nearest-neighbor implementation: at each call, weights (or eligibility)
+    are updated *only* for synapses whose pre or post neuron fired this
+    step. A pre→post spike pair contributes exactly once to LTP and once
+    to LTD as the events occur — not 50 times across the STDP window.
+    """
 
-    def apply_to_arrays(
+    def __init__(
         self,
-        pre_last_spike: np.ndarray,
-        post_last_spike: np.ndarray,
-        weights: np.ndarray,
+        learning_rate: float = 1.0,
+        stdp_window: float = 50.0,
+        tau_plus: float = 20.0,
+        tau_minus: float = 20.0,
+    ):
+        self.learning_rate = learning_rate
+        self.stdp_window = stdp_window
+        self.tau_plus = tau_plus
+        self.tau_minus = tau_minus
+
+    def apply_event(
+        self,
+        fired_pre: np.ndarray,            # bool [n_neurons_src]
+        fired_post: np.ndarray,           # bool [n_neurons_dst]
+        syn_pre: np.ndarray,              # int32 [n_syn]
+        syn_post: np.ndarray,             # int32 [n_syn]
+        pre_last_spike_arr: np.ndarray,   # float64 [n_neurons_src]
+        post_last_spike_arr: np.ndarray,  # float64 [n_neurons_dst]
         A_plus: np.ndarray,
         A_minus: np.ndarray,
         alive: np.ndarray,
+        weights: np.ndarray,
         min_weight: np.ndarray,
         max_weight: np.ndarray,
         current_time: float,
         eligibility: np.ndarray | None = None,
     ) -> int:
         """
-        Apply nearest-neighbor STDP to synapse arrays.
+        Apply nearest-neighbor STDP to synapses whose pre or post fired this step.
 
-        If eligibility is provided, dw is accumulated into the eligibility
-        trace instead of being applied directly (for reward-modulated STDP).
+        LTP arm: post just fired → look back at pre's last spike. dt >= 0 means
+        pre fired before post (causal) → potentiate.
+        LTD arm: pre just fired → look back at post's last spike. dt >= 0 means
+        post fired before pre (anti-causal) → depress.
+
+        If `eligibility` is given, dw is accumulated into the eligibility trace
+        (for reward-modulated STDP). Otherwise dw is applied directly to weights
+        and clipped to [min_weight, max_weight].
+
+        Returns the number of synapses that received a non-zero update.
         """
-        t_min = current_time - self.stdp_window
-        has_pre = pre_last_spike > t_min
-        has_post = post_last_spike > t_min
-        elig_mask = has_pre & has_post & alive
+        window = self.stdp_window
+        n_changes = 0
 
-        if not np.any(elig_mask):
-            return 0
+        # ── LTP arm: post fired this step ────────────────────────────
+        post_fired_syn = fired_post[syn_post] & alive
+        if np.any(post_fired_syn):
+            idx = np.where(post_fired_syn)[0]
+            dt = current_time - pre_last_spike_arr[syn_pre[idx]]
+            within = np.isfinite(dt) & (dt >= 0.0) & (dt < window)
+            if np.any(within):
+                sel = idx[within]
+                dw = A_plus[sel] * np.exp(-dt[within] / self.tau_plus) * self.learning_rate
+                if eligibility is not None:
+                    eligibility[sel] += dw
+                else:
+                    weights[sel] = np.clip(
+                        weights[sel] + dw, min_weight[sel], max_weight[sel],
+                    )
+                n_changes += int(sel.size)
 
-        dt = post_last_spike[elig_mask] - pre_last_spike[elig_mask]
-        within = np.abs(dt) < self.stdp_window
-        if not np.any(within):
-            return 0
+        # ── LTD arm: pre fired this step ─────────────────────────────
+        pre_fired_syn = fired_pre[syn_pre] & alive
+        if np.any(pre_fired_syn):
+            idx = np.where(pre_fired_syn)[0]
+            dt = current_time - post_last_spike_arr[syn_post[idx]]
+            within = np.isfinite(dt) & (dt >= 0.0) & (dt < window)
+            if np.any(within):
+                sel = idx[within]
+                dw = -A_minus[sel] * np.exp(-dt[within] / self.tau_minus) * self.learning_rate
+                if eligibility is not None:
+                    eligibility[sel] += dw
+                else:
+                    weights[sel] = np.clip(
+                        weights[sel] + dw, min_weight[sel], max_weight[sel],
+                    )
+                n_changes += int(sel.size)
 
-        idx = np.where(elig_mask)[0][within]
-        dt_w = dt[within] * self.learning_rate
-
-        dw = np.zeros(len(dt_w))
-        ltp = dt_w > 0
-        ltd = dt_w < 0
-        dw[ltp] = A_plus[idx[ltp]] * np.exp(-dt_w[ltp] / self.tau_plus)
-        dw[ltd] = -A_minus[idx[ltd]] * np.exp(dt_w[ltd] / self.tau_minus)
-
-        if eligibility is not None:
-            # Three-factor rule: accumulate into eligibility trace
-            eligibility[idx] += dw
-        else:
-            weights[idx] += dw
-            weights[idx] = np.clip(weights[idx], min_weight[idx], max_weight[idx])
-
-        return int(np.count_nonzero(dw))
+        return n_changes
 
 
 class RewardModulatedSTDP:
     """
-    Three-factor learning rule: STDP × neuromodulation.
+    Three-factor learning rule with per-target dopamine.
 
-    STDP computes a candidate weight change (dw) which is accumulated
-    into an eligibility trace per synapse. The trace decays over time.
-    When a reward (dopamine) or punishment signal arrives, the actual
-    weight change is: Δw = eligibility × dopamine_level.
+    STDP computes a candidate weight change (dw) which is accumulated into
+    an eligibility trace per synapse. When a reward (positive dopamine) or
+    punishment (negative dopamine) is delivered to a *specific target*
+    (a region's internal synapses, or one projection), the actual weight
+    change there is: Δw = eligibility × dopamine[target].
 
-    This implements the biological principle: "neurons that fire together
-    AND are rewarded, wire together."
+    Targets are strings:
+      - "region:<name>"             for a region's internal synapses
+      - "proj:<src>-><dst>"         for an inter-region projection
+
+    No global dopamine: reward signals must specify a target so credit
+    assignment stays sample-local.
     """
 
     def __init__(
         self,
-        tau_eligibility: float = 1000.0,
-        dopamine_decay: float = 0.995,
+        tau_eligibility: float = 200.0,
+        dopamine_decay: float = 0.5,
         baseline_dopamine: float = 0.0,
     ):
         self.tau_eligibility = tau_eligibility
         self.dopamine_decay = dopamine_decay
         self.baseline_dopamine = baseline_dopamine
-        self.dopamine_level: float = baseline_dopamine
-
+        self.dopamine: dict[str, float] = {}
         self._stdp = STDP()
 
-    def reward(self, amount: float = 1.0) -> None:
-        """Deliver a reward signal (positive dopamine burst)."""
-        self.dopamine_level += amount
+    # ── External reinforcement signals ───────────────────────────────
 
-    def punish(self, amount: float = 0.5) -> None:
-        """Deliver a punishment signal (dopamine dip below baseline)."""
-        self.dopamine_level -= amount
+    def reward(self, amount: float, target: str) -> None:
+        """Deliver a positive dopamine pulse to `target`."""
+        if not target:
+            raise ValueError(
+                "reward() requires an explicit target "
+                "(e.g. 'region:motor' or 'proj:cortex->motor')"
+            )
+        self.dopamine[target] = (
+            self.dopamine.get(target, self.baseline_dopamine) + amount
+        )
 
-    def apply_to_arrays(
+    def punish(self, amount: float, target: str) -> None:
+        """Deliver a negative dopamine dip to `target`."""
+        if not target:
+            raise ValueError(
+                "punish() requires an explicit target "
+                "(e.g. 'region:motor' or 'proj:cortex->motor')"
+            )
+        self.dopamine[target] = (
+            self.dopamine.get(target, self.baseline_dopamine) - amount
+        )
+
+    def get(self, target: str) -> float:
+        """Current dopamine level at `target` (baseline if unseen)."""
+        return self.dopamine.get(target, self.baseline_dopamine)
+
+    # ── Per-step plasticity application ──────────────────────────────
+
+    def apply_target(
         self,
-        pre_last_spike: np.ndarray,
-        post_last_spike: np.ndarray,
+        target: str,
+        fired_pre: np.ndarray,
+        fired_post: np.ndarray,
+        syn_pre: np.ndarray,
+        syn_post: np.ndarray,
+        pre_last_spike_arr: np.ndarray,
+        post_last_spike_arr: np.ndarray,
         weights: np.ndarray,
         A_plus: np.ndarray,
         A_minus: np.ndarray,
@@ -125,38 +191,47 @@ class RewardModulatedSTDP:
         current_time: float,
     ) -> int:
         """
-        1. Compute STDP dw and accumulate into eligibility trace
-        2. Decay eligibility trace
-        3. Apply eligibility × dopamine to weights
-        4. Decay dopamine toward baseline
+        Single-step plasticity for a set of synapses identified by `target`:
+          1. Event-driven STDP → accumulate into eligibility
+          2. Decay eligibility toward 0
+          3. If |dopamine[target]| > eps: weights += eligibility × dopamine
+          4. Decay dopamine[target] toward baseline
         """
-        n = len(weights)
-
-        # Step 1: STDP → eligibility (not directly to weights)
-        changes = self._stdp.apply_to_arrays(
-            pre_last_spike, post_last_spike,
-            weights, A_plus, A_minus, alive,
-            min_weight, max_weight, current_time,
+        # 1. STDP into eligibility
+        changes = self._stdp.apply_event(
+            fired_pre, fired_post,
+            syn_pre, syn_post,
+            pre_last_spike_arr, post_last_spike_arr,
+            A_plus, A_minus, alive,
+            weights, min_weight, max_weight,
+            current_time,
             eligibility=eligibility,
         )
 
-        # Step 2: Decay eligibility trace
-        decay = np.exp(-1.0 / self.tau_eligibility)
-        eligibility[:n] *= decay
+        # 2. Decay eligibility (single vectorized multiply)
+        eligibility *= np.exp(-1.0 / self.tau_eligibility)
 
-        # Step 3: Apply eligibility × dopamine to weights
-        if abs(self.dopamine_level) > 1e-6:
-            dw = eligibility[:n] * self.dopamine_level
+        # 3. Apply eligibility × dopamine if this target has non-baseline dopamine
+        da = self.dopamine.get(target, self.baseline_dopamine)
+        if abs(da - self.baseline_dopamine) > 1e-6:
+            dw = eligibility * da
             mask = alive & (np.abs(dw) > 1e-8)
             if np.any(mask):
-                weights[mask] += dw[mask]
-                weights[:n] = np.clip(weights[:n], min_weight[:n], max_weight[:n])
+                weights[mask] = np.clip(
+                    weights[mask] + dw[mask], min_weight[mask], max_weight[mask],
+                )
 
-        # Step 4: Decay dopamine toward baseline
-        self.dopamine_level = (
-            self.baseline_dopamine
-            + (self.dopamine_level - self.baseline_dopamine) * self.dopamine_decay
-        )
+        # 4. Decay dopamine[target] toward baseline
+        if target in self.dopamine:
+            new_level = (
+                self.baseline_dopamine
+                + (self.dopamine[target] - self.baseline_dopamine) * self.dopamine_decay
+            )
+            # Prune entries that have effectively settled — keeps the dict small.
+            if abs(new_level - self.baseline_dopamine) < 1e-9:
+                del self.dopamine[target]
+            else:
+                self.dopamine[target] = new_level
 
         return changes
 

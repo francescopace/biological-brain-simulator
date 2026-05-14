@@ -31,7 +31,7 @@ from .oscillator import FrequencyBand
 from .region import MAX_DELAY_STEPS, Region, RegionType, _SYN_SPECS
 from .stimulus import EncodingStrategy
 
-_VERSION = 2
+_VERSION = 3
 
 
 def save_brain(brain: Brain, path: str | Path) -> None:
@@ -106,7 +106,7 @@ def save_brain(brain: Brain, path: str | Path) -> None:
             "tau_eligibility": brain.reward_stdp.tau_eligibility,
             "dopamine_decay": brain.reward_stdp.dopamine_decay,
             "baseline_dopamine": brain.reward_stdp.baseline_dopamine,
-            "dopamine_level": brain.reward_stdp.dopamine_level,
+            "dopamine": dict(brain.reward_stdp.dopamine),
         },
         "homeostasis": {
             "target_rate": brain.homeostasis.target_rate,
@@ -210,7 +210,7 @@ def load_brain(path: str | Path) -> Brain:
     brain.reward_stdp.tau_eligibility = sub["reward_stdp"]["tau_eligibility"]
     brain.reward_stdp.dopamine_decay = sub["reward_stdp"]["dopamine_decay"]
     brain.reward_stdp.baseline_dopamine = sub["reward_stdp"]["baseline_dopamine"]
-    brain.reward_stdp.dopamine_level = sub["reward_stdp"]["dopamine_level"]
+    brain.reward_stdp.dopamine = dict(sub["reward_stdp"]["dopamine"])
 
     brain.homeostasis.target_rate = sub["homeostasis"]["target_rate"]
     brain.homeostasis.scaling_rate = sub["homeostasis"]["scaling_rate"]

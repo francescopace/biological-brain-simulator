@@ -213,19 +213,35 @@ class Brain:
         region = self.regions[region_name]
         return self.encoder.encode(values, region, self.time)
 
-    # ── Reward / Punishment (dopamine) ─────────────────────────────
+    # ── Reward / Punishment (per-target dopamine) ──────────────────
 
-    def reward(self, amount: float = 1.0) -> None:
-        """Deliver a reward signal — dopamine burst that consolidates recent STDP."""
-        self.reward_stdp.reward(amount)
+    def reward(self, amount: float, target: str) -> None:
+        """Deliver a dopamine pulse to a specific target.
 
-    def punish(self, amount: float = 0.5) -> None:
-        """Deliver a punishment signal — dopamine dip that reverses recent STDP."""
-        self.reward_stdp.punish(amount)
+        Target syntax:
+          - "region:<name>"        for a region's internal synapses
+          - "proj:<src>-><dst>"    for an inter-region projection
 
-    @property
-    def dopamine_level(self) -> float:
-        return self.reward_stdp.dopamine_level
+        Use Brain.region_target(name) and Brain.projection_target(src, dst)
+        to build target strings without typos.
+        """
+        self.reward_stdp.reward(amount, target)
+
+    def punish(self, amount: float, target: str) -> None:
+        """Deliver a dopamine dip to a specific target. See `reward()` for syntax."""
+        self.reward_stdp.punish(amount, target)
+
+    def dopamine(self, target: str) -> float:
+        """Current dopamine level at `target` (baseline if unseen)."""
+        return self.reward_stdp.get(target)
+
+    @staticmethod
+    def region_target(name: str) -> str:
+        return f"region:{name}"
+
+    @staticmethod
+    def projection_target(source: str, target: str) -> str:
+        return f"proj:{source}->{target}"
 
     def inject_current(
         self,
@@ -295,43 +311,55 @@ class Brain:
                 posts = proj.syn_post[active]
                 np.add.at(target.spike_buffer, (slots, posts), effective)
 
-        # 5. Reward-Modulated STDP on region-internal synapses
-        #    STDP computes dw → eligibility trace; dopamine converts to weight change
-        for region in self.regions.values():
+        # 5. Event-driven R-STDP on region-internal synapses.
+        #    Each region's own `fired` array drives STDP computations; the
+        #    eligibility trace then waits for dopamine targeted at this region.
+        for name, region in self.regions.items():
             ns = region.n_synapses
             if ns == 0:
                 continue
-            self.reward_stdp.apply_to_arrays(
-                region.last_spike_time[region.syn_pre[:ns]],
-                region.last_spike_time[region.syn_post[:ns]],
-                region.syn_weight[:ns],
-                region.syn_A_plus[:ns],
-                region.syn_A_minus[:ns],
-                region.syn_alive[:ns],
-                region.syn_min_weight[:ns],
-                region.syn_max_weight[:ns],
-                region.syn_eligibility[:ns],
-                self.time,
+            n = region.n_neurons
+            self.reward_stdp.apply_target(
+                target=self.region_target(name),
+                fired_pre=region.fired[:n],
+                fired_post=region.fired[:n],
+                syn_pre=region.syn_pre[:ns],
+                syn_post=region.syn_post[:ns],
+                pre_last_spike_arr=region.last_spike_time[:n],
+                post_last_spike_arr=region.last_spike_time[:n],
+                weights=region.syn_weight[:ns],
+                A_plus=region.syn_A_plus[:ns],
+                A_minus=region.syn_A_minus[:ns],
+                alive=region.syn_alive[:ns],
+                min_weight=region.syn_min_weight[:ns],
+                max_weight=region.syn_max_weight[:ns],
+                eligibility=region.syn_eligibility[:ns],
+                current_time=self.time,
             )
 
-        # 6. Reward-Modulated STDP on projections
+        # 6. Event-driven R-STDP on inter-region projections.
         for proj in self.projections:
             ns = proj.n_synapses
             if ns == 0:
                 continue
             source = self.regions[proj.source_name]
-            target = self.regions[proj.target_name]
-            self.reward_stdp.apply_to_arrays(
-                source.last_spike_time[proj.syn_pre[:ns]],
-                target.last_spike_time[proj.syn_post[:ns]],
-                proj.syn_weight[:ns],
-                proj.syn_A_plus[:ns],
-                proj.syn_A_minus[:ns],
-                proj.syn_alive[:ns],
-                proj.syn_min_weight[:ns],
-                proj.syn_max_weight[:ns],
-                proj.syn_eligibility[:ns],
-                self.time,
+            target_region = self.regions[proj.target_name]
+            self.reward_stdp.apply_target(
+                target=self.projection_target(proj.source_name, proj.target_name),
+                fired_pre=source.fired[:source.n_neurons],
+                fired_post=target_region.fired[:target_region.n_neurons],
+                syn_pre=proj.syn_pre[:ns],
+                syn_post=proj.syn_post[:ns],
+                pre_last_spike_arr=source.last_spike_time[:source.n_neurons],
+                post_last_spike_arr=target_region.last_spike_time[:target_region.n_neurons],
+                weights=proj.syn_weight[:ns],
+                A_plus=proj.syn_A_plus[:ns],
+                A_minus=proj.syn_A_minus[:ns],
+                alive=proj.syn_alive[:ns],
+                min_weight=proj.syn_min_weight[:ns],
+                max_weight=proj.syn_max_weight[:ns],
+                eligibility=proj.syn_eligibility[:ns],
+                current_time=self.time,
             )
 
         # 7. Homeostatic plasticity
