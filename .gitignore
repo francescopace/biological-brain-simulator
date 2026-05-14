@@ -53,3 +53,6 @@ brain_checkpoint/
 
 # Cursor
 .cursor/
+
+# Datasets
+.sklearn_data/

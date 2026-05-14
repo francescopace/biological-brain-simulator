@@ -133,8 +133,15 @@ Three candidates, each testing a different capability. Pick based on Step 1 resu
 
 **Goal**: The definitive SNN benchmark. Only attempt after Steps 1-2 work and performance is optimized.
 
+**Current status**: an initial prototype exists in `examples/mnist_prototype.py`.
+It uses real MNIST, but on a reduced binary task (`0` vs `1`) with
+`28x28 -> 14x14` downsampling, unsupervised STDP on `input->cortex`, and a
+simple neuron-label readout. Best reduced smoke test reached roughly **70%**
+accuracy on a tiny split: good enough to validate the pipeline, not yet good
+enough to count as the full Step 3 benchmark.
+
 **Prerequisites**:
-- Optimize the Python simulation loop (vectorize remaining per-neuron loops in homeostasis/metaplasticity)
+- Optimize the Python simulation loop (vectorize remaining per-neuron loops in homeostasis/metaplasticity) — partially addressed
 - Consider sparse matrix representation for synaptic connectivity
 - Profile and eliminate bottlenecks — MNIST needs ~1200 neurons and ~100k synapses running for thousands of training images
 
@@ -154,6 +161,18 @@ Three candidates, each testing a different capability. Pick based on Step 1 resu
 - Scalability of the simulator
 - STDP alone can learn useful representations (no reward needed)
 - The network self-organizes digit-specific receptive fields
+
+**What is already validated by the prototype**:
+- true-image dataset loading and preprocessing
+- unsupervised feedforward STDP in a reduced image task
+- post-hoc readout from excitatory association neurons
+- rough computational feasibility of a small MNIST-like setup
+
+**What still blocks the full benchmark**:
+- stronger winner-take-all / competition so cortex neurons specialize more evenly
+- a more stable readout than the current simple neuron-label vote
+- extension from binary MNIST to 10 classes
+- profiling at the intended `784 + 400 + 400` scale
 
 **Target**: >90% accuracy (Diehl & Cook 2015 achieved 95% with 6400 excitatory neurons, 87% with 400).
 

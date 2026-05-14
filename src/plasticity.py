@@ -261,25 +261,33 @@ class HomeostaticPlasticity:
             if n == 0 or ns == 0:
                 continue
 
+            syn = slice(0, ns)
+            post_idx = region.syn_post[syn]
+            valid_post = post_idx < n
+            alive_syn = region.syn_alive[syn]
+            if not np.any(alive_syn & valid_post):
+                continue
+
             activity = region.activity[:n]
             alive_n = region.neuron_alive[:n]
             target = self.target_rate * 0.001
+            mask = alive_syn & valid_post & alive_n[post_idx]
+            if not np.any(mask):
+                continue
 
-            for i in range(n):
-                if not alive_n[i]:
-                    continue
-                rate = activity[i]
-                ratio = target / max(rate, 0.001)
-                scale = 1.0 + self.scaling_rate * (ratio - 1.0)
-                scale = np.clip(scale, 0.95, 1.05)
+            weights = region.syn_weight[syn]
+            min_weight = region.syn_min_weight[syn]
+            max_weight = region.syn_max_weight[syn]
+            post_rate = np.maximum(activity[post_idx], 0.001)
+            ratio = target / post_rate
+            scale = np.clip(1.0 + self.scaling_rate * (ratio - 1.0), 0.95, 1.05)
 
-                mask = (region.syn_post[:ns] == i) & region.syn_alive[:ns]
-                region.syn_weight[:ns][mask] *= scale
-                region.syn_weight[:ns][mask] = np.clip(
-                    region.syn_weight[:ns][mask],
-                    region.syn_min_weight[:ns][mask],
-                    region.syn_max_weight[:ns][mask],
-                )
+            weights[mask] *= scale[mask]
+            weights[mask] = np.clip(
+                weights[mask],
+                min_weight[mask],
+                max_weight[mask],
+            )
 
 
 class Metaplasticity:
@@ -295,18 +303,23 @@ class Metaplasticity:
             if n == 0 or ns == 0:
                 continue
 
-            activity = region.activity[:n]
+            syn = slice(0, ns)
+            post_idx = region.syn_post[syn]
+            valid_post = post_idx < n
+            alive_syn = region.syn_alive[syn]
+            alive_post = region.neuron_alive[:n]
+            mask = alive_syn & valid_post & alive_post[post_idx]
+            if not np.any(mask):
+                continue
 
-            for i in range(n):
-                if not region.neuron_alive[i]:
-                    continue
-                rate = activity[i]
-                mask = (region.syn_post[:ns] == i) & region.syn_alive[:ns]
-                if not np.any(mask):
-                    continue
-                region.syn_A_plus[:ns][mask] = np.maximum(
-                    0.001, 0.01 - self.adaptation_rate * rate
-                )
-                region.syn_A_minus[:ns][mask] = np.maximum(
-                    0.001, 0.012 + self.adaptation_rate * rate * 0.5
-                )
+            rate = region.activity[:n][post_idx]
+            A_plus = region.syn_A_plus[syn]
+            A_minus = region.syn_A_minus[syn]
+            A_plus[mask] = np.maximum(
+                0.001,
+                0.01 - self.adaptation_rate * rate[mask],
+            )
+            A_minus[mask] = np.maximum(
+                0.001,
+                0.012 + self.adaptation_rate * rate[mask] * 0.5,
+            )

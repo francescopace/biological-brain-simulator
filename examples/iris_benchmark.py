@@ -6,7 +6,7 @@ using spike-timing dependent plasticity modulated by dopamine (R-STDP),
 not gradient descent.
 
 Architecture:
-    input (40 sensory neurons, 10 per feature, place-field encoded)
+    input (80 sensory neurons, 20 per feature, place-field encoded)
         ↓ density 0.5           ↓ density 0.9 (readout, R-STDP)
     cortex (80 association)     motor (3 chattering, one per class)
         ↓ density 0.8 (frozen)   ↑ lateral inhibition (GABA)

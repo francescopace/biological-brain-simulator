@@ -1,4 +1,4 @@
-# Brain — Biological Brain Simulator
+# Biological Brain Simulator
 
 A simulator that reproduces the fundamental mechanisms of the human brain: spiking neurons, synapses that strengthen or weaken with use, new connections forming and old ones dying. This is not machine learning — it is a biological simulation.
 
@@ -35,18 +35,24 @@ The brain starts small and grows organically as it receives input, forming new n
 
 ## Quickstart
 
+**Requirements:** Python >= 3.10, plus numpy, matplotlib, networkx, scikit-learn (all pinned in `requirements.txt`).
+
 ```bash
 pip install -r requirements.txt
+
+# Run from the project root
 python examples/learn_association.py
 python examples/growing_brain.py
-python examples/iris_benchmark.py   # classification benchmark (needs scikit-learn)
+python examples/iris_benchmark.py      # classification benchmark
 python examples/grid_nav_benchmark.py  # grid navigation benchmark
+python examples/mnist_prototype.py     # reduced MNIST prototype
 ```
 
 ## Project structure
 
 ```
 src/
+├── __init__.py      # Public API re-exports
 ├── neuron.py        # Neuron types and Izhikevich parameters
 ├── synapse.py       # Neurotransmitter types and properties
 ├── region.py        # Brain region (vectorized NumPy arrays)
@@ -63,7 +69,10 @@ examples/
 ├── learn_association.py   # Pavlovian conditioning with spiking neurons
 ├── growing_brain.py       # A brain that grows from scratch
 ├── iris_benchmark.py      # Iris classification with R-STDP (86.7% accuracy)
-└── grid_nav_benchmark.py  # Grid navigation with R-STDP (100% success, 4.38 steps)
+├── grid_nav_benchmark.py  # Grid navigation with R-STDP (100% success, 4.38 steps)
+└── mnist_prototype.py     # Reduced MNIST prototype for unsupervised STDP/readout
+
+BENCHMARKS.md              # Detailed benchmark results and methodology
 ```
 
 ## Usage
@@ -73,12 +82,14 @@ from src.brain import Brain
 from src.region import RegionType
 from src.persistence import save_brain, load_brain
 
-brain = Brain(dt=1.0)
+brain = Brain(dt=1.0, seed=42)
 
-# Create regions (start small)
+# Available region types: SENSORY, ASSOCIATION, MEMORY, MOTOR, REWARD
 brain.add_region("input", RegionType.SENSORY, n_neurons=50)
 brain.add_region("cortex", RegionType.ASSOCIATION, n_neurons=200)
+brain.add_region("output", RegionType.MOTOR, n_neurons=10)
 brain.connect_regions("input", "cortex", density=0.1)
+brain.connect_regions("cortex", "output", density=0.1)
 
 # Enable multi-compartment neuron morphology (optional)
 brain.regions["cortex"].enable_morphology()
@@ -87,7 +98,9 @@ brain.regions["cortex"].enable_morphology()
 for step in range(10000):
     brain.stimulate("input", [0.8, 0.3, 0.5])
     if step == 5000:
-        brain.reward(2.0, target="proj:input->cortex")  # dopamine on specific pathway
+        brain.reward(2.0, target="proj:input->cortex")
+    if step == 7000:
+        brain.punish(1.0, target="proj:cortex->output")
     brain.step()
 
 # The brain has grown
@@ -115,6 +128,7 @@ The current configuration uses:
 
 With the current settings, the benchmark reaches **86.7% test accuracy**
 on Iris, with a best checkpoint of **90.0%** during training.
+See [BENCHMARKS.md](BENCHMARKS.md) for detailed results and methodology.
 
 ## Grid Navigation Benchmark
 
@@ -133,7 +147,44 @@ with **4.38 mean steps-to-goal** over held-out evaluation rollouts
 One important caveat: the synapses learn the policy through fully spiking
 R-STDP, but action selection is decoded from the learned `input->motor`
 weights because raw motor spike argmax was too noisy for stable control.
+See [BENCHMARKS.md](BENCHMARKS.md) for detailed results and methodology.
+
+## Reduced MNIST Prototype
+
+`examples/mnist_prototype.py` is the first Phase 3 stepping stone. It is
+not the full MNIST benchmark yet; instead it validates the end-to-end
+unsupervised workflow on a much smaller setup:
+
+- real MNIST loaded from OpenML
+- binary task (`0` vs `1`)
+- `28x28 -> 14x14` downsampling (`196` input neurons)
+- unsupervised STDP on `input->cortex`
+- simple neuron-label readout over excitatory cortex neurons
+
+The prototype currently learns above chance and reached about **70%**
+accuracy in the best reduced smoke test, which is enough to validate the
+dataset plumbing and the STDP/readout loop, but not enough to claim Phase 3
+is solved.
+
+The main remaining work is improving competitive self-organization and
+readout stability so the same approach can scale from binary MNIST to the
+planned 10-class benchmark.
 
 ## Performance
 
-All neuron and synapse computations are vectorized with NumPy dense arrays. A single `Region.step()` call advances thousands of neurons in parallel rather than looping over individual Python objects. Typical speedup: **5-10x** over the object-based approach.
+All neuron and synapse state lives in dense NumPy arrays (structure-of-arrays layout). A single `Region.step()` call advances thousands of neurons in parallel rather than looping over individual Python objects.
+
+Key techniques:
+
+- **Vectorized Izhikevich integration** with configurable sub-stepping (`dt / 0.5`)
+- **Ring buffer** for spike delays — `np.add.at` deposits postsynaptic currents into future slots; each timestep reads and clears the current slot
+- **Event-driven STDP** — nearest-neighbor pairing updates only synapses whose pre or post neuron fired this step, not the entire weight matrix every timestep
+- **Sparse-like propagation** — synapses are stored as COO-style parallel arrays; spike delivery filters on `fired[syn_pre]` so only active synapses are touched
+- **Pre-allocated neuron arrays** up to `max_neurons`; synapse arrays grow via capacity-doubling when needed
+- **Dead flags** (`syn_alive`, `neuron_alive`) for pruning and apoptosis — no costly array compaction
+
+Current limitations: synaptogenesis pair enumeration and pattern completion still use Python loops, which become the bottleneck at large network sizes. See the MNIST roadmap in [BENCHMARKS.md](BENCHMARKS.md) for planned optimizations (sparse connectivity, loop vectorization, profiling).
+
+## License
+
+This project is licensed under the [MIT License](LICENSE).
