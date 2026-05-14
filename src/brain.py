@@ -1,0 +1,475 @@
+"""
+The Brain: top-level orchestrator with vectorized simulation.
+
+Inter-region connections are stored as Projection objects with the
+same array layout as Region internal synapses. Spike delivery
+uses the target region's ring buffer for delay handling.
+"""
+
+from __future__ import annotations
+
+import json
+import time as wall_time
+from dataclasses import dataclass, field
+from pathlib import Path
+
+import numpy as np
+
+from .growth import GrowthController, GrowthStats
+from .memory import MemorySystem
+from .neuron import NeuronType
+from .oscillator import OscillatorBank
+from .plasticity import STDP, HomeostaticPlasticity, Metaplasticity, RewardModulatedSTDP
+from .region import (
+    MAX_DELAY_STEPS,
+    Region,
+    RegionType,
+    _DEPLETION_RATE,
+    _RECOVERY_RATE,
+    _SYN_SPECS,
+    _TRANSMISSION_DECAY,
+)
+from .stimulus import EncodingStrategy, StimulusEncoder
+from .synapse import NT_PROPERTIES, NeurotransmitterType
+
+
+# ── Inter-region projection ─────────────────────────────────────────
+
+class Projection:
+    """Synapse arrays connecting a source region to a target region."""
+
+    def __init__(self, source_name: str, target_name: str):
+        self.source_name = source_name
+        self.target_name = target_name
+        self.n_synapses: int = 0
+        self._syn_capacity: int = 0
+        self._alloc(256)
+
+    def _alloc(self, capacity: int) -> None:
+        self._syn_capacity = capacity
+        for attr, dtype, default in _SYN_SPECS:
+            setattr(self, attr, np.full(capacity, default, dtype=dtype))
+
+    def _ensure_capacity(self, additional: int) -> None:
+        needed = self.n_synapses + additional
+        if needed <= self._syn_capacity:
+            return
+        new_cap = max(self._syn_capacity * 2, needed)
+        for attr, dtype, default in _SYN_SPECS:
+            old = getattr(self, attr)
+            new = np.full(new_cap, default, dtype=dtype)
+            new[:self.n_synapses] = old[:self.n_synapses]
+            setattr(self, attr, new)
+        self._syn_capacity = new_cap
+
+
+# ── Brain stats ──────────────────────────────────────────────────────
+
+@dataclass
+class BrainStats:
+    time: float
+    total_neurons: int
+    total_synapses: int
+    total_spikes: int
+    regions: dict[str, dict]
+    growth: GrowthStats | None = None
+
+
+# ── Brain ────────────────────────────────────────────────────────────
+
+class Brain:
+    """
+    Vectorized biological brain simulator.
+
+    Usage:
+        brain = Brain()
+        brain.add_region("visual", RegionType.SENSORY, n_neurons=50)
+        brain.add_region("cortex", RegionType.ASSOCIATION, n_neurons=100)
+        brain.connect_regions("visual", "cortex", density=0.05)
+
+        for step in range(10000):
+            brain.stimulate("visual", [0.8, 0.2, 0.5])
+            brain.step()
+    """
+
+    def __init__(self, dt: float = 1.0, seed: int | None = None):
+        self.dt = dt
+        self.time: float = 0.0
+        self.step_count: int = 0
+
+        self.regions: dict[str, Region] = {}
+        self.projections: list[Projection] = []
+
+        self.stdp = STDP()
+        self.reward_stdp = RewardModulatedSTDP()
+        self.homeostasis = HomeostaticPlasticity()
+        self.metaplasticity = Metaplasticity()
+        self.growth = GrowthController()
+        self.memory = MemorySystem()
+        self.encoder = StimulusEncoder(strategy=EncodingStrategy.RATE)
+        self.oscillators = OscillatorBank()
+
+        self.stats_history: list[BrainStats] = []
+        self._stats_interval = 500
+
+        self._rng = np.random.default_rng(seed)
+
+    # ── Region management ────────────────────────────────────────────
+
+    def add_region(
+        self,
+        name: str,
+        region_type: RegionType,
+        n_neurons: int = 50,
+        connectivity: float = 0.1,
+        max_neurons: int = 1000,
+    ) -> Region:
+        region = Region(name, region_type, max_neurons, dt=self.dt)
+        region.populate(n_neurons, connectivity)
+        self.regions[name] = region
+        self.oscillators.add_region(name, region_type)
+        return region
+
+    def connect_regions(
+        self,
+        source: str,
+        target: str,
+        density: float = 0.05,
+        bidirectional: bool = False,
+        nt: NeurotransmitterType = NeurotransmitterType.GLUTAMATE,
+    ) -> int:
+        src = self.regions[source]
+        tgt = self.regions[target]
+        proj = Projection(source, target)
+
+        src_n = src.n_neurons
+        tgt_n = tgt.n_neurons
+
+        # Only excitatory neurons project long-range
+        exc_mask = src.neuron_type[:src_n] == NeuronType.EXCITATORY
+        exc_idx = np.where(exc_mask)[0]
+
+        if len(exc_idx) == 0 or tgt_n == 0:
+            self.projections.append(proj)
+            if bidirectional:
+                return self.connect_regions(target, source, density, False, nt)
+            return 0
+
+        # Vectorized connection generation
+        conn = self._rng.random((len(exc_idx), tgt_n)) < density
+        pre_local, post_idx = np.where(conn)
+        pre_idx = exc_idx[pre_local]
+
+        if len(pre_idx) == 0:
+            self.projections.append(proj)
+            if bidirectional:
+                return self.connect_regions(target, source, density, False, nt)
+            return 0
+
+        count = len(pre_idx)
+        proj._ensure_capacity(count)
+        s = proj.n_synapses
+        e = s + count
+
+        sign, mod = NT_PROPERTIES[nt]
+        weights = self._rng.exponential(0.3, size=count)
+        if sign < 0:
+            weights = -weights
+        delays_ms = self._rng.uniform(3.0, 15.0, size=count)
+        delay_steps = np.clip(
+            np.round(delays_ms / self.dt).astype(np.int32),
+            1, MAX_DELAY_STEPS - 1,
+        )
+
+        proj.syn_pre[s:e] = pre_idx
+        proj.syn_post[s:e] = post_idx
+        proj.syn_weight[s:e] = weights
+        proj.syn_delay[s:e] = delay_steps
+        proj.syn_modulation[s:e] = mod
+        proj.syn_resource[s:e] = 1.0
+        proj.syn_facilitation[s:e] = 0.0
+        proj.syn_alive[s:e] = True
+        proj.syn_max_weight[s:e] = 0.0 if sign < 0 else 10.0
+        proj.syn_min_weight[s:e] = -10.0 if sign < 0 else 0.0
+        proj.syn_A_plus[s:e] = 0.01
+        proj.syn_A_minus[s:e] = 0.012
+        proj.n_synapses = e
+
+        self.projections.append(proj)
+        created = count
+
+        if bidirectional:
+            created += self.connect_regions(target, source, density, False, nt)
+
+        return created
+
+    # ── Stimulation ──────────────────────────────────────────────────
+
+    def stimulate(
+        self,
+        region_name: str,
+        values: list[float] | np.ndarray,
+    ) -> int:
+        region = self.regions[region_name]
+        return self.encoder.encode(values, region, self.time)
+
+    # ── Reward / Punishment (dopamine) ─────────────────────────────
+
+    def reward(self, amount: float = 1.0) -> None:
+        """Deliver a reward signal — dopamine burst that consolidates recent STDP."""
+        self.reward_stdp.reward(amount)
+
+    def punish(self, amount: float = 0.5) -> None:
+        """Deliver a punishment signal — dopamine dip that reverses recent STDP."""
+        self.reward_stdp.punish(amount)
+
+    @property
+    def dopamine_level(self) -> float:
+        return self.reward_stdp.dopamine_level
+
+    def inject_current(
+        self,
+        region_name: str,
+        neuron_indices: list[int] | np.ndarray,
+        current: float,
+    ) -> None:
+        region = self.regions[region_name]
+        idx = np.asarray(neuron_indices)
+        valid = idx < region.n_neurons
+        region.current[idx[valid]] += current
+
+    # ── Simulation step ──────────────────────────────────────────────
+
+    def step(self) -> dict[str, np.ndarray]:
+        self.time += self.dt
+        self.step_count += 1
+
+        # 1. Projection housekeeping (STP recovery for inter-region synapses)
+        for proj in self.projections:
+            ns = proj.n_synapses
+            if ns == 0:
+                continue
+            s = slice(0, ns)
+            proj.syn_resource[s] = np.minimum(1.0, proj.syn_resource[s] + _RECOVERY_RATE)
+            proj.syn_facilitation[s] *= 0.98
+            proj.syn_age[s] += 1
+            proj.syn_recent[s] *= _TRANSMISSION_DECAY
+
+        # 2. Inject oscillatory background currents
+        osc_currents = self.oscillators.step(self.dt)
+        for name, osc_current in osc_currents.items():
+            region = self.regions.get(name)
+            if region is not None and region.n_neurons > 0:
+                region.current[:region.n_neurons] += osc_current
+
+        # 3. Step each region (reads buffer, integrates, propagates internal)
+        all_fired: dict[str, np.ndarray] = {}
+        for name, region in self.regions.items():
+            fired = region.step(self.time, self.step_count)
+            all_fired[name] = fired
+
+        # 4. Propagate spikes through inter-region projections
+        for proj in self.projections:
+            ns = proj.n_synapses
+            if ns == 0:
+                continue
+
+            source = self.regions[proj.source_name]
+            target = self.regions[proj.target_name]
+
+            pre_fired = source.fired[proj.syn_pre[:ns]] & proj.syn_alive[:ns]
+            active = np.where(pre_fired)[0]
+
+            if len(active) > 0:
+                res = proj.syn_resource[active]
+                fac = proj.syn_facilitation[active]
+                mod = proj.syn_modulation[active]
+                effective = proj.syn_weight[active] * res * (1.0 + fac) * mod
+
+                proj.syn_resource[active] = np.maximum(0.0, res - _DEPLETION_RATE)
+                proj.syn_facilitation[active] += 0.05
+                proj.syn_total_tx[active] += 1
+                proj.syn_recent[active] += 1.0
+
+                slots = (self.step_count + proj.syn_delay[active]) % MAX_DELAY_STEPS
+                posts = proj.syn_post[active]
+                np.add.at(target.spike_buffer, (slots, posts), effective)
+
+        # 5. Reward-Modulated STDP on region-internal synapses
+        #    STDP computes dw → eligibility trace; dopamine converts to weight change
+        for region in self.regions.values():
+            ns = region.n_synapses
+            if ns == 0:
+                continue
+            self.reward_stdp.apply_to_arrays(
+                region.last_spike_time[region.syn_pre[:ns]],
+                region.last_spike_time[region.syn_post[:ns]],
+                region.syn_weight[:ns],
+                region.syn_A_plus[:ns],
+                region.syn_A_minus[:ns],
+                region.syn_alive[:ns],
+                region.syn_min_weight[:ns],
+                region.syn_max_weight[:ns],
+                region.syn_eligibility[:ns],
+                self.time,
+            )
+
+        # 6. Reward-Modulated STDP on projections
+        for proj in self.projections:
+            ns = proj.n_synapses
+            if ns == 0:
+                continue
+            source = self.regions[proj.source_name]
+            target = self.regions[proj.target_name]
+            self.reward_stdp.apply_to_arrays(
+                source.last_spike_time[proj.syn_pre[:ns]],
+                target.last_spike_time[proj.syn_post[:ns]],
+                proj.syn_weight[:ns],
+                proj.syn_A_plus[:ns],
+                proj.syn_A_minus[:ns],
+                proj.syn_alive[:ns],
+                proj.syn_min_weight[:ns],
+                proj.syn_max_weight[:ns],
+                proj.syn_eligibility[:ns],
+                self.time,
+            )
+
+        # 7. Homeostatic plasticity
+        self.homeostasis.apply(list(self.regions.values()), self.time)
+
+        # 8. Metaplasticity
+        self.metaplasticity.update_thresholds(list(self.regions.values()), self.time)
+
+        # 9. Growth / pruning
+        self.growth.step(list(self.regions.values()))
+
+        # 10. Memory consolidation
+        self.memory.consolidate(self.regions, self.time)
+
+        # 11. Auto-capture memory traces
+        for region in self.regions.values():
+            if region.mean_activity > 0.1:
+                self.memory.capture_trace(region, self.time)
+
+        # 12. Stats
+        if self.step_count % self._stats_interval == 0:
+            self.stats_history.append(self._snapshot())
+
+        return all_fired
+
+    def run(
+        self,
+        steps: int,
+        stimulus_fn=None,
+        progress_interval: int = 1000,
+        verbose: bool = True,
+    ) -> None:
+        t0 = wall_time.time()
+        for i in range(steps):
+            if stimulus_fn is not None:
+                stimulus_fn(self, i)
+            self.step()
+            if verbose and (i + 1) % progress_interval == 0:
+                elapsed = wall_time.time() - t0
+                snap = self._snapshot()
+                print(
+                    f"  Step {self.step_count:>8d} | "
+                    f"t={self.time:.0f}ms | "
+                    f"neurons={snap.total_neurons} | "
+                    f"synapses={snap.total_synapses} | "
+                    f"spikes={snap.total_spikes} | "
+                    f"memories={len(self.memory.traces)} | "
+                    f"{elapsed:.1f}s"
+                )
+        if verbose:
+            elapsed = wall_time.time() - t0
+            print(f"\n  Simulation complete: {steps} steps in {elapsed:.1f}s")
+
+    # ── Inspection ───────────────────────────────────────────────────
+
+    def _snapshot(self) -> BrainStats:
+        total_neurons = sum(r.n_alive_neurons for r in self.regions.values())
+        total_synapses = (
+            sum(r.n_alive_synapses for r in self.regions.values())
+            + sum(int(np.sum(p.syn_alive[:p.n_synapses])) for p in self.projections)
+        )
+        total_spikes = sum(
+            int(np.sum(r.total_spikes[:r.n_neurons]))
+            for r in self.regions.values()
+        )
+        regions_info = {}
+        for name, region in self.regions.items():
+            regions_info[name] = {
+                "neurons": region.n_alive_neurons,
+                "synapses": region.n_alive_synapses,
+                "activity": float(region.mean_activity),
+            }
+        growth_stats = self.growth.history[-1] if self.growth.history else None
+        return BrainStats(
+            time=self.time,
+            total_neurons=total_neurons,
+            total_synapses=total_synapses,
+            total_spikes=total_spikes,
+            regions=regions_info,
+            growth=growth_stats,
+        )
+
+    def summary(self) -> str:
+        snap = self._snapshot()
+        lines = [
+            f"=== Brain Summary (t={self.time:.0f}ms, step={self.step_count}) ===",
+            f"  Total neurons:  {snap.total_neurons}",
+            f"  Total synapses: {snap.total_synapses}",
+            f"  Total spikes:   {snap.total_spikes}",
+            f"  Memory traces:  {len(self.memory.traces)}",
+            f"  Growth cycles:  {len(self.growth.history)}",
+            "",
+        ]
+        for name, info in snap.regions.items():
+            lines.append(
+                f"  [{name}] neurons={info['neurons']}, "
+                f"synapses={info['synapses']}, "
+                f"activity={info['activity']:.4f}"
+            )
+        if self.growth.history:
+            recent = self.growth.history[-1]
+            lines.extend([
+                "",
+                "  Last growth cycle:",
+                f"    Neurons born:     {recent.neurons_born}",
+                f"    Synapses created: {recent.synapses_created}",
+                f"    Synapses pruned:  {recent.synapses_pruned}",
+                f"    Neurons died:     {recent.neurons_died}",
+            ])
+        return "\n".join(lines)
+
+    def save_state(self, path: str | Path) -> None:
+        snap = self._snapshot()
+        data = {
+            "time": snap.time,
+            "step_count": self.step_count,
+            "total_neurons": snap.total_neurons,
+            "total_synapses": snap.total_synapses,
+            "total_spikes": snap.total_spikes,
+            "memory_traces": len(self.memory.traces),
+            "regions": snap.regions,
+            "growth_history": [
+                {
+                    "neurons_born": g.neurons_born,
+                    "synapses_created": g.synapses_created,
+                    "synapses_pruned": g.synapses_pruned,
+                    "neurons_died": g.neurons_died,
+                }
+                for g in self.growth.history
+            ],
+        }
+        Path(path).write_text(json.dumps(data, indent=2))
+
+    def __repr__(self) -> str:
+        snap = self._snapshot()
+        return (
+            f"Brain(t={self.time:.0f}ms, "
+            f"regions={len(self.regions)}, "
+            f"neurons={snap.total_neurons}, "
+            f"synapses={snap.total_synapses})"
+        )
