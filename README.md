@@ -157,21 +157,22 @@ unsupervised workflow on a much smaller setup:
 
 - real MNIST loaded from OpenML
 - reduced `4-class` task (`0-3`)
-- `28x28 -> 14x14` downsampling (`196` input neurons)
-- unsupervised STDP on `input->cortex`
-- explicit excitatory/inhibitory cortex microcircuit for stronger competition
+- `28x28 -> 14x14` downsampling (`196` input neurons) with L1 intensity equalization
+- unsupervised STDP on `input->cortex` with per-neuron weight normalization
+- explicit excitatory/inhibitory cortex microcircuit for winner-take-all competition
+- adaptive excitability threshold during training (neurons that fire too much become harder to activate)
 - blended readout over cortex spike and voltage templates
 
-The current `4-class` prototype learns clearly above chance (`25%`) and
-reached about **67.5%** in the best reduced smoke test, with the current
-default configuration landing around **62.5%** and eliminating no-response
-cases in the validation run. That is enough to validate the
-dataset plumbing and the STDP/readout loop on a multi-class image task,
-but not enough to claim Phase 3 is solved.
+The current `4-class` prototype reaches **75-77.5%** accuracy consistently,
+with all four classes receiving dedicated excitatory neurons and zero
+no-response samples. Earlier versions were stuck at ~62.5% because class 1
+(digit "1") received zero dedicated neurons; L1 intensity equalization,
+adaptive thresholds, and proper weight clipping resolved the
+specialization imbalance.
 
-The main remaining work is improving competitive self-organization and
-readout stability so the same approach can scale from reduced `4-class` MNIST to the
-planned 10-class benchmark.
+The main remaining work is scaling from the reduced `4-class` MNIST to
+the planned 10-class benchmark, which will require profiling at the
+`784 + 400 + 400` neuron scale and potentially sparse connectivity.
 
 ## Performance
 

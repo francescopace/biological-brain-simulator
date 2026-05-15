@@ -133,14 +133,15 @@ Three candidates, each testing a different capability. Pick based on Step 1 resu
 
 **Goal**: The definitive SNN benchmark. Only attempt after Steps 1-2 work and performance is optimized.
 
-**Current status**: an initial prototype exists in `examples/mnist_prototype.py`.
-It uses real MNIST, but on a reduced `4-class` task (`0-3`) with
+**Current status**: a working prototype exists in `examples/mnist_prototype.py`.
+It uses real MNIST on a reduced `4-class` task (`0-3`) with
 `28x28 -> 14x14` downsampling, unsupervised STDP on `input->cortex`, an
-explicit excitatory/inhibitory cortex microcircuit, and a blended spike +
-voltage template readout. Best reduced smoke test reached roughly **67.5%**
-accuracy on a tiny split, while the current default setup is around
-**62.5%** with no no-response samples: good enough to validate the pipeline,
-not yet good enough to count as the full Step 3 benchmark.
+explicit excitatory/inhibitory cortex microcircuit, L1 intensity
+equalization, adaptive excitability thresholds, per-neuron incoming
+weight normalization, and a blended spike + voltage template readout.
+The default configuration reaches **75-77.5%** accuracy consistently,
+with balanced neuron specialization across all four classes and zero
+no-response samples.
 
 **Prerequisites**:
 - Optimize the Python simulation loop (vectorize remaining per-neuron loops in homeostasis/metaplasticity) — partially addressed
@@ -169,13 +170,15 @@ not yet good enough to count as the full Step 3 benchmark.
 - unsupervised feedforward STDP in a reduced multi-class image task
 - post-hoc spike/voltage template readout from excitatory association neurons
 - explicit cortex competition via excitatory/inhibitory microcircuit wiring
+- L1 intensity equalization to handle unequal pixel density across digit classes
+- adaptive excitability thresholds to force competitive neuron specialization
+- per-neuron incoming weight normalization to prevent runaway weight concentration
 - rough computational feasibility of a small MNIST-like setup
 
 **What still blocks the full benchmark**:
-- stronger and more even winner-take-all specialization across all classes
-- a readout that scales beyond the current reduced spike/voltage template prototype
 - extension from reduced `4-class` MNIST to 10 classes
-- profiling at the intended `784 + 400 + 400` scale
+- profiling and optimization at the intended `784 + 400 + 400` scale
+- potentially sparse connectivity or batched computation for scalability
 
 **Target**: >90% accuracy (Diehl & Cook 2015 achieved 95% with 6400 excitatory neurons, 87% with 400).
 
