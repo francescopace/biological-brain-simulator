@@ -386,17 +386,9 @@ class Brain:
                 proj.syn_total_tx[active] += 1
                 proj.syn_recent[active] += 1.0
 
-                # Build temporary CSR for projection (since projections don't change topology often, we could cache this too)
-                # But for now, we can just use index_add_ or build a quick COO tensor
-                # Since the plan specifically asked for sparse tensors:
                 effective = proj.syn_weight[active] * res * (1.0 + fac) * mod
                 slots = (self.step_count + proj.syn_delay[active]) % MAX_DELAY_STEPS
                 posts = proj.syn_post[active]
-                
-                # We can use index_add_ here because building CSR for active only is not SpMV, it's just scatter.
-                # To do SpMV, we need the full W matrix. Since projections don't have a built-in CSR cache yet,
-                # let's just use index_add_ for projections, as the plan mainly targets Region's internal dense connections.
-                # Actually, let's use index_add_ for projections to keep it simple.
                 flat_indices = slots * target.spike_buffer.size(1) + posts
                 target.spike_buffer.view(-1).index_add_(0, flat_indices.to(torch.int64), effective)
 

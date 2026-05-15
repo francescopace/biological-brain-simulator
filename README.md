@@ -1,10 +1,12 @@
 # Biological Brain Simulator
 
-A simulator that reproduces the fundamental mechanisms of the human brain: spiking neurons, synapses that strengthen or weaken with use, new connections forming and old ones dying. This is not machine learning — it is a biological simulation.
+An open-source, research-oriented simulator for studying biologically inspired learning in spiking neural systems. 
+The project combines spiking neurons, synaptic plasticity, structural growth, memory / replay, oscillations, and full-state persistence in a single experimental framework.
 
-The brain starts small and grows organically as it receives input, forming new neurons and connections based on activity patterns, just like a developing biological brain.
+The goal is not to claim a faithful whole-brain model. 
+The goal is to provide a practical sandbox for testing whether local learning rules and biologically motivated dynamics can support non-trivial behavior on controlled AI tasks.
 
-## What it simulates
+## Modeling scope
 
 | Biological mechanism | Implementation |
 |---|---|
@@ -23,15 +25,21 @@ The brain starts small and grows organically as it receives input, forming new n
 | **Morphology** | Multi-compartment neurons (dendrites/soma/axon) with distance-based synaptic attenuation |
 | **Persistence** | Full save/restore of the entire brain state to disk |
 
-## How it differs from ML
+## Research positioning
 
-| Traditional ML | This simulator |
+| Mainstream ML pipeline | This simulator |
 |---|---|
-| Training phase, then the model is fixed | Continuous learning, never stops |
+| Distinct training and inference phases | Continuous adaptation during interaction |
 | Fixed size | Grows organically (neurogenesis) |
-| Backpropagation | STDP + dopamine (biologically plausible) |
-| Neurons = mathematical functions | Neurons with real membrane dynamics |
-| No internal structure | Regions, connectivity, neurotransmitters, oscillations |
+| Backpropagation | Local plasticity rules (STDP, R-STDP, homeostasis) |
+| Abstract activations | Spiking membrane dynamics |
+| Minimal internal structure | Regions, projections, neurotransmitters, oscillations |
+
+## Status
+
+This project is best understood as an experimental research codebase rather than a polished general-purpose framework. The current implementation is useful for exploring biologically inspired learning mechanisms, running controlled benchmarks, and testing architectural ideas, but the benchmark scripts remain the canonical reference for exact experimental settings.
+
+The strongest current evidence in the repo is: supervised R-STDP on Iris, reward-modulated control on grid navigation, and unsupervised STDP on a scaled MNIST setup. The main research gap is not whether the simulator can learn at all, but how far these mechanisms can be pushed while remaining stable, interpretable, and biologically motivated.
 
 ## Quickstart
 
@@ -41,11 +49,11 @@ The brain starts small and grows organically as it receives input, forming new n
 pip install -r requirements.txt
 
 # Run from the project root
-python examples/learn_association.py
-python examples/growing_brain.py
+python examples/association_demo.py
+python examples/growth_demo.py
 python examples/iris_benchmark.py      # classification benchmark
 python examples/grid_nav_benchmark.py  # grid navigation benchmark
-python examples/mnist_prototype.py     # MNIST benchmark (10-class, 784+400+400)
+python examples/mnist_benchmark.py     # MNIST benchmark (10-class, 784+1600+1600)
 ```
 
 ## Project structure
@@ -67,13 +75,13 @@ src/
 └── persistence.py   # Full brain serialization and deserialization
 
 examples/
-├── learn_association.py   # Pavlovian conditioning with spiking neurons
-├── growing_brain.py       # A brain that grows from scratch
-├── iris_benchmark.py      # Iris classification with R-STDP (86.7% accuracy)
-├── grid_nav_benchmark.py  # Grid navigation with R-STDP (100% success, 4.38 steps)
-└── mnist_prototype.py     # MNIST benchmark: 10-class unsupervised STDP (62.2% accuracy)
+├── association_demo.py    # Pavlovian conditioning with spiking neurons
+├── growth_demo.py         # A brain that grows from scratch
+├── iris_benchmark.py      # Iris classification with R-STDP
+├── grid_nav_benchmark.py  # Grid navigation with R-STDP
+└── mnist_benchmark.py     # MNIST benchmark: 10-class unsupervised STDP
 
-BENCHMARKS.md              # Detailed benchmark results and methodology
+BENCHMARKS.md              # Concise benchmark notes, results, and caveats
 ```
 
 ## Usage
@@ -119,8 +127,7 @@ for step in range(5000):
 
 ### Convenience helpers
 
-The core simulator now exposes a few helpers that are useful when building
-benchmarks or structured training loops:
+The core simulator exposes a few helpers that are useful when building benchmarks or structured training loops:
 
 - `brain.reset_traces()` clears all synaptic eligibility traces and per-target dopamine
 - `brain.freeze_structural_plasticity()` disables growth and metaplasticity for stable experiments
@@ -138,83 +145,35 @@ brain.freeze_structural_plasticity()
 brain.regions["output"].add_lateral_inhibition(weight=5.0)
 ```
 
-## Iris Benchmark
+## Experimental Results
 
-`examples/iris_benchmark.py` is the most complete supervised benchmark in the repo.
-The current configuration uses:
+The repository currently includes three validated reference benchmarks:
 
-- place-field encoding with `4 × 20 = 80` sensory neurons
-- a direct `input->motor` readout trained with reward-modulated STDP
-- anti-Hebbian punishment on the strongest wrong motor neuron
-- repeated test-time presentations to reduce spiking noise
+| Benchmark | Script | Main question | Latest validated result |
+|---|---|---|---|
+| Iris classification | `examples/iris_benchmark.py` | Can reward-modulated local plasticity solve a standard supervised classification task? | **86.7%** test accuracy, **90.0%** best checkpoint |
+| Grid navigation | `examples/grid_nav_benchmark.py` | Can the simulator learn a usable control policy with reward-modulated spiking dynamics? | **100.0%** success, **4.38** mean steps-to-goal |
+| MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | **62.2%** test accuracy (400 exc); 51.8% with 1600 exc (training regime undersaturation — see BENCHMARKS.md) |
 
-With the current settings, the benchmark reaches **86.7% test accuracy**
-on Iris, with a best checkpoint of **90.0%** during training.
-See [BENCHMARKS.md](BENCHMARKS.md) for detailed results and methodology.
+`BENCHMARKS.md` contains the detailed benchmark notes, including research setup, caveats, runtime observations, and interpretation. Use the benchmark scripts themselves as the source of truth for exact hyperparameters.
 
-## Grid Navigation Benchmark
+## Computational Performance
 
-`examples/grid_nav_benchmark.py` is the current reinforcement-learning benchmark.
-It uses:
-
-- a `5x5` grid encoded with `25` sensory neurons and 2D Gaussian place fields
-- a `MEMORY` region (`place_cells`) with theta-gamma coupling
-- reward-modulated STDP on `input->motor` and `place_cells->motor`
-- inter-episode rest periods to exercise replay / consolidation infrastructure
-
-With the current settings, the benchmark reaches **100.0% success rate**
-with **4.38 mean steps-to-goal** over held-out evaluation rollouts
-(random baseline: **29.0%** success, **17.18** mean steps).
-
-One important caveat: the synapses learn the policy through fully spiking
-R-STDP, but action selection is decoded from the learned `input->motor`
-weights because raw motor spike argmax was too noisy for stable control.
-See [BENCHMARKS.md](BENCHMARKS.md) for detailed results and methodology.
-
-## MNIST Benchmark
-
-`examples/mnist_prototype.py` is the Step 3 benchmark following the Diehl &
-Cook 2015 architecture:
-
-- real MNIST loaded from OpenML, all **10 digit classes**
-- `784` input neurons (full `28x28`, rate coded) with L1 intensity equalization
-- `400` excitatory + `400` inhibitory cortex neurons (`254k` total synapses)
-- unsupervised STDP on `input->cortex` with per-neuron weight normalization
-- leaky adaptive excitability threshold (theta) integrated into `Region` state
-  and updated every step by `HomeostaticPlasticity`
-- **1:1 matched exc-inh wiring** (Diehl & Cook WTA): each exc[i] drives
-  inh[i], each inh[i] suppresses all other exc neurons
-- blended readout over cortex spike and voltage templates
-
-The current configuration reaches **62.2%** test accuracy on 10-class MNIST
-(chance: 10%), with all 10 classes receiving dedicated excitatory neurons
-and zero no-response samples. The full run completes in under **17 minutes**
-(training: 636s, readout: 316s, evaluation: 48s) with `1,584` neurons and
-`254k` synapses (`300` training images per class, `3` epochs).
-
-The gap to the Diehl & Cook target (87% with 400 exc neurons) is mainly due
-to fewer training images (`300`/class vs `6,000` in the paper) and shorter
-presentation windows (`25` steps vs `700`). The leaky theta update integrated
-into `HomeostaticPlasticity` is what makes the `300`/class, `3`-epoch regime
-stable.
-
-## Performance
-
-All neuron and synapse state lives in dense PyTorch tensors (structure-of-arrays layout). A single `Region.step()` call advances thousands of neurons in parallel rather than looping over individual Python objects.
+The simulator is implemented as a vectorized research codebase rather than a neuron-by-neuron object model. All neuron and synapse state lives in dense PyTorch tensors (structure-of-arrays layout), so a single `Region.step()` call can advance thousands of neurons in parallel.
 
 Key techniques:
 
-- **PyTorch tensors** on CPU — profiling showed CPU is 16x faster than MPS (Apple GPU) for SNN workloads due to kernel launch overhead dominating at this tensor size. Override with `BRAIN_DEVICE=mps` for large networks (10k+ neurons).
+- **PyTorch tensors** on CPU — extensive profiling showed CPU outperforms MPS (Apple GPU) at all tested scales (up to 3200 neurons / 2.9M synapses). GPU kernel launch overhead dominates small conditional ops; `torch.compile` fails due to dynamic shapes; masked full-tensor approaches waste compute on the ~95-99% of inactive synapses. See [BENCHMARKS.md](BENCHMARKS.md) for details. Override with `BRAIN_DEVICE=mps` for very large dense networks where GPU occupancy may eventually win.
 - **Vectorized Izhikevich integration** with configurable sub-stepping (`dt / 0.5`)
 - **Ring buffer** for spike delays — `index_add_` deposits postsynaptic currents into future slots; each timestep reads and clears the current slot
 - **Event-driven STDP** — nearest-neighbor pairing updates only synapses whose pre or post neuron fired this step, not the entire weight matrix every timestep. Sync-free implementation avoids GPU stalls.
-- **Sparse-like propagation** — synapses are stored as COO-style parallel arrays; spike delivery filters on `fired[syn_pre]` so only active synapses are touched (O(active) not O(all))
+- **Sparse scatter/gather propagation** — synapses are stored as COO-style parallel arrays; spike delivery filters on `fired[syn_pre]` so only active synapses are touched (O(active) not O(all)). This is the key SNN advantage: with 1-5% neuron activity per step, scatter/gather touches ~30-150k elements vs 2.9M for any dense approach.
 - **Vectorized stimulus encoding** — rate/temporal/population coding computed in a single tensor operation instead of per-neuron Python loops
 - **Vectorized synaptogenesis** — co-activity scoring via `torch.outer` instead of nested Python loops
 - **Pre-allocated neuron arrays** up to `max_neurons`; synapse arrays grow via capacity-doubling when needed
 - **Dead flags** (`syn_alive`, `neuron_alive`) for pruning and apoptosis — no costly array compaction
 
-The full MNIST benchmark (`784+400+400`, `254k` synapses) runs at ~70ms per training sample on a MacBook Air M2, completing 3 epochs of 3000 samples in ~10.5 minutes.
+Run-specific timing numbers live in [BENCHMARKS.md](BENCHMARKS.md) alongside the corresponding benchmark results.
 
 ## License
 
@@ -222,4 +181,6 @@ This project is licensed under the [MIT License](LICENSE).
 
 ## Author
 
-Francesco Pace
+**Francesco Pace**  
+Email: [francesco.pace@gmail.com](mailto:francesco.pace@gmail.com)
+LinkedIn: [linkedin.com/in/francescopace](https://www.linkedin.com/in/francescopace/)

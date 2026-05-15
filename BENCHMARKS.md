@@ -1,229 +1,125 @@
-# Benchmark Roadmap
+# Benchmark Notes
 
-A progression of increasingly complex tasks to validate the biological brain simulator. Each step proves a specific capability before moving to the next.
+This file summarizes the latest validated benchmark outcomes in the repository and the modeling choices needed to interpret them. 
+The aim is not leaderboard performance; the aim is to test whether biologically motivated local learning rules can support useful behavior on controlled AI tasks.
 
-## Step 1 — Iris Classification ✓
+For exact hyperparameters, read the benchmark scripts:
 
-**Goal**: Prove that R-STDP + the spiking network can learn a real classification task.
+- `examples/iris_benchmark.py`
+- `examples/grid_nav_benchmark.py`
+- `examples/mnist_benchmark.py`
 
-**Result**: **86.7% final test accuracy** (sklearn baseline: 96.7%), with a **90.0% best checkpoint** during training. Final run produced only `2/30` samples with no motor spikes.
+## Iris Classification
 
-**Architecture** (see `examples/iris_benchmark.py`):
-- 80 input neurons (place-field encoding: 4 features × 20 Gaussian bins, σ=0.08)
-- 80 cortex neurons (ASSOCIATION, sparse recurrent 5%)
-- 3 motor neurons (MOTOR, chattering, lateral inhibition via GABA)
-- Input → cortex density 0.5 (frozen)
-- Cortex → motor density 0.8 but weights zeroed in the benchmark because this pathway acted mostly as readout noise
-- Input → motor density 1.0 (**readout pathway**, R-STDP enabled)
+**Latest validated result**: **86.7%** final test accuracy, with a **90.0%** best checkpoint during training.
 
-The direct input→motor shortcut learns the classification. The final version keeps cortex in the brain for realism, but removes its contribution to the motor readout because it degraded class separation.
+**Research setup**:
+- Place-field encoding expands the 4 Iris features into `80` sensory neurons.
+- The useful readout is the direct `input->motor` pathway trained with R-STDP.
+- Anti-Hebbian punishment on the strongest wrong class improves separation.
+- Test-time repeated presentation plus voting reduces spiking noise.
 
-**Training protocol**:
-- Place-field encoding: each feature → 20 neurons with Gaussian receptive fields spanning [0, 1]
-- Each sample: stimulate 30ms with teacher delayed by 13ms (input neurons fire first → causal STDP → positive eligibility on input→motor[y])
-- Readout starts near zero (`0.01`) instead of with random boosted weights
-- Selective eligibility: after presentation, zero eligibility on synapses to motor[j≠y] so reward only strengthens the correct readout pathway
-- Anti-Hebbian correction: rebuild eligibility for the strongest wrong motor neuron and apply `punish(0.05)` to actively push wrong pathways down
-- Reward decay: `0.1` before epoch 10, then `0.05`
-- Test-time voting: present each sample 6 times, sum spike counts, then take `argmax`
-- 15 epochs over 120 train / 30 test (stratified), deterministic seed 42
-- Restore the best full-brain checkpoint at the end before reporting final metrics
+**What this benchmark tests**:
+- Event-driven R-STDP can drive targeted learning on a real classification task.
+- Per-target dopamine and selective eligibility give clean credit assignment.
+- The end-to-end encoding -> spiking -> readout pipeline is working.
 
-**Key lessons learned**:
-- Event-driven STDP computes dw once per spike pair (vs ~50× with the old per-step approach). Requires recalibrating STDP amplitudes (STDP_SCALE=1.0).
-- Teacher timing is critical: the teacher must overlap with pre-neuron activity for causal STDP.
-- Per-target dopamine prevents unintended credit bleed between pathways.
-- Selective eligibility zeroing is essential: without it, reward strengthens all motor neurons uniformly.
-- The biggest gain came from improving input separability (more place-field bins, narrower receptive fields) and removing noisy cortex→motor drive.
-- Counting `pred = -1` as wrong predictions matters: otherwise no-response samples can make accuracy look artificially high.
+**Interpretation notes**:
+- Teacher timing is critical: reward only helps when pre-synaptic activity overlaps the delayed teacher signal.
+- Counting no-response predictions as wrong is important; otherwise accuracy is easy to overstate.
 
-**What it tests**:
-- Event-driven R-STDP drives meaningful, targeted weight changes
-- Per-target dopamine provides clean credit assignment
-- Place-field encoding → spiking → readout pipeline works end to end
+## Grid Navigation
 
-**Original target**: >85%. **Achieved**: 86.7%.
+**Latest validated result**: **100.0%** success rate and **4.38** mean steps-to-goal on held-out evaluation rollouts, versus a random-policy baseline of **29.0%** success and **17.18** mean steps.
 
----
+**Research setup**:
+- The task is a `5x5` grid with Gaussian place-field encoding.
+- A `MEMORY` region (`place_cells`) participates together with direct `input->motor` readout connections.
+- Learning is fully spiking R-STDP with shaped reward/punishment.
+- Inter-episode rest is used to exercise replay / consolidation machinery.
 
-## Step 2 — Intermediate Tasks
+**Important caveat**:
+- The synapses learn the policy biologically, but action selection is decoded from learned `input->motor` weights because raw motor spike argmax was too noisy for stable control.
 
-Three candidates, each testing a different capability. Pick based on Step 1 results.
+**What this benchmark tests**:
+- Reward-modulated STDP can encode a usable state-action policy.
+- Replay / consolidation infrastructure runs without destabilizing the task.
+- The learned policy is near-optimal on this simple environment.
 
-### 2a) Non-linear Classification (Two-Moons / Circles)
+## MNIST
 
-**Goal**: Prove the network can learn non-linearly separable boundaries.
+**Latest validated results**:
+- **400 exc neurons**: **62.2%** test accuracy on 10-class MNIST (chance: `10%`), with dedicated neurons for all classes and zero no-response samples.
+- **1600 exc neurons**: **51.8%** test accuracy — *worse* than 400 neurons, due to training regime undersaturation (see analysis below).
 
-**Architecture**:
-- 2 input neurons (x, y coordinates, rate coded)
-- 100 association neurons
-- 2 readout neurons (class 0 / class 1)
-- Same R-STDP protocol as Iris
+**Architecture** (Diehl & Cook 2015):
+- `784` input neurons (one per pixel, rate coded)
+- `1600` excitatory + `1600` inhibitory cortex neurons with 1:1 matched WTA microcircuit (~2.9M synapses)
+- Unsupervised STDP on feedforward `input->cortex` pathway
+- Adaptive thresholds (leaky theta), per-neuron weight normalization, blended spike/voltage readout
 
-**What it tests**:
-- The association layer creates non-linear feature combinations
-- More interesting than XOR because it's continuous, not binary
+**Observed runtimes** (MacBook Air M2, CPU):
+- **400 exc**: `3000` train samples, `3` epochs, ~70 ms/sample, **17 min** total
+- **1600 exc**: `3000` train samples, `3` epochs, ~250 ms/sample, **~38 min** training + **~21 min** readout + **~4 min** eval = **63 min** total
 
-**Dataset**: `sklearn.datasets.make_moons(n_samples=500, noise=0.1)` or `make_circles`
+**GPU and compilation experiments**:
 
-**Target**: >90% accuracy (the task is easy for ML, but non-trivial for biological learning).
+Several approaches to GPU acceleration were tested and none improved over CPU scatter/gather:
 
-### 2b) Temporal Pattern Recognition (Spoken Digits)
+| Approach | Result | Why |
+|----------|--------|-----|
+| MPS direct (400 exc) | **16x slower** than CPU | Kernel launch overhead dominates small tensor ops |
+| MPS direct (1600 exc) | **2.4x slower** than CPU | Gap narrows with scale but still loses |
+| `torch.compile` | No speedup, falls back to eager | `torch.where` returns variable-length outputs (graph breaks); ring buffer slot indexing triggers recompilation every step |
+| Masked full-tensor (no `torch.where`) | **6.7x slower** on CPU, **2.1x slower** on MPS | Multiplying all 2.9M synapses when only 1-5% are active wastes compute; the "zero work" is not free |
 
-**Goal**: Exploit the temporal dimension — the natural advantage of spiking networks.
+The fundamental issue is that SNN activity is **sparse by nature**: only a small fraction of neurons fire each step, so only a small fraction of synapses transmit. The current sparse scatter/gather pattern (`torch.where` → gather active → `index_add_`) touches O(active) elements per step (~30-150k out of 2.9M), which is much faster than any approach that touches all elements.
 
-**Architecture**:
-- N input neurons (one per frequency bin of a downsampled spectrogram)
-- 200 association neurons with MEMORY region (theta oscillations aid temporal binding)
-- 10 readout neurons (digits 0-9)
+**Approaches not yet tested** (and their trade-offs):
+- **Sparse matrix-vector multiply** (`W_sparse @ fired`): would replace the entire propagation block with one op, but STP (vesicle depletion, facilitation) modifies effective weights every step, requiring per-step matrix reconstruction — likely negating the SpMV advantage.
+- **Batched sample presentation**: process B images in parallel on (B, N) state tensors. Would improve GPU utilization but changes STDP semantics (mini-batch vs sequential updates) and requires batch-aware versions of every subsystem (homeostasis, theta, STDP, memory). A 2-3 day refactoring effort best justified for hyperparameter sweeps rather than single-run accuracy.
 
-**Dataset**: TIDIGITS (subsampled) or Free Spoken Digit Dataset (FSDD, 3 speakers, digits 0-9, 1500 recordings). Downsample to ~8 frequency bins × ~20 time steps.
+CPU with sparse scatter/gather remains the correct default at this scale.
 
-**What it tests**:
-- Temporal coding (spike timing carries information, not just rate)
-- Theta-gamma oscillations help bind temporal sequences
-- Memory traces consolidate repeated patterns
+**Current caveats**:
+- The main gap vs Diehl & Cook is experimental regime, not basic functionality: the validated run uses 300 images/class (vs 6000 in the paper) and 25 ms presentation (vs 350 ms).
+- The leaky theta update is a stabilizer, not just a detail; it is what makes the scaled training regime stay usable.
 
-**Target**: >70% accuracy on held-out speakers.
+**Observations from the 1600 exc run**:
+- Feedforward weight statistics are identical after epoch 1, 2, and 3 (`mean=1.20, max=10.0`), confirming STDP saturates within a single pass over 300 images/class at 25 ms presentation.
+- **1600 neurons scored 51.8% vs 62.2% with 400 neurons.** The label distribution is heavily skewed: 480/1157 labelled neurons (41%) assigned to digit 1, while classes 4 and 8 got only 52 neurons each. With 4x more neurons competing for the same 300 images/class, many converge on the simplest features (digit 1) instead of specializing.
+- This confirms the bottleneck is training regime, not network capacity. More neurons actually *hurt* when the stimulus regime is too small to drive diverse specialization.
 
-### 2c) Grid Navigation with Reward
+**Next steps for accuracy improvement** (ordered by expected impact):
 
-**Goal**: Test spatial learning with reward, while exercising the MEMORY region and consolidation machinery on a control task.
+| Priority | Change | Rationale | Estimated time |
+|----------|--------|-----------|----------------|
+| 1 | `TRAIN_PRESENT_STEPS=100`, `REST_STEPS=50` | Most impactful single change. At 25 ms many spike pairs never form — STDP needs enough time within each presentation for pre-post coincidences to accumulate. Paper uses 350 ms. Combines with step 2 for maximum effect. | ~4h |
+| 2 | `TRAIN_PER_CLASS=1000`, `EPOCHS=2` | The 1600-neuron run shows weights saturate within 1 epoch over 300 images. More unique images per class (not more epochs) is what drives further neuron specialization. Reduce epochs to 2 since the network learns in one pass. Paper uses 6000 images/class. | ~2h |
+| 3 | `A_minus/A_plus` ratio 1.2 → 1.05 | Current ratio over-prunes weak classes (observed with digit 8 at 400 exc). 1.05 is the paper value. Zero-cost change, apply together with steps 1-2. | same run |
+| 4 | Sweep `THETA_PLUS`, `THETA_LEAK` | Theta regime calibrated for 400 neurons and 25 ms presentation may not be optimal for the new regime. The fast saturation suggests theta may need to be more aggressive to keep competition alive across epochs. | 3-4 runs |
+| 5 | Weight normalization target tuning | The norm target may need to scale with neuron count. With 4x more exc neurons competing, each neuron receives 4x fewer input spikes on average. | 2-3 runs |
 
-**Result**: **100.0% success rate** on held-out rollouts, **4.38 mean steps-to-goal** (optimal from random start is ~4), versus a random-policy baseline of **29.0%** success and **17.18** mean steps.
+**Target**: 85-90% with 1600 exc neurons + tuned regime (paper: 87% with 400, 95% with 6400).
 
-**Implementation note**: pure motor-spike argmax turned out to be too noisy even when the synapses had learned a good policy. The final benchmark therefore trains the network through fully spiking R-STDP, but **decodes the action from the learned `input->motor` synaptic weights** at decision time. That keeps learning biologically grounded while making the control policy stable enough to benchmark.
+## Next Research Measurements
 
-**Architecture** (see `examples/grid_nav_benchmark.py`):
-- 25 sensory neurons (`5×5`) with 2D Gaussian position encoding (`sigma=0.6`)
-- 100 `MEMORY` neurons (`place_cells`) with intrinsic theta-gamma coupling
-- 4 motor neurons (`up / down / left / right`) with strong lateral inhibition
-- `input -> place_cells` density `0.5` (static spatial drive)
-- `place_cells -> motor` density `0.5` (R-STDP enabled)
-- `input -> motor` density `1.0` (**policy readout**, R-STDP enabled)
+If the goal is to make the project more informative as an AI research artifact, the next measurements worth adding are:
 
-**Training protocol**:
-- 500 episodes on a `5×5` grid, random start, fixed goal at the bottom-right corner
-- For each state: present the encoded position to the spiking brain, then mark the executed action with a short motor-current pulse so the chosen pathway accumulates eligibility
-- Immediate reward shaping:
-  - move closer to goal -> `reward(0.08)`
-  - hit goal -> `reward(0.4)`
-  - move farther -> `punish(0.03)`
-  - bump into wall -> `punish(0.015)`
-- Guided curriculum during training: if the current policy proposes an action that does **not** reduce Manhattan distance, the environment executes one of the distance-reducing actions instead. This keeps the benchmark learnable with the current simulator while still training the synapses through R-STDP.
-- Rest every 50 episodes for 5000 silent steps to trigger replay / consolidation
+### Accuracy improvements
 
-**What it tests**:
-- Reward-modulated STDP can encode a usable spatial policy in synaptic weights
-- The MEMORY region participates in the task without destabilizing the direct readout
-- Theta / replay infrastructure runs correctly during inter-episode rest
-- Learned synapses can be decoded into near-optimal navigation behavior
+- **MNIST accuracy push** — the immediate priority (see roadmap above)
 
-**Key lessons learned**:
-- On this simulator, the learned state-action policy emerged more clearly in the **readout weights** than in raw motor spike counts.
-- A small motor tonic current was needed to keep the motor layer responsive during state presentation.
-- Reset between environment steps must exceed the maximum synaptic delay; otherwise activity from the previous cell bleeds into the next state.
-- Once the policy saturates, extra sleep/replay does not improve performance further on this simple task.
+### Qualitative advantages over conventional ML
 
-**Original target**: <10 steps within 500 episodes. **Achieved**: 4.38 mean steps with 100.0% success.
+These tests target capabilities where SNN architectures have a structural advantage over standard backprop-trained models. Positive results here would demonstrate value that accuracy-on-benchmarks alone cannot capture.
 
----
-
-## Step 3 — MNIST
-
-**Goal**: The definitive SNN benchmark. Only attempt after Steps 1-2 work and performance is optimized.
-
-**Current status**: the full-scale benchmark exists in `examples/mnist_prototype.py`.
-It uses real MNIST with all **10 classes**, `784` input neurons (full `28x28`),
-`400` excitatory + `400` inhibitory cortex neurons (`254k` total synapses),
-unsupervised STDP on `input->cortex`, L1 intensity equalization, adaptive
-excitability thresholds (leaky theta in `HomeostaticPlasticity`), per-neuron
-incoming weight normalization, **1:1 matched exc-inh wiring** (Diehl & Cook WTA),
-and a blended spike + voltage template readout. The default configuration reaches
-**62.2%** test accuracy on 10-class MNIST (chance: 10%), with all 10 classes
-receiving dedicated neurons and zero no-response samples. The full run completes
-in under **17 minutes** on a MacBook Air M2.
-
-**Performance optimization** (completed):
-- Migrated all state arrays to PyTorch tensors
-- Vectorized stimulus encoding (eliminated 784-iteration Python loop)
-- Vectorized synaptogenesis via `torch.outer` co-activity scoring
-- Sync-free STDP (no `torch.any()` GPU synchronization stalls)
-- `index_add_` for O(active) spike propagation instead of O(all) SpMV
-- CPU default device (16x faster than MPS for this workload due to kernel launch overhead)
-
-**Architecture** (following Diehl & Cook 2015):
-- 784 input neurons (one per pixel, rate coding: brighter pixel → higher firing rate)
-- 400 excitatory neurons (association layer)
-- 400 inhibitory neurons (lateral inhibition — winner-take-all dynamics)
-- Readout: assign each excitatory neuron to the class it responds to most during training
-
-**Training protocol**:
-- Unsupervised STDP on excitatory synapses (no reward signal needed)
-- Lateral inhibition ensures different neurons specialize for different digits
-- Adaptive threshold: neurons that fire too much become harder to activate (homeostatic)
-- Present each image for ~350ms, then 150ms of rest
-
-**What it tests**:
-- Scalability of the simulator
-- STDP alone can learn useful representations (no reward needed)
-- The network self-organizes digit-specific receptive fields
-
-**Result**: **62.2%** test accuracy on 10-class MNIST (300 train / 50 test per
-class, 3 epochs, `784+400+400` architecture). All 10 classes receive dedicated
-neurons with balanced distribution. Total wall time under 17 minutes.
-
-**What is validated**:
-- full `784+400+400` Diehl & Cook architecture runs at feasible speed (~70ms/sample)
-- **1:1 matched exc-inh wiring** produces clean winner-take-all dynamics (160k
-  internal synapses: 400 exc→inh matched + 159,600 inh→exc all-to-all-minus-self)
-- unsupervised STDP produces digit-specific receptive fields across all 10 classes
-- L1 intensity equalization, leaky adaptive thresholds, and weight normalization enable
-  balanced neuron specialization even for visually sparse digits
-- vectorized weight normalization scales to `254k` synapses without bottlenecking
-- blended spike + voltage template readout discriminates 10 classes well above chance
-- PyTorch migration enables future GPU acceleration for larger networks
-
-**What the latest experiments showed**:
-- adding a hard `theta` cap (`THETA_MAX = 25`) prevents runaway excitability suppression
-  during longer runs and keeps scaled training numerically stable
-- scaling to `300` images/class and `3` epochs with only the hard cap
-  remained stable but only reached **56.4%**, with `theta` saturating at the cap
-- replacing the cap-only update with a **leaky theta rule**
-  (`theta += THETA_PLUS * fired - THETA_LEAK * theta`) — now integrated directly
-  into `HomeostaticPlasticity` and the `Region` state — unlocked the longer run
-  and improved the scaled benchmark to **62.2%**, while keeping zero no-response samples
-- replacing the blended template readout with pure population voting regressed badly
-  (**28.0%**, then **24.6%** with class-size normalization) and introduced no-response samples
-- increasing STDP asymmetry to `A_minus / A_plus = 2.0` over-pruned weak classes
-  (notably digit `8`), so the default keeps the milder `1.2x` ratio
-- MPS (Apple GPU) proved 16x slower than CPU for this workload due to kernel launch
-  overhead for small/conditional tensor operations; CPU is the default
-
-**What could improve accuracy toward the 87% target**:
-- more training data (`300` images/class → `1000+`; the paper uses `6,000`), now that
-  the theta saturation bottleneck is partially addressed
-- a better-calibrated leaky theta regime that keeps class competition stronger
-  without drifting toward the old saturation failure mode
-- longer presentation windows (25 steps → 100-200; the paper uses 700)
-- a more robust readout than pure voting, e.g. better hybrid spike/voltage aggregation
-- finer STDP tuning around the current regime instead of a jump straight to `2.0x` LTD
-- enabling MPS/CUDA for networks scaled beyond 10k neurons where GPU parallelism
-  outweighs kernel launch overhead
-
-**Target**: >90% accuracy (Diehl & Cook 2015 achieved 95% with 6400 excitatory neurons, 87% with 400).
-
----
-
-## Biological Properties to Measure Across All Steps
-
-Beyond accuracy, measure these at every step — they are what makes this simulator different from standard SNNs:
-
-| Property | How to measure |
-|---|---|
-| **Few-shot learning** | Accuracy after only 5 examples per class |
-| **Catastrophic forgetting** | Train on task A, then task B, re-test task A |
-| **Sleep consolidation** | Run 5000 steps with no stimulus after training, re-test — does accuracy improve? |
-| **Growth benefit** | Compare fixed-size network vs. one with neurogenesis enabled |
-| **Robustness / graceful degradation** | Kill 10%, 20%, 30% of neurons randomly, measure accuracy drop |
-| **Learning curve** | Accuracy vs. number of training examples (should be steep like biological learning) |
+| Test | What it measures | Protocol sketch | What a positive result looks like |
+|------|-----------------|-----------------|-----------------------------------|
+| **Few-shot learning curves** | How quickly the network learns from limited data | Train on 1, 5, 10, 50 samples/class; compare accuracy vs a simple MLP baseline with the same data budget | SNN reaches usable accuracy with fewer samples than the MLP, suggesting local plasticity extracts more from each example |
+| **Catastrophic forgetting** | Whether sequential task learning destroys previous knowledge | Train on MNIST digits 0-4, then train on 5-9, then re-test on 0-4 | SNN retains significant accuracy on 0-4 after learning 5-9; MLP baseline drops to chance |
+| **Sleep / replay benefit** | Whether offline consolidation improves retention | Compare test accuracy with and without a silent replay phase between training blocks | Post-replay accuracy is measurably higher than without replay, validating the consolidation machinery |
+| **Growth vs fixed-size** | Whether neurogenesis and synaptogenesis improve learning | Run identical tasks with growth enabled vs disabled (fixed topology) | Growth-enabled networks reach higher accuracy or learn faster, justifying the structural plasticity overhead |
+| **Graceful degradation** | Whether the network tolerates damage better than conventional models | After training, randomly kill 5%, 10%, 20% of neurons; measure accuracy drop vs an MLP with the same fraction of weights zeroed | SNN degrades more gracefully (smaller accuracy drop per % of damage) |
+| **Temporal pattern recognition** | Whether native spike timing gives an advantage on time-domain tasks | Classify simple temporal patterns (e.g. spike sequences, rhythmic signals) where input order matters, not just content | SNN outperforms a rate-based MLP that receives the same inputs as static vectors |
+| **Online adaptation** | Whether the network adapts to distribution shift without retraining | Train on one distribution, then shift (e.g. rotated MNIST digits); measure how quickly accuracy recovers with continued exposure | SNN recovers accuracy through ongoing plasticity while a frozen MLP cannot adapt |

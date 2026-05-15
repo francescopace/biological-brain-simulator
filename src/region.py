@@ -393,7 +393,7 @@ class Region:
 
     def step(self, time: float, step_count: int) -> torch.Tensor:
         """
-        Advance all neurons by one timestep (vectorized).
+        Advance all neurons by one timestep (vectorized, branchless).
         Returns array of indices of neurons that fired.
         """
         n = self.n_neurons
@@ -403,16 +403,17 @@ class Region:
         if n == 0:
             return torch.tensor([], dtype=torch.int32, device=DEVICE)
 
+        _step = torch.tensor(step_count, dtype=torch.int64, device=DEVICE)
+
         # 1. Synapse housekeeping (recovery, facilitation decay)
-        if ns > 0:
-            s = slice(0, ns)
-            self.syn_resource[s] = torch.clamp(self.syn_resource[s] + _RECOVERY_RATE, max=1.0)
-            self.syn_facilitation[s] *= 0.98
-            self.syn_age[s] += 1
-            self.syn_recent[s] *= _TRANSMISSION_DECAY
+        s = slice(0, ns)
+        self.syn_resource[s] = torch.clamp(self.syn_resource[s] + _RECOVERY_RATE, max=1.0)
+        self.syn_facilitation[s] *= 0.98
+        self.syn_age[s] += 1
+        self.syn_recent[s] *= _TRANSMISSION_DECAY
 
         # 2. Read delayed spikes from ring buffer
-        slot = step_count % MAX_DELAY_STEPS
+        slot = _step % MAX_DELAY_STEPS
         self.current[:n] += self.spike_buffer[slot, :n]
         self.spike_buffer[slot, :n] = 0.0
 
@@ -443,11 +444,10 @@ class Region:
         self.v[:n] = v
         self.u[:n] = u
 
-        # 6. Update spike tracking
+        # 6. Update spike tracking (branchless: empty index ops are no-ops)
         fired_idx = torch.where(fired)[0]
-        if len(fired_idx) > 0:
-            self.last_spike_time[fired_idx] = time
-            self.total_spikes[fired_idx] += 1
+        self.last_spike_time[fired_idx] = time
+        self.total_spikes[fired_idx] += 1
         self.fired[:n] = fired
 
         # 7. Activity trace (EMA)
@@ -459,27 +459,26 @@ class Region:
         # 9. Clear input current
         self.current[:n] = 0.0
 
-        # 10. Propagate spikes through internal synapses
-        if len(fired_idx) > 0 and ns > 0:
-            pre_fired = fired[self.syn_pre[:ns]] & self.syn_alive[:ns]
-            active_syns = torch.where(pre_fired)[0]
+        # 10. Propagate spikes through internal synapses (sparse gather/scatter)
+        pre_fired = fired[self.syn_pre[:ns]] & self.syn_alive[:ns]
+        active_syns = torch.where(pre_fired)[0]
 
-            if len(active_syns) > 0:
-                res = self.syn_resource[active_syns]
-                fac = self.syn_facilitation[active_syns]
-                mod = self.syn_modulation[active_syns]
-                atten = self.syn_attenuation[active_syns]
-                effective = self.syn_weight[active_syns] * res * (1.0 + fac) * mod * atten
+        res = self.syn_resource[active_syns]
+        fac = self.syn_facilitation[active_syns]
+        mod = self.syn_modulation[active_syns]
+        atten = self.syn_attenuation[active_syns]
+        effective = self.syn_weight[active_syns] * res * (1.0 + fac) * mod * atten
 
-                self.syn_resource[active_syns] = torch.clamp(res - _DEPLETION_RATE, min=0.0)
-                self.syn_facilitation[active_syns] += 0.05
-                self.syn_total_tx[active_syns] += 1
-                self.syn_recent[active_syns] += 1.0
+        self.syn_resource[active_syns] = torch.clamp(res - _DEPLETION_RATE, min=0.0)
+        self.syn_facilitation[active_syns] += 0.05
+        self.syn_total_tx[active_syns] += 1
+        self.syn_recent[active_syns] += 1.0
 
-                target_slots = (step_count + self.syn_delay[active_syns]) % MAX_DELAY_STEPS
-                target_neurons = self.syn_post[active_syns].to(torch.int64)
-                flat_indices = target_slots.to(torch.int64) * n + target_neurons
-                self.spike_buffer.view(-1).index_add_(0, flat_indices, effective)
+        target_slots = (_step + self.syn_delay[active_syns]) % MAX_DELAY_STEPS
+        target_neurons = self.syn_post[active_syns].to(torch.int64)
+        buf_stride = self.spike_buffer.size(1)
+        flat_indices = target_slots.to(torch.int64) * buf_stride + target_neurons
+        self.spike_buffer.view(-1).index_add_(0, flat_indices, effective)
 
         return fired_idx
 

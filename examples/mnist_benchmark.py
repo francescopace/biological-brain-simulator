@@ -53,8 +53,8 @@ N_INPUT = IMAGE_SIDE * IMAGE_SIDE
 
 # --- Network / training hyperparameters ------------------------------------
 
-N_CORTEX_EXC = 400
-N_CORTEX_INH = 400
+N_CORTEX_EXC = 1600
+N_CORTEX_INH = 1600
 CORTEX_CONNECTIVITY = 0.0
 EXC_TO_INH_WEIGHT = 8.0
 INH_LATERAL_WEIGHT = 10.0
@@ -492,7 +492,7 @@ def main() -> None:
                     f"sample {j:4d}/{len(order)}  "
                     f"elapsed={time.time() - t1:5.1f}s"
                 )
-        proj = feedforward_proj(brain)
+        proj = brain.get_projection("input", "cortex")
         w = proj.syn_weight[:proj.n_synapses]
         print(
             f"  -> after epoch {epoch + 1}: "
