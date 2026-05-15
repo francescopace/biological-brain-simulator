@@ -159,11 +159,13 @@ unsupervised workflow on a much smaller setup:
 - reduced `4-class` task (`0-3`)
 - `28x28 -> 14x14` downsampling (`196` input neurons)
 - unsupervised STDP on `input->cortex`
-- template-based readout over cortex response patterns
+- explicit excitatory/inhibitory cortex microcircuit for stronger competition
+- blended readout over cortex spike and voltage templates
 
 The current `4-class` prototype learns clearly above chance (`25%`) and
-reached about **65%** in the best reduced smoke test, with the default
-configuration landing around **50%**. That is enough to validate the
+reached about **67.5%** in the best reduced smoke test, with the current
+default configuration landing around **62.5%** and eliminating no-response
+cases in the validation run. That is enough to validate the
 dataset plumbing and the STDP/readout loop on a multi-class image task,
 but not enough to claim Phase 3 is solved.
 
@@ -184,8 +186,12 @@ Key techniques:
 - **Pre-allocated neuron arrays** up to `max_neurons`; synapse arrays grow via capacity-doubling when needed
 - **Dead flags** (`syn_alive`, `neuron_alive`) for pruning and apoptosis — no costly array compaction
 
-Current limitations: synaptogenesis pair enumeration and pattern completion still use Python loops, which become the bottleneck at large network sizes. See the MNIST roadmap in [BENCHMARKS.md](BENCHMARKS.md) for planned optimizations (sparse connectivity, loop vectorization, profiling).
+Current limitations: the per-neuron scans in homeostatic plasticity and metaplasticity have already been vectorized, so the main remaining large-scale bottlenecks are elsewhere: synaptogenesis pair enumeration, pattern completion, and the dense per-step memory/bandwidth cost of very large connectivity. See the MNIST roadmap in [BENCHMARKS.md](BENCHMARKS.md) for the next round of optimizations (sparse connectivity, additional loop removal, profiling).
 
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
+
+## Author
+
+Francesco Pace

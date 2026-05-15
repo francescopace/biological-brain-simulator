@@ -135,11 +135,12 @@ Three candidates, each testing a different capability. Pick based on Step 1 resu
 
 **Current status**: an initial prototype exists in `examples/mnist_prototype.py`.
 It uses real MNIST, but on a reduced `4-class` task (`0-3`) with
-`28x28 -> 14x14` downsampling, unsupervised STDP on `input->cortex`, and a
-template-based readout over cortex responses. Best reduced smoke test reached
-roughly **65%** accuracy on a tiny split, while the current default setup is
-around **50%**: good enough to validate the pipeline, not yet good enough to
-count as the full Step 3 benchmark.
+`28x28 -> 14x14` downsampling, unsupervised STDP on `input->cortex`, an
+explicit excitatory/inhibitory cortex microcircuit, and a blended spike +
+voltage template readout. Best reduced smoke test reached roughly **67.5%**
+accuracy on a tiny split, while the current default setup is around
+**62.5%** with no no-response samples: good enough to validate the pipeline,
+not yet good enough to count as the full Step 3 benchmark.
 
 **Prerequisites**:
 - Optimize the Python simulation loop (vectorize remaining per-neuron loops in homeostasis/metaplasticity) — partially addressed
@@ -166,12 +167,13 @@ count as the full Step 3 benchmark.
 **What is already validated by the prototype**:
 - true-image dataset loading and preprocessing
 - unsupervised feedforward STDP in a reduced multi-class image task
-- post-hoc template readout from excitatory association neurons
+- post-hoc spike/voltage template readout from excitatory association neurons
+- explicit cortex competition via excitatory/inhibitory microcircuit wiring
 - rough computational feasibility of a small MNIST-like setup
 
 **What still blocks the full benchmark**:
-- stronger winner-take-all / competition so cortex neurons specialize more evenly
-- a more stable readout than the current reduced-template prototype
+- stronger and more even winner-take-all specialization across all classes
+- a readout that scales beyond the current reduced spike/voltage template prototype
 - extension from reduced `4-class` MNIST to 10 classes
 - profiling at the intended `784 + 400 + 400` scale
 

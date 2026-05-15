@@ -35,6 +35,7 @@ except ImportError:
 from src.brain import Brain, Projection
 from src.neuron import FiringPattern, NeuronType
 from src.region import Region, RegionType
+from src.synapse import NeurotransmitterType
 
 
 # --- Dataset / prototype scope ---------------------------------------------
@@ -49,8 +50,12 @@ N_INPUT = IMAGE_SIDE * IMAGE_SIDE
 
 # --- Network / training hyperparameters ------------------------------------
 
-N_CORTEX = 120
-CORTEX_CONNECTIVITY = 0.05
+N_CORTEX_EXC = 96
+N_CORTEX_INH = 24
+CORTEX_CONNECTIVITY = 0.0
+EXC_TO_INH_DENSITY = 0.30
+INH_TO_EXC_DENSITY = 0.50
+INH_LATERAL_WEIGHT = 4.0
 INPUT_TO_CORTEX_DENSITY = 0.25
 INPUT_WEIGHT_BOOST = 6.0
 
@@ -61,6 +66,8 @@ REST_STEPS = 10
 EPOCHS = 1
 ASSIGN_TOP_K = 12
 TEST_REPEATS = 2
+SPIKE_SCORE_WEIGHT = 0.7
+VOLTAGE_SCORE_WEIGHT = 0.3
 
 ENCODER_MAX_CURRENT = 30.0
 ENCODER_NOISE = 0.03
@@ -108,11 +115,17 @@ def build_brain(seed: int = SEED) -> Brain:
         brain,
         "cortex",
         RegionType.ASSOCIATION,
-        n_neurons=N_CORTEX,
-        connectivity=CORTEX_CONNECTIVITY,
-        max_neurons=N_CORTEX,
+        n_neurons=0,
+        connectivity=0.0,
+        max_neurons=N_CORTEX_EXC + N_CORTEX_INH,
         seed=seed + 2,
     )
+    cortex_rng = np.random.default_rng(seed + 20)
+    for _ in range(N_CORTEX_EXC):
+        cortex.add_neuron(NeuronType.EXCITATORY, FiringPattern.REGULAR_SPIKING)
+    for _ in range(N_CORTEX_INH):
+        cortex.add_neuron(NeuronType.INHIBITORY, FiringPattern.FAST_SPIKING)
+    wire_cortex_microcircuit(cortex, cortex_rng)
 
     brain.connect_regions("input", "cortex", density=INPUT_TO_CORTEX_DENSITY)
     proj = feedforward_proj(brain)
@@ -140,6 +153,56 @@ def build_brain(seed: int = SEED) -> Brain:
     brain.encoder._rng = np.random.default_rng(seed + 100)
 
     return brain
+
+
+def wire_cortex_microcircuit(cortex: Region, rng: np.random.Generator) -> None:
+    n = cortex.n_neurons
+    if n == 0:
+        return
+
+    types = cortex.neuron_type[:n]
+    exc_idx = np.where(types == NeuronType.EXCITATORY)[0]
+    inh_idx = np.where(types == NeuronType.INHIBITORY)[0]
+
+    # Sparse recurrent excitation among excitatory neurons.
+    if len(exc_idx) > 1 and CORTEX_CONNECTIVITY > 0:
+        conn = rng.random((len(exc_idx), len(exc_idx))) < CORTEX_CONNECTIVITY
+        np.fill_diagonal(conn, False)
+        pre_local, post_local = np.where(conn)
+        if len(pre_local) > 0:
+            cortex.add_synapses(
+                exc_idx[pre_local].astype(np.int32),
+                exc_idx[post_local].astype(np.int32),
+                rng.exponential(0.5, size=len(pre_local)),
+                rng.uniform(1.0, 5.0, size=len(pre_local)),
+                np.full(len(pre_local), NeurotransmitterType.GLUTAMATE.value),
+            )
+
+    # Excitatory neurons recruit inhibitory interneurons.
+    if len(exc_idx) > 0 and len(inh_idx) > 0 and EXC_TO_INH_DENSITY > 0:
+        conn = rng.random((len(exc_idx), len(inh_idx))) < EXC_TO_INH_DENSITY
+        pre_local, post_local = np.where(conn)
+        if len(pre_local) > 0:
+            cortex.add_synapses(
+                exc_idx[pre_local].astype(np.int32),
+                inh_idx[post_local].astype(np.int32),
+                rng.exponential(0.4, size=len(pre_local)),
+                rng.uniform(1.0, 3.0, size=len(pre_local)),
+                np.full(len(pre_local), NeurotransmitterType.GLUTAMATE.value),
+            )
+
+    # Fast inhibitory feedback enforces winner-take-all competition.
+    if len(inh_idx) > 0 and len(exc_idx) > 0 and INH_TO_EXC_DENSITY > 0:
+        conn = rng.random((len(inh_idx), len(exc_idx))) < INH_TO_EXC_DENSITY
+        pre_local, post_local = np.where(conn)
+        if len(pre_local) > 0:
+            cortex.add_synapses(
+                inh_idx[pre_local].astype(np.int32),
+                exc_idx[post_local].astype(np.int32),
+                np.full(len(pre_local), INH_LATERAL_WEIGHT),
+                rng.uniform(1.0, 2.0, size=len(pre_local)),
+                np.full(len(pre_local), NeurotransmitterType.GABA.value),
+            )
 
 
 def feedforward_proj(brain: Brain) -> Projection:
@@ -252,19 +315,22 @@ def present_sample(
     x: np.ndarray,
     n_steps: int,
     learn: bool = False,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     cortex = brain.regions["cortex"]
     exc_idx = excitatory_cortex_indices(brain)
     before = cortex.total_spikes[exc_idx].copy()
+    voltage_sum = np.zeros(len(exc_idx), dtype=np.float64)
 
     for _ in range(n_steps):
         brain.stimulate("input", x)
         brain.step()
+        voltage_sum += cortex.v[exc_idx]
         if learn:
             apply_feedforward_stdp(brain)
 
     counts = cortex.total_spikes[exc_idx] - before
-    return counts
+    mean_voltage = voltage_sum / max(n_steps, 1)
+    return counts, mean_voltage
 
 
 def assign_neuron_labels(
@@ -279,7 +345,7 @@ def assign_neuron_labels(
 
     class_to_row = {cls: i for i, cls in enumerate(classes)}
     for x, label in zip(X, y):
-        counts = present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False)
+        counts, _ = present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False)
         active = np.flatnonzero(counts > 0)
         if len(active) > 0:
             top_k = min(ASSIGN_TOP_K, len(active))
@@ -298,39 +364,55 @@ def build_response_templates(
     X: np.ndarray,
     y: np.ndarray,
     classes: tuple[int, ...] | None = None,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     classes = CLASSES if classes is None else classes
-    responses = []
+    spike_responses = []
+    voltage_responses = []
     for x in X:
-        responses.append(present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False).astype(np.float64))
+        counts, mean_voltage = present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False)
+        spike_responses.append(counts.astype(np.float64))
+        voltage_responses.append(mean_voltage.astype(np.float64))
         reset_brain_state(brain)
-    responses_arr = np.asarray(responses, dtype=np.float64)
+    spike_arr = np.asarray(spike_responses, dtype=np.float64)
+    voltage_arr = np.asarray(voltage_responses, dtype=np.float64)
 
-    templates = np.zeros((len(classes), responses_arr.shape[1]), dtype=np.float64)
+    spike_templates = np.zeros((len(classes), spike_arr.shape[1]), dtype=np.float64)
+    voltage_templates = np.zeros((len(classes), voltage_arr.shape[1]), dtype=np.float64)
     for i, cls in enumerate(classes):
-        cls_resp = responses_arr[y == cls]
-        if len(cls_resp) > 0:
-            templates[i] = cls_resp.mean(axis=0)
-    norms = np.linalg.norm(templates, axis=1, keepdims=True) + 1e-9
-    return templates / norms
+        cls_spike = spike_arr[y == cls]
+        cls_voltage = voltage_arr[y == cls]
+        if len(cls_spike) > 0:
+            spike_templates[i] = cls_spike.mean(axis=0)
+        if len(cls_voltage) > 0:
+            voltage_templates[i] = cls_voltage.mean(axis=0)
+
+    spike_templates /= (np.linalg.norm(spike_templates, axis=1, keepdims=True) + 1e-9)
+    voltage_templates /= (np.linalg.norm(voltage_templates, axis=1, keepdims=True) + 1e-9)
+    return spike_templates, voltage_templates
 
 
 def predict_sample(
     brain: Brain,
     x: np.ndarray,
-    templates: np.ndarray,
+    spike_templates: np.ndarray,
+    voltage_templates: np.ndarray,
     classes: tuple[int, ...] | None = None,
 ) -> tuple[int, np.ndarray]:
     classes = CLASSES if classes is None else classes
-    counts = np.zeros(templates.shape[1], dtype=np.float64)
+    counts = np.zeros(spike_templates.shape[1], dtype=np.float64)
+    voltage_sum = np.zeros(spike_templates.shape[1], dtype=np.float64)
     for _ in range(TEST_REPEATS):
-        counts += present_sample(brain, x, TEST_PRESENT_STEPS, learn=False)
+        spike_counts, mean_voltage = present_sample(brain, x, TEST_PRESENT_STEPS, learn=False)
+        counts += spike_counts
+        voltage_sum += mean_voltage
         reset_brain_state(brain)
-    if counts.sum() <= 0:
-        return -1, np.zeros(len(classes), dtype=np.float64)
 
-    query = counts / (np.linalg.norm(counts) + 1e-9)
-    scores = templates @ query
+    spike_query = counts / (np.linalg.norm(counts) + 1e-9)
+    voltage_query = voltage_sum / (np.linalg.norm(voltage_sum) + 1e-9)
+    scores = (
+        SPIKE_SCORE_WEIGHT * (spike_templates @ spike_query)
+        + VOLTAGE_SCORE_WEIGHT * (voltage_templates @ voltage_query)
+    )
     if scores.max() <= 0:
         return -1, scores
     return int(classes[int(np.argmax(scores))]), scores
@@ -340,13 +422,14 @@ def evaluate(
     brain: Brain,
     X: np.ndarray,
     y: np.ndarray,
-    templates: np.ndarray,
+    spike_templates: np.ndarray,
+    voltage_templates: np.ndarray,
     classes: tuple[int, ...] | None = None,
 ) -> tuple[float, np.ndarray]:
     classes = CLASSES if classes is None else classes
     preds = np.full(len(X), -1, dtype=np.int64)
     for i, x in enumerate(X):
-        preds[i], _ = predict_sample(brain, x, templates, classes)
+        preds[i], _ = predict_sample(brain, x, spike_templates, voltage_templates, classes)
     return float(np.mean(preds == y)), preds
 
 
@@ -420,7 +503,7 @@ def main() -> None:
     print("  Building readout")
     print("-" * 68)
     exc_idx, neuron_labels = assign_neuron_labels(brain, X_train, y_train)
-    templates = build_response_templates(brain, X_train, y_train)
+    spike_templates, voltage_templates = build_response_templates(brain, X_train, y_train)
     labelled = neuron_labels >= 0
     print(f"  Excitatory cortex neurons: {len(exc_idx)}")
     print(f"  Labelled excitatory neurons: {int(np.sum(labelled))}/{len(exc_idx)}")
@@ -430,7 +513,7 @@ def main() -> None:
     print("\n" + "-" * 68)
     print("  Evaluation")
     print("-" * 68)
-    acc, preds = evaluate(brain, X_test, y_test, templates)
+    acc, preds = evaluate(brain, X_test, y_test, spike_templates, voltage_templates)
     no_response = int(np.sum(preds < 0))
     cm = confusion_matrix(y_test, preds)
 
