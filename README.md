@@ -45,7 +45,7 @@ python examples/learn_association.py
 python examples/growing_brain.py
 python examples/iris_benchmark.py      # classification benchmark
 python examples/grid_nav_benchmark.py  # grid navigation benchmark
-python examples/mnist_prototype.py     # reduced MNIST prototype
+python examples/mnist_prototype.py     # MNIST benchmark (10-class, 784+400+400)
 ```
 
 ## Project structure
@@ -70,7 +70,7 @@ examples/
 ├── growing_brain.py       # A brain that grows from scratch
 ├── iris_benchmark.py      # Iris classification with R-STDP (86.7% accuracy)
 ├── grid_nav_benchmark.py  # Grid navigation with R-STDP (100% success, 4.38 steps)
-└── mnist_prototype.py     # Reduced MNIST prototype for unsupervised STDP/readout
+└── mnist_prototype.py     # MNIST benchmark: 10-class unsupervised STDP (56% accuracy)
 
 BENCHMARKS.md              # Detailed benchmark results and methodology
 ```
@@ -149,30 +149,29 @@ R-STDP, but action selection is decoded from the learned `input->motor`
 weights because raw motor spike argmax was too noisy for stable control.
 See [BENCHMARKS.md](BENCHMARKS.md) for detailed results and methodology.
 
-## Reduced MNIST Prototype
+## MNIST Benchmark
 
-`examples/mnist_prototype.py` is the first Phase 3 stepping stone. It is
-not the full MNIST benchmark yet; instead it validates the end-to-end
-unsupervised workflow on a much smaller setup:
+`examples/mnist_prototype.py` is the Step 3 benchmark following the Diehl &
+Cook 2015 architecture:
 
-- real MNIST loaded from OpenML
-- reduced `4-class` task (`0-3`)
-- `28x28 -> 14x14` downsampling (`196` input neurons) with L1 intensity equalization
+- real MNIST loaded from OpenML, all **10 digit classes**
+- `784` input neurons (full `28x28`, rate coded) with L1 intensity equalization
+- `400` excitatory + `400` inhibitory cortex neurons (`190k` total synapses)
 - unsupervised STDP on `input->cortex` with per-neuron weight normalization
-- explicit excitatory/inhibitory cortex microcircuit for winner-take-all competition
-- adaptive excitability threshold during training (neurons that fire too much become harder to activate)
+- adaptive excitability threshold during training
+- winner-take-all exc/inh microcircuit for competitive specialization
 - blended readout over cortex spike and voltage templates
 
-The current `4-class` prototype reaches **75-77.5%** accuracy consistently,
-with all four classes receiving dedicated excitatory neurons and zero
-no-response samples. Earlier versions were stuck at ~62.5% because class 1
-(digit "1") received zero dedicated neurons; L1 intensity equalization,
-adaptive thresholds, and proper weight clipping resolved the
-specialization imbalance.
+The current configuration reaches **56%** test accuracy on 10-class MNIST
+(chance: 10%), with all 10 classes receiving dedicated excitatory neurons
+and zero no-response samples. The full run completes in under **4 minutes**
+(training: 128s, readout: 72s, evaluation: 27s) with `1,584` neurons and
+`190k` synapses.
 
-The main remaining work is scaling from the reduced `4-class` MNIST to
-the planned 10-class benchmark, which will require profiling at the
-`784 + 400 + 400` neuron scale and potentially sparse connectivity.
+The gap to the Diehl & Cook target (87% with 400 exc neurons) is mainly due
+to using only `50` training images per class (vs 6,000 in the paper) and
+shorter presentation windows (`25` steps vs `700`). These can be increased
+at the cost of longer wall time.
 
 ## Performance
 
@@ -187,7 +186,7 @@ Key techniques:
 - **Pre-allocated neuron arrays** up to `max_neurons`; synapse arrays grow via capacity-doubling when needed
 - **Dead flags** (`syn_alive`, `neuron_alive`) for pruning and apoptosis — no costly array compaction
 
-Current limitations: the per-neuron scans in homeostatic plasticity and metaplasticity have already been vectorized, so the main remaining large-scale bottlenecks are elsewhere: synaptogenesis pair enumeration, pattern completion, and the dense per-step memory/bandwidth cost of very large connectivity. See the MNIST roadmap in [BENCHMARKS.md](BENCHMARKS.md) for the next round of optimizations (sparse connectivity, additional loop removal, profiling).
+Current limitations: the per-neuron scans in homeostatic plasticity and metaplasticity have already been vectorized, and weight normalization uses fully vectorized `np.add.at` rather than per-neuron loops. The main remaining large-scale bottlenecks are synaptogenesis pair enumeration, pattern completion, and the dense per-step memory/bandwidth cost of very large connectivity. The full MNIST benchmark (`784+400+400`, `190k` synapses) runs at ~85ms per training sample, demonstrating feasible simulation speed at this scale.
 
 ## License
 

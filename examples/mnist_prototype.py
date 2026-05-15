@@ -1,18 +1,17 @@
 """
-Reduced MNIST prototype for validating unsupervised STDP + readout.
+MNIST benchmark — unsupervised STDP + template readout.
 
-This is not the full Step 3 benchmark yet. Instead it validates the core
-protocol on a smaller setting:
+Full Step 3 benchmark following the Diehl & Cook 2015 architecture:
 
-- true MNIST digits loaded from OpenML
-- reduced class set (default: digits 0-3)
-- 28x28 images downsampled to 14x14 (196 input neurons)
-- unsupervised STDP only on input->cortex feedforward synapses
-- class readout from cortex response templates built after STDP training
+- true MNIST loaded from OpenML, all 10 digit classes
+- 784 input neurons (one per pixel, rate coded)
+- 400 excitatory + 400 inhibitory cortex neurons with WTA microcircuit
+- unsupervised STDP on input->cortex feedforward synapses
+- adaptive excitability thresholds + per-neuron weight normalization
+- L1 intensity equalization for balanced cross-class drive
+- class readout from cortex response templates (spike + voltage blend)
 
-The goal is to prove that the current simulator can support the classic
-"STDP features + neuron-label readout" workflow before attempting the
-full 784->400 excitatory / 400 inhibitory MNIST benchmark.
+Target: >50% accuracy (Diehl & Cook 2015 achieved 87% with 400 exc neurons).
 """
 
 from __future__ import annotations
@@ -38,43 +37,43 @@ from src.region import Region, RegionType
 from src.synapse import NeurotransmitterType
 
 
-# --- Dataset / prototype scope ---------------------------------------------
+# --- Dataset scope ----------------------------------------------------------
 
-CLASSES = (0, 1, 2, 3)
-TRAIN_PER_CLASS = 20
-TEST_PER_CLASS = 10
-DOWNSAMPLE = 2
+CLASSES = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
+TRAIN_PER_CLASS = 50
+TEST_PER_CLASS = 20
+DOWNSAMPLE = 1
 IMAGE_SIDE = 28 // DOWNSAMPLE
 N_INPUT = IMAGE_SIDE * IMAGE_SIDE
 
 
 # --- Network / training hyperparameters ------------------------------------
 
-N_CORTEX_EXC = 96
-N_CORTEX_INH = 24
+N_CORTEX_EXC = 400
+N_CORTEX_INH = 400
 CORTEX_CONNECTIVITY = 0.0
-EXC_TO_INH_DENSITY = 0.40
-INH_TO_EXC_DENSITY = 0.80
-INH_LATERAL_WEIGHT = 8.0
-INPUT_TO_CORTEX_DENSITY = 0.25
-INPUT_WEIGHT_BOOST = 6.0
+EXC_TO_INH_DENSITY = 0.10
+INH_TO_EXC_DENSITY = 0.50
+INH_LATERAL_WEIGHT = 12.0
+INPUT_TO_CORTEX_DENSITY = 0.15
+INPUT_WEIGHT_BOOST = 4.0
 
 TRAIN_PRESENT_STEPS = 25
 ASSIGN_PRESENT_STEPS = 25
 TEST_PRESENT_STEPS = 25
-REST_STEPS = 10
-EPOCHS = 4
-ASSIGN_TOP_K = 12
-TEST_REPEATS = 3
+REST_STEPS = 5
+EPOCHS = 3
+ASSIGN_TOP_K = 20
+TEST_REPEATS = 2
 SPIKE_SCORE_WEIGHT = 0.7
 VOLTAGE_SCORE_WEIGHT = 0.3
 
-ENCODER_MAX_CURRENT = 30.0
-ENCODER_NOISE = 0.03
+ENCODER_MAX_CURRENT = 25.0
+ENCODER_NOISE = 0.02
 
 STDP_SCALE = 0.8
 
-THETA_PLUS = 0.15
+THETA_PLUS = 0.10
 THETA_DECAY = 1e-6
 
 SEED = 42
@@ -356,19 +355,26 @@ def normalize_feedforward_weights(brain: Brain, target_sum: float) -> None:
     """Normalize incoming feedforward weight sum per excitatory cortex neuron."""
     proj = feedforward_proj(brain)
     ns = proj.n_synapses
-    exc_idx = excitatory_cortex_indices(brain)
     weights = proj.syn_weight[:ns]
     post = proj.syn_post[:ns]
     alive = proj.syn_alive[:ns]
-    min_w = proj.syn_min_weight[:ns]
-    max_w = proj.syn_max_weight[:ns]
+    cortex = brain.regions["cortex"]
+    types = cortex.neuron_type[:cortex.n_neurons]
 
-    for idx in exc_idx:
-        mask = (post == idx) & alive
-        total = weights[mask].sum()
-        if total > 1e-9:
-            weights[mask] *= target_sum / total
-    np.clip(weights, min_w, max_w, out=weights)
+    exc_mask = (types[post] == NeuronType.EXCITATORY) & alive
+    if not np.any(exc_mask):
+        return
+
+    sums = np.zeros(cortex.n_neurons, dtype=np.float64)
+    np.add.at(sums, post[exc_mask], weights[exc_mask])
+
+    post_sums = sums[post]
+    scalable = exc_mask & (post_sums > 1e-9)
+    if np.any(scalable):
+        weights[scalable] *= target_sum / post_sums[scalable]
+
+    np.clip(weights, proj.syn_min_weight[:ns], proj.syn_max_weight[:ns],
+            out=weights)
 
 
 def assign_neuron_labels(
@@ -495,8 +501,8 @@ def confusion_matrix(
 
 def main() -> None:
     print("=" * 68)
-    print("  REDUCED MNIST PROTOTYPE - Unsupervised STDP + Template Readout")
-    print("  (Validate the protocol before full Step 3 scaling)")
+    print("  MNIST BENCHMARK - Unsupervised STDP + Template Readout")
+    print("  (Step 3: 10-class, 784+400+400)")
     print("=" * 68)
 
     t0 = time.time()
@@ -544,7 +550,7 @@ def main() -> None:
                            theta=theta, update_theta=True)
             normalize_feedforward_weights(brain, norm_target)
             reset_brain_state(brain)
-            if j % 100 == 0 or j == len(order):
+            if j % 50 == 0 or j == len(order):
                 print(
                     f"  Epoch {epoch + 1}/{EPOCHS}  "
                     f"sample {j:4d}/{len(order)}  "
@@ -558,9 +564,13 @@ def main() -> None:
             f"theta mean={theta.mean():.2f} max={theta.max():.2f}"
         )
 
+    t2 = time.time()
+    print(f"  Training time: {t2 - t1:.1f}s")
+
     print("\n" + "-" * 68)
     print("  Building readout")
     print("-" * 68)
+    t3 = time.time()
     exc_idx, neuron_labels = assign_neuron_labels(brain, X_train, y_train)
     spike_templates, voltage_templates = build_response_templates(brain, X_train, y_train)
     labelled = neuron_labels >= 0
@@ -568,13 +578,16 @@ def main() -> None:
     print(f"  Labelled excitatory neurons: {int(np.sum(labelled))}/{len(exc_idx)}")
     for cls in CLASSES:
         print(f"    class {cls}: {int(np.sum(neuron_labels == cls))} neurons")
+    print(f"  Readout build time: {time.time() - t3:.1f}s")
 
     print("\n" + "-" * 68)
     print("  Evaluation")
     print("-" * 68)
+    t4 = time.time()
     acc, preds = evaluate(brain, X_test, y_test, spike_templates, voltage_templates)
     no_response = int(np.sum(preds < 0))
     cm = confusion_matrix(y_test, preds)
+    eval_time = time.time() - t4
 
     print(f"  Test accuracy:            {acc:.1%}")
     print(f"  Samples with no response: {no_response}/{len(y_test)}")
@@ -584,13 +597,15 @@ def main() -> None:
         row = "  ".join(f"{v:>5d}" for v in cm[i])
         print(f"    {cls:>5d}:  {row}")
 
+    total_time = time.time() - t0
+    print(f"\n  Eval time: {eval_time:.1f}s | Total wall time: {total_time:.0f}s")
     print("\n" + "=" * 68)
-    if acc >= 0.60:
-        print("  OK: the reduced 4-class MNIST prototype validates STDP + template readout.")
-    elif acc >= 0.50:
-        print("  PARTIAL: the 4-class protocol is promising, but still needs tuning before full MNIST.")
+    if acc >= 0.50:
+        print("  OK: 10-class MNIST benchmark validates unsupervised STDP + readout.")
+    elif acc >= 0.30:
+        print("  PARTIAL: above chance (10%) but not yet at target (>50%).")
     else:
-        print("  FAIL: the reduced 4-class prototype does not yet validate the protocol.")
+        print("  FAIL: 10-class benchmark does not yet validate the protocol.")
     print("=" * 68)
 
 

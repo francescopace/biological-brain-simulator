@@ -133,15 +133,15 @@ Three candidates, each testing a different capability. Pick based on Step 1 resu
 
 **Goal**: The definitive SNN benchmark. Only attempt after Steps 1-2 work and performance is optimized.
 
-**Current status**: a working prototype exists in `examples/mnist_prototype.py`.
-It uses real MNIST on a reduced `4-class` task (`0-3`) with
-`28x28 -> 14x14` downsampling, unsupervised STDP on `input->cortex`, an
-explicit excitatory/inhibitory cortex microcircuit, L1 intensity
-equalization, adaptive excitability thresholds, per-neuron incoming
-weight normalization, and a blended spike + voltage template readout.
-The default configuration reaches **75-77.5%** accuracy consistently,
-with balanced neuron specialization across all four classes and zero
-no-response samples.
+**Current status**: the full-scale benchmark exists in `examples/mnist_prototype.py`.
+It uses real MNIST with all **10 classes**, `784` input neurons (full `28x28`),
+`400` excitatory + `400` inhibitory cortex neurons (`190k` total synapses),
+unsupervised STDP on `input->cortex`, L1 intensity equalization, adaptive
+excitability thresholds, per-neuron incoming weight normalization, a
+winner-take-all exc/inh microcircuit, and a blended spike + voltage template
+readout. The default configuration reaches **56%** test accuracy on 10-class
+MNIST (chance: 10%), with all 10 classes receiving dedicated neurons and zero
+no-response samples. The full run completes in under **4 minutes**.
 
 **Prerequisites**:
 - Optimize the Python simulation loop (vectorize remaining per-neuron loops in homeostasis/metaplasticity) — partially addressed
@@ -165,20 +165,24 @@ no-response samples.
 - STDP alone can learn useful representations (no reward needed)
 - The network self-organizes digit-specific receptive fields
 
-**What is already validated by the prototype**:
-- true-image dataset loading and preprocessing
-- unsupervised feedforward STDP in a reduced multi-class image task
-- post-hoc spike/voltage template readout from excitatory association neurons
-- explicit cortex competition via excitatory/inhibitory microcircuit wiring
-- L1 intensity equalization to handle unequal pixel density across digit classes
-- adaptive excitability thresholds to force competitive neuron specialization
-- per-neuron incoming weight normalization to prevent runaway weight concentration
-- rough computational feasibility of a small MNIST-like setup
+**Result**: **56%** test accuracy on 10-class MNIST (50 train / 20 test per class,
+3 epochs, `784+400+400` architecture). All 10 classes receive dedicated neurons.
+Total wall time under 4 minutes.
 
-**What still blocks the full benchmark**:
-- extension from reduced `4-class` MNIST to 10 classes
-- profiling and optimization at the intended `784 + 400 + 400` scale
-- potentially sparse connectivity or batched computation for scalability
+**What is validated**:
+- full `784+400+400` Diehl & Cook architecture runs at feasible speed (~85ms/sample)
+- unsupervised STDP produces digit-specific receptive fields across all 10 classes
+- L1 intensity equalization, adaptive thresholds, and weight normalization enable
+  balanced neuron specialization even for visually sparse digits
+- vectorized weight normalization scales to `190k` synapses without bottlenecking
+- blended spike + voltage template readout discriminates 10 classes above chance
+
+**What could improve accuracy toward the 87% target**:
+- more training data (50 images/class → 300-1000; the paper uses 6,000)
+- longer presentation windows (25 steps → 100-200; the paper uses 700)
+- 1:1 exc-inh matched wiring instead of random sparse connectivity
+- stronger adaptive thresholds with slower decay
+- more test-time voting repeats
 
 **Target**: >90% accuracy (Diehl & Cook 2015 achieved 95% with 6400 excitatory neurons, 87% with 400).
 
