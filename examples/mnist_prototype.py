@@ -66,14 +66,16 @@ ASSIGN_TOP_K = 20
 TEST_REPEATS = 2
 SPIKE_SCORE_WEIGHT = 0.7
 VOLTAGE_SCORE_WEIGHT = 0.3
-
 ENCODER_MAX_CURRENT = 25.0
 ENCODER_NOISE = 0.02
 
 STDP_SCALE = 0.8
+STDP_A_PLUS = 0.01
+STDP_A_MINUS = 0.012
 
 THETA_PLUS = 0.10
 THETA_DECAY = 1e-6
+THETA_MAX = 25.0
 
 SEED = 42
 
@@ -135,8 +137,8 @@ def build_brain(seed: int = SEED) -> Brain:
     proj.syn_weight[:ns] *= INPUT_WEIGHT_BOOST
     np.clip(proj.syn_weight[:ns], proj.syn_min_weight[:ns],
             proj.syn_max_weight[:ns], out=proj.syn_weight[:ns])
-    proj.syn_A_plus[:ns] = 0.01 * STDP_SCALE
-    proj.syn_A_minus[:ns] = 0.012 * STDP_SCALE
+    proj.syn_A_plus[:ns] = STDP_A_PLUS * STDP_SCALE
+    proj.syn_A_minus[:ns] = STDP_A_MINUS * STDP_SCALE
 
     # Learn only on feedforward synapses onto excitatory cortex neurons.
     cortex_types = cortex.neuron_type[:cortex.n_neurons]
@@ -333,6 +335,8 @@ def present_sample(
             fired_exc = cortex.fired[exc_idx]
             theta += THETA_PLUS * fired_exc
             theta *= (1.0 - THETA_DECAY)
+            # Prevent long training runs from silencing the whole cortex.
+            np.minimum(theta, THETA_MAX, out=theta)
 
     counts = cortex.total_spikes[exc_idx] - before
     mean_voltage = voltage_sum / max(n_steps, 1)

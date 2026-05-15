@@ -139,9 +139,9 @@ It uses real MNIST with all **10 classes**, `784` input neurons (full `28x28`),
 unsupervised STDP on `input->cortex`, L1 intensity equalization, adaptive
 excitability thresholds, per-neuron incoming weight normalization, **1:1 matched
 exc-inh wiring** (Diehl & Cook WTA), and a blended spike + voltage template
-readout. The default configuration reaches **59-63%** test accuracy on 10-class
+readout. The default configuration reaches **58-60%** test accuracy on 10-class
 MNIST (chance: 10%), with all 10 classes receiving dedicated neurons and zero
-no-response samples. The full run completes in under **11 minutes**.
+no-response samples. The full run completes in under **8 minutes**.
 
 **Prerequisites**:
 - Optimize the Python simulation loop (vectorize remaining per-neuron loops in homeostasis/metaplasticity) — partially addressed
@@ -165,26 +165,38 @@ no-response samples. The full run completes in under **11 minutes**.
 - STDP alone can learn useful representations (no reward needed)
 - The network self-organizes digit-specific receptive fields
 
-**Result**: **59-63%** test accuracy on 10-class MNIST (150 train / 30 test per
+**Result**: **58-60%** test accuracy on 10-class MNIST (150 train / 30 test per
 class, 2 epochs, `784+400+400` architecture). All 10 classes receive dedicated
-neurons with balanced distribution. Total wall time under 11 minutes.
+neurons with balanced distribution. Total wall time under 8 minutes.
 
 **What is validated**:
 - full `784+400+400` Diehl & Cook architecture runs at feasible speed (~73ms/sample)
 - **1:1 matched exc-inh wiring** produces clean winner-take-all dynamics (160k
   internal synapses: 400 exc→inh matched + 159,600 inh→exc all-to-all-minus-self)
 - unsupervised STDP produces digit-specific receptive fields across all 10 classes
-- L1 intensity equalization, adaptive thresholds, and weight normalization enable
+- L1 intensity equalization, bounded adaptive thresholds, and weight normalization enable
   balanced neuron specialization even for visually sparse digits
 - vectorized weight normalization scales to `254k` synapses without bottlenecking
 - blended spike + voltage template readout discriminates 10 classes well above chance
 
+**What the latest experiments showed**:
+- adding a hard `theta` cap (`THETA_MAX = 25`) prevents runaway excitability suppression
+  during longer runs and keeps scaled training numerically stable
+- scaling to `300` images/class and `3` epochs with the existing template readout
+  remained stable but only reached **56.4%**, with `theta` saturating at the cap
+- replacing the blended template readout with pure population voting regressed badly
+  (**28.0%**, then **24.6%** with class-size normalization) and introduced no-response samples
+- increasing STDP asymmetry to `A_minus / A_plus = 2.0` over-pruned weak classes
+  (notably digit `8`), so the default keeps the milder `1.2x` ratio
+
 **What could improve accuracy toward the 87% target**:
-- more training data (150 images/class → 1000+; the paper uses 6,000)
+- a softer theta schedule (cap + slower growth or scheduled decay) so more data
+  can be used without saturating all excitatory neurons
+- more training data (150 images/class → 1000+; the paper uses 6,000), but only
+  after fixing the theta saturation bottleneck
 - longer presentation windows (25 steps → 100-200; the paper uses 700)
-- theta mechanism with bounded accumulation to allow more training epochs
-- fine-tuned STDP learning rates (A_plus / A_minus ratio)
-- more test-time voting repeats
+- a more robust readout than pure voting, e.g. better hybrid spike/voltage aggregation
+- finer STDP tuning around the current regime instead of a jump straight to `2.0x` LTD
 
 **Target**: >90% accuracy (Diehl & Cook 2015 achieved 95% with 6400 excitatory neurons, 87% with 400).
 
