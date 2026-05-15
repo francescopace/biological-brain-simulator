@@ -70,7 +70,7 @@ examples/
 ├── growing_brain.py       # A brain that grows from scratch
 ├── iris_benchmark.py      # Iris classification with R-STDP (86.7% accuracy)
 ├── grid_nav_benchmark.py  # Grid navigation with R-STDP (100% success, 4.38 steps)
-└── mnist_prototype.py     # MNIST benchmark: 10-class unsupervised STDP (56% accuracy)
+└── mnist_prototype.py     # MNIST benchmark: 10-class unsupervised STDP (59-63% accuracy)
 
 BENCHMARKS.md              # Detailed benchmark results and methodology
 ```
@@ -156,22 +156,22 @@ Cook 2015 architecture:
 
 - real MNIST loaded from OpenML, all **10 digit classes**
 - `784` input neurons (full `28x28`, rate coded) with L1 intensity equalization
-- `400` excitatory + `400` inhibitory cortex neurons (`190k` total synapses)
+- `400` excitatory + `400` inhibitory cortex neurons (`254k` total synapses)
 - unsupervised STDP on `input->cortex` with per-neuron weight normalization
 - adaptive excitability threshold during training
-- winner-take-all exc/inh microcircuit for competitive specialization
+- **1:1 matched exc-inh wiring** (Diehl & Cook WTA): each exc[i] drives
+  inh[i], each inh[i] suppresses all other exc neurons
 - blended readout over cortex spike and voltage templates
 
-The current configuration reaches **56%** test accuracy on 10-class MNIST
+The current configuration reaches **59-63%** test accuracy on 10-class MNIST
 (chance: 10%), with all 10 classes receiving dedicated excitatory neurons
-and zero no-response samples. The full run completes in under **4 minutes**
-(training: 128s, readout: 72s, evaluation: 27s) with `1,584` neurons and
-`190k` synapses.
+and zero no-response samples. The full run completes in under **11 minutes**
+(training: 220s, readout: 190s, evaluation: 38s) with `1,584` neurons and
+`254k` synapses (`150` training images per class, `2` epochs).
 
 The gap to the Diehl & Cook target (87% with 400 exc neurons) is mainly due
-to using only `50` training images per class (vs 6,000 in the paper) and
-shorter presentation windows (`25` steps vs `700`). These can be increased
-at the cost of longer wall time.
+to fewer training images (`150`/class vs `6,000` in the paper) and shorter
+presentation windows (`25` steps vs `700`).
 
 ## Performance
 
@@ -186,7 +186,7 @@ Key techniques:
 - **Pre-allocated neuron arrays** up to `max_neurons`; synapse arrays grow via capacity-doubling when needed
 - **Dead flags** (`syn_alive`, `neuron_alive`) for pruning and apoptosis — no costly array compaction
 
-Current limitations: the per-neuron scans in homeostatic plasticity and metaplasticity have already been vectorized, and weight normalization uses fully vectorized `np.add.at` rather than per-neuron loops. The main remaining large-scale bottlenecks are synaptogenesis pair enumeration, pattern completion, and the dense per-step memory/bandwidth cost of very large connectivity. The full MNIST benchmark (`784+400+400`, `190k` synapses) runs at ~85ms per training sample, demonstrating feasible simulation speed at this scale.
+Current limitations: the per-neuron scans in homeostatic plasticity and metaplasticity have already been vectorized, and weight normalization uses fully vectorized `np.add.at` rather than per-neuron loops. The main remaining large-scale bottlenecks are synaptogenesis pair enumeration, pattern completion, and the dense per-step memory/bandwidth cost of very large connectivity. The full MNIST benchmark (`784+400+400`, `254k` synapses) runs at ~73ms per training sample, demonstrating feasible simulation speed at this scale.
 
 ## License
 

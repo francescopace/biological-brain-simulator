@@ -40,8 +40,8 @@ from src.synapse import NeurotransmitterType
 # --- Dataset scope ----------------------------------------------------------
 
 CLASSES = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
-TRAIN_PER_CLASS = 50
-TEST_PER_CLASS = 20
+TRAIN_PER_CLASS = 150
+TEST_PER_CLASS = 30
 DOWNSAMPLE = 1
 IMAGE_SIDE = 28 // DOWNSAMPLE
 N_INPUT = IMAGE_SIDE * IMAGE_SIDE
@@ -52,9 +52,8 @@ N_INPUT = IMAGE_SIDE * IMAGE_SIDE
 N_CORTEX_EXC = 400
 N_CORTEX_INH = 400
 CORTEX_CONNECTIVITY = 0.0
-EXC_TO_INH_DENSITY = 0.10
-INH_TO_EXC_DENSITY = 0.50
-INH_LATERAL_WEIGHT = 12.0
+EXC_TO_INH_WEIGHT = 8.0
+INH_LATERAL_WEIGHT = 10.0
 INPUT_TO_CORTEX_DENSITY = 0.15
 INPUT_WEIGHT_BOOST = 4.0
 
@@ -62,7 +61,7 @@ TRAIN_PRESENT_STEPS = 25
 ASSIGN_PRESENT_STEPS = 25
 TEST_PRESENT_STEPS = 25
 REST_STEPS = 5
-EPOCHS = 3
+EPOCHS = 2
 ASSIGN_TOP_K = 20
 TEST_REPEATS = 2
 SPIKE_SCORE_WEIGHT = 0.7
@@ -161,6 +160,12 @@ def build_brain(seed: int = SEED) -> Brain:
 
 
 def wire_cortex_microcircuit(cortex: Region, rng: np.random.Generator) -> None:
+    """Wire 1:1 matched exc-inh pairs (Diehl & Cook 2015 WTA).
+
+    Each exc[i] drives exactly inh[i]; each inh[i] suppresses every
+    exc[j != i].  This creates much sharper winner-take-all competition
+    than random sparse connectivity.
+    """
     n = cortex.n_neurons
     if n == 0:
         return
@@ -168,46 +173,29 @@ def wire_cortex_microcircuit(cortex: Region, rng: np.random.Generator) -> None:
     types = cortex.neuron_type[:n]
     exc_idx = np.where(types == NeuronType.EXCITATORY)[0]
     inh_idx = np.where(types == NeuronType.INHIBITORY)[0]
+    n_matched = min(len(exc_idx), len(inh_idx))
+    if n_matched == 0:
+        return
 
-    # Sparse recurrent excitation among excitatory neurons.
-    if len(exc_idx) > 1 and CORTEX_CONNECTIVITY > 0:
-        conn = rng.random((len(exc_idx), len(exc_idx))) < CORTEX_CONNECTIVITY
-        np.fill_diagonal(conn, False)
-        pre_local, post_local = np.where(conn)
-        if len(pre_local) > 0:
-            cortex.add_synapses(
-                exc_idx[pre_local].astype(np.int32),
-                exc_idx[post_local].astype(np.int32),
-                rng.exponential(0.5, size=len(pre_local)),
-                rng.uniform(1.0, 5.0, size=len(pre_local)),
-                np.full(len(pre_local), NeurotransmitterType.GLUTAMATE.value),
-            )
+    # 1:1 exc[i] -> inh[i] with strong, fast connections.
+    cortex.add_synapses(
+        exc_idx[:n_matched].astype(np.int32),
+        inh_idx[:n_matched].astype(np.int32),
+        np.full(n_matched, EXC_TO_INH_WEIGHT),
+        np.full(n_matched, 1.0),
+        np.full(n_matched, NeurotransmitterType.GLUTAMATE.value),
+    )
 
-    # Excitatory neurons recruit inhibitory interneurons.
-    if len(exc_idx) > 0 and len(inh_idx) > 0 and EXC_TO_INH_DENSITY > 0:
-        conn = rng.random((len(exc_idx), len(inh_idx))) < EXC_TO_INH_DENSITY
-        pre_local, post_local = np.where(conn)
-        if len(pre_local) > 0:
-            cortex.add_synapses(
-                exc_idx[pre_local].astype(np.int32),
-                inh_idx[post_local].astype(np.int32),
-                rng.exponential(0.4, size=len(pre_local)),
-                rng.uniform(1.0, 3.0, size=len(pre_local)),
-                np.full(len(pre_local), NeurotransmitterType.GLUTAMATE.value),
-            )
-
-    # Fast inhibitory feedback enforces winner-take-all competition.
-    if len(inh_idx) > 0 and len(exc_idx) > 0 and INH_TO_EXC_DENSITY > 0:
-        conn = rng.random((len(inh_idx), len(exc_idx))) < INH_TO_EXC_DENSITY
-        pre_local, post_local = np.where(conn)
-        if len(pre_local) > 0:
-            cortex.add_synapses(
-                inh_idx[pre_local].astype(np.int32),
-                exc_idx[post_local].astype(np.int32),
-                np.full(len(pre_local), INH_LATERAL_WEIGHT),
-                rng.uniform(1.0, 2.0, size=len(pre_local)),
-                np.full(len(pre_local), NeurotransmitterType.GABA.value),
-            )
+    # Each inh[i] -> every exc[j != i] (all-to-all minus self-pair).
+    ii, jj = np.meshgrid(np.arange(n_matched), np.arange(n_matched), indexing="ij")
+    off_diag = ii != jj
+    cortex.add_synapses(
+        inh_idx[ii[off_diag]].astype(np.int32),
+        exc_idx[jj[off_diag]].astype(np.int32),
+        np.full(int(off_diag.sum()), INH_LATERAL_WEIGHT),
+        np.full(int(off_diag.sum()), 1.0),
+        np.full(int(off_diag.sum()), NeurotransmitterType.GABA.value),
+    )
 
 
 def feedforward_proj(brain: Brain) -> Projection:
