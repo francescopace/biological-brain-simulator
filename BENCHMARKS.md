@@ -139,9 +139,9 @@ It uses real MNIST with all **10 classes**, `784` input neurons (full `28x28`),
 unsupervised STDP on `input->cortex`, L1 intensity equalization, adaptive
 excitability thresholds, per-neuron incoming weight normalization, **1:1 matched
 exc-inh wiring** (Diehl & Cook WTA), and a blended spike + voltage template
-readout. The default configuration reaches **58-60%** test accuracy on 10-class
+readout. The default configuration reaches **62.2%** test accuracy on 10-class
 MNIST (chance: 10%), with all 10 classes receiving dedicated neurons and zero
-no-response samples. The full run completes in under **8 minutes**.
+no-response samples. The full run completes in under **19 minutes**.
 
 **Prerequisites**:
 - Optimize the Python simulation loop (vectorize remaining per-neuron loops in homeostasis/metaplasticity) — partially addressed
@@ -165,16 +165,16 @@ no-response samples. The full run completes in under **8 minutes**.
 - STDP alone can learn useful representations (no reward needed)
 - The network self-organizes digit-specific receptive fields
 
-**Result**: **58-60%** test accuracy on 10-class MNIST (150 train / 30 test per
-class, 2 epochs, `784+400+400` architecture). All 10 classes receive dedicated
-neurons with balanced distribution. Total wall time under 8 minutes.
+**Result**: **62.2%** test accuracy on 10-class MNIST (300 train / 50 test per
+class, 3 epochs, `784+400+400` architecture). All 10 classes receive dedicated
+neurons with balanced distribution. Total wall time under 19 minutes.
 
 **What is validated**:
 - full `784+400+400` Diehl & Cook architecture runs at feasible speed (~73ms/sample)
 - **1:1 matched exc-inh wiring** produces clean winner-take-all dynamics (160k
   internal synapses: 400 exc→inh matched + 159,600 inh→exc all-to-all-minus-self)
 - unsupervised STDP produces digit-specific receptive fields across all 10 classes
-- L1 intensity equalization, bounded adaptive thresholds, and weight normalization enable
+- L1 intensity equalization, leaky adaptive thresholds, and weight normalization enable
   balanced neuron specialization even for visually sparse digits
 - vectorized weight normalization scales to `254k` synapses without bottlenecking
 - blended spike + voltage template readout discriminates 10 classes well above chance
@@ -182,18 +182,21 @@ neurons with balanced distribution. Total wall time under 8 minutes.
 **What the latest experiments showed**:
 - adding a hard `theta` cap (`THETA_MAX = 25`) prevents runaway excitability suppression
   during longer runs and keeps scaled training numerically stable
-- scaling to `300` images/class and `3` epochs with the existing template readout
+- scaling to `300` images/class and `3` epochs with only the hard cap
   remained stable but only reached **56.4%**, with `theta` saturating at the cap
+- replacing the cap-only update with a **leaky theta rule**
+  (`theta += THETA_PLUS * fired - THETA_LEAK * theta`) unlocked the longer run
+  and improved the scaled benchmark to **62.2%**, while keeping zero no-response samples
 - replacing the blended template readout with pure population voting regressed badly
   (**28.0%**, then **24.6%** with class-size normalization) and introduced no-response samples
 - increasing STDP asymmetry to `A_minus / A_plus = 2.0` over-pruned weak classes
   (notably digit `8`), so the default keeps the milder `1.2x` ratio
 
 **What could improve accuracy toward the 87% target**:
-- a softer theta schedule (cap + slower growth or scheduled decay) so more data
-  can be used without saturating all excitatory neurons
-- more training data (150 images/class → 1000+; the paper uses 6,000), but only
-  after fixing the theta saturation bottleneck
+- more training data (`300` images/class → `1000+`; the paper uses `6,000`), now that
+  the theta saturation bottleneck is partially addressed
+- a better-calibrated leaky theta regime that keeps class competition stronger
+  without drifting toward the old saturation failure mode
 - longer presentation windows (25 steps → 100-200; the paper uses 700)
 - a more robust readout than pure voting, e.g. better hybrid spike/voltage aggregation
 - finer STDP tuning around the current regime instead of a jump straight to `2.0x` LTD

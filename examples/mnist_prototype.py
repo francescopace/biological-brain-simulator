@@ -40,8 +40,8 @@ from src.synapse import NeurotransmitterType
 # --- Dataset scope ----------------------------------------------------------
 
 CLASSES = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
-TRAIN_PER_CLASS = 150
-TEST_PER_CLASS = 30
+TRAIN_PER_CLASS = 300
+TEST_PER_CLASS = 50
 DOWNSAMPLE = 1
 IMAGE_SIDE = 28 // DOWNSAMPLE
 N_INPUT = IMAGE_SIDE * IMAGE_SIDE
@@ -61,7 +61,7 @@ TRAIN_PRESENT_STEPS = 25
 ASSIGN_PRESENT_STEPS = 25
 TEST_PRESENT_STEPS = 25
 REST_STEPS = 5
-EPOCHS = 2
+EPOCHS = 3
 ASSIGN_TOP_K = 20
 TEST_REPEATS = 2
 SPIKE_SCORE_WEIGHT = 0.7
@@ -74,7 +74,7 @@ STDP_A_PLUS = 0.01
 STDP_A_MINUS = 0.012
 
 THETA_PLUS = 0.10
-THETA_DECAY = 1e-6
+THETA_LEAK = 0.005
 THETA_MAX = 25.0
 
 SEED = 42
@@ -333,10 +333,9 @@ def present_sample(
             apply_feedforward_stdp(brain)
         if update_theta and theta is not None:
             fired_exc = cortex.fired[exc_idx]
-            theta += THETA_PLUS * fired_exc
-            theta *= (1.0 - THETA_DECAY)
-            # Prevent long training runs from silencing the whole cortex.
-            np.minimum(theta, THETA_MAX, out=theta)
+            theta += THETA_PLUS * fired_exc - THETA_LEAK * theta
+            # Keep theta non-negative and add a guardrail for long runs.
+            np.clip(theta, 0.0, THETA_MAX, out=theta)
 
     counts = cortex.total_spikes[exc_idx] - before
     mean_voltage = voltage_sum / max(n_steps, 1)

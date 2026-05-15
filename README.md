@@ -70,7 +70,7 @@ examples/
 ├── growing_brain.py       # A brain that grows from scratch
 ├── iris_benchmark.py      # Iris classification with R-STDP (86.7% accuracy)
 ├── grid_nav_benchmark.py  # Grid navigation with R-STDP (100% success, 4.38 steps)
-└── mnist_prototype.py     # MNIST benchmark: 10-class unsupervised STDP (58-60% accuracy)
+└── mnist_prototype.py     # MNIST benchmark: 10-class unsupervised STDP (62.2% accuracy)
 
 BENCHMARKS.md              # Detailed benchmark results and methodology
 ```
@@ -158,23 +158,22 @@ Cook 2015 architecture:
 - `784` input neurons (full `28x28`, rate coded) with L1 intensity equalization
 - `400` excitatory + `400` inhibitory cortex neurons (`254k` total synapses)
 - unsupervised STDP on `input->cortex` with per-neuron weight normalization
-- adaptive excitability threshold during training with a bounded `theta` cap
+- leaky adaptive excitability threshold during training, with a safety cap
 - **1:1 matched exc-inh wiring** (Diehl & Cook WTA): each exc[i] drives
   inh[i], each inh[i] suppresses all other exc neurons
 - blended readout over cortex spike and voltage templates
 
-The current configuration reaches **58-60%** test accuracy on 10-class MNIST
+The current configuration reaches **62.2%** test accuracy on 10-class MNIST
 (chance: 10%), with all 10 classes receiving dedicated excitatory neurons
-and zero no-response samples. The full run completes in under **8 minutes**
-(training: 215s, readout: 186s, evaluation: 36s) with `1,584` neurons and
-`254k` synapses (`150` training images per class, `2` epochs).
+and zero no-response samples. The full run completes in under **19 minutes**
+(training: 649s, readout: 381s, evaluation: 62s) with `1,584` neurons and
+`254k` synapses (`300` training images per class, `3` epochs).
 
 The gap to the Diehl & Cook target (87% with 400 exc neurons) is mainly due
-to fewer training images (`150`/class vs `6,000` in the paper) and shorter
-presentation windows (`25` steps vs `700`). Exploratory runs with
-`300` images/class + `3` epochs, pure population voting readout, and a
-stronger LTD ratio all regressed, so the default benchmark keeps the blended
-template readout and milder STDP asymmetry.
+to fewer training images (`300`/class vs `6,000` in the paper) and shorter
+presentation windows (`25` steps vs `700`). Earlier runs showed that a hard
+`theta` cap alone was not enough to scale training cleanly; the current leaky
+theta update is what makes the `300`/class, `3`-epoch regime stable.
 
 ## Performance
 
