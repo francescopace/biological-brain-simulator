@@ -13,8 +13,9 @@ import time as wall_time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import numpy as np
+import torch
 
+from .device import DEVICE
 from .growth import GrowthController, GrowthStats
 from .memory import MemorySystem
 from .neuron import NeuronType
@@ -48,7 +49,7 @@ class Projection:
     def _alloc(self, capacity: int) -> None:
         self._syn_capacity = capacity
         for attr, dtype, default in _SYN_SPECS:
-            setattr(self, attr, np.full(capacity, default, dtype=dtype))
+            setattr(self, attr, torch.full((capacity,), default, dtype=dtype, device=DEVICE))
 
     def _ensure_capacity(self, additional: int) -> None:
         needed = self.n_synapses + additional
@@ -57,7 +58,7 @@ class Projection:
         new_cap = max(self._syn_capacity * 2, needed)
         for attr, dtype, default in _SYN_SPECS:
             old = getattr(self, attr)
-            new = np.full(new_cap, default, dtype=dtype)
+            new = torch.full((new_cap,), default, dtype=dtype, device=DEVICE)
             new[:self.n_synapses] = old[:self.n_synapses]
             setattr(self, attr, new)
         self._syn_capacity = new_cap
@@ -112,7 +113,9 @@ class Brain:
         self.stats_history: list[BrainStats] = []
         self._stats_interval = 500
 
-        self._rng = np.random.default_rng(seed)
+        self._rng = torch.Generator(device=DEVICE)
+        if seed is not None:
+            self._rng.manual_seed(seed)
 
     # ── Region management ────────────────────────────────────────────
 
@@ -146,8 +149,8 @@ class Brain:
         tgt_n = tgt.n_neurons
 
         # Only excitatory neurons project long-range
-        exc_mask = src.neuron_type[:src_n] == NeuronType.EXCITATORY
-        exc_idx = np.where(exc_mask)[0]
+        exc_mask = src.neuron_type[:src_n] == NeuronType.EXCITATORY.value
+        exc_idx = torch.where(exc_mask)[0]
 
         if len(exc_idx) == 0 or tgt_n == 0:
             self.projections.append(proj)
@@ -156,8 +159,8 @@ class Brain:
             return 0
 
         # Vectorized connection generation
-        conn = self._rng.random((len(exc_idx), tgt_n)) < density
-        pre_local, post_idx = np.where(conn)
+        conn = torch.rand((len(exc_idx), tgt_n), device=DEVICE, generator=self._rng) < density
+        pre_local, post_idx = torch.where(conn)
         pre_idx = exc_idx[pre_local]
 
         if len(pre_idx) == 0:
@@ -172,18 +175,18 @@ class Brain:
         e = s + count
 
         sign, mod = NT_PROPERTIES[nt]
-        weights = self._rng.exponential(0.3, size=count)
+        weights = -torch.log(torch.rand(count, device=DEVICE, generator=self._rng)) * 0.3
         if sign < 0:
             weights = -weights
-        delays_ms = self._rng.uniform(3.0, 15.0, size=count)
-        delay_steps = np.clip(
-            np.round(delays_ms / self.dt).astype(np.int32),
+        delays_ms = torch.rand(count, device=DEVICE, generator=self._rng) * 12.0 + 3.0
+        delay_steps = torch.clamp(
+            torch.round(delays_ms / self.dt).to(torch.int32),
             1, MAX_DELAY_STEPS - 1,
         )
 
-        proj.syn_pre[s:e] = pre_idx
-        proj.syn_post[s:e] = post_idx
-        proj.syn_weight[s:e] = weights
+        proj.syn_pre[s:e] = pre_idx.to(torch.int32)
+        proj.syn_post[s:e] = post_idx.to(torch.int32)
+        proj.syn_weight[s:e] = weights.to(torch.float32)
         proj.syn_delay[s:e] = delay_steps
         proj.syn_modulation[s:e] = mod
         proj.syn_resource[s:e] = 1.0
@@ -208,7 +211,7 @@ class Brain:
     def stimulate(
         self,
         region_name: str,
-        values: list[float] | np.ndarray,
+        values: list[float] | torch.Tensor | object,
     ) -> int:
         region = self.regions[region_name]
         return self.encoder.encode(values, region, self.time)
@@ -246,17 +249,20 @@ class Brain:
     def inject_current(
         self,
         region_name: str,
-        neuron_indices: list[int] | np.ndarray,
+        neuron_indices: list[int] | torch.Tensor,
         current: float,
     ) -> None:
         region = self.regions[region_name]
-        idx = np.asarray(neuron_indices)
+        if not isinstance(neuron_indices, torch.Tensor):
+            idx = torch.tensor(neuron_indices, dtype=torch.int64, device=DEVICE)
+        else:
+            idx = neuron_indices.to(torch.int64)
         valid = idx < region.n_neurons
         region.current[idx[valid]] += current
 
     # ── Simulation step ──────────────────────────────────────────────
 
-    def step(self) -> dict[str, np.ndarray]:
+    def step(self) -> dict[str, torch.Tensor]:
         self.time += self.dt
         self.step_count += 1
 
@@ -266,7 +272,7 @@ class Brain:
             if ns == 0:
                 continue
             s = slice(0, ns)
-            proj.syn_resource[s] = np.minimum(1.0, proj.syn_resource[s] + _RECOVERY_RATE)
+            proj.syn_resource[s] = torch.clamp(proj.syn_resource[s] + _RECOVERY_RATE, max=1.0)
             proj.syn_facilitation[s] *= 0.98
             proj.syn_age[s] += 1
             proj.syn_recent[s] *= _TRANSMISSION_DECAY
@@ -279,7 +285,7 @@ class Brain:
                 region.current[:region.n_neurons] += osc_current
 
         # 3. Step each region (reads buffer, integrates, propagates internal)
-        all_fired: dict[str, np.ndarray] = {}
+        all_fired: dict[str, torch.Tensor] = {}
         for name, region in self.regions.items():
             fired = region.step(self.time, self.step_count)
             all_fired[name] = fired
@@ -294,22 +300,31 @@ class Brain:
             target = self.regions[proj.target_name]
 
             pre_fired = source.fired[proj.syn_pre[:ns]] & proj.syn_alive[:ns]
-            active = np.where(pre_fired)[0]
+            active = torch.where(pre_fired)[0]
 
             if len(active) > 0:
                 res = proj.syn_resource[active]
                 fac = proj.syn_facilitation[active]
                 mod = proj.syn_modulation[active]
-                effective = proj.syn_weight[active] * res * (1.0 + fac) * mod
 
-                proj.syn_resource[active] = np.maximum(0.0, res - _DEPLETION_RATE)
+                proj.syn_resource[active] = torch.clamp(res - _DEPLETION_RATE, min=0.0)
                 proj.syn_facilitation[active] += 0.05
                 proj.syn_total_tx[active] += 1
                 proj.syn_recent[active] += 1.0
 
+                # Build temporary CSR for projection (since projections don't change topology often, we could cache this too)
+                # But for now, we can just use index_add_ or build a quick COO tensor
+                # Since the plan specifically asked for sparse tensors:
+                effective = proj.syn_weight[active] * res * (1.0 + fac) * mod
                 slots = (self.step_count + proj.syn_delay[active]) % MAX_DELAY_STEPS
                 posts = proj.syn_post[active]
-                np.add.at(target.spike_buffer, (slots, posts), effective)
+                
+                # We can use index_add_ here because building CSR for active only is not SpMV, it's just scatter.
+                # To do SpMV, we need the full W matrix. Since projections don't have a built-in CSR cache yet,
+                # let's just use index_add_ for projections, as the plan mainly targets Region's internal dense connections.
+                # Actually, let's use index_add_ for projections to keep it simple.
+                flat_indices = slots * target.spike_buffer.size(1) + posts
+                target.spike_buffer.view(-1).index_add_(0, flat_indices.to(torch.int64), effective)
 
         # 5. Event-driven R-STDP on region-internal synapses.
         #    Each region's own `fired` array drives STDP computations; the
@@ -419,10 +434,10 @@ class Brain:
         total_neurons = sum(r.n_alive_neurons for r in self.regions.values())
         total_synapses = (
             sum(r.n_alive_synapses for r in self.regions.values())
-            + sum(int(np.sum(p.syn_alive[:p.n_synapses])) for p in self.projections)
+            + sum(int(torch.sum(p.syn_alive[:p.n_synapses]).item()) for p in self.projections)
         )
         total_spikes = sum(
-            int(np.sum(r.total_spikes[:r.n_neurons]))
+            int(torch.sum(r.total_spikes[:r.n_neurons]).item())
             for r in self.regions.values()
         )
         regions_info = {}

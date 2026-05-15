@@ -9,11 +9,11 @@ Format:
     brain_save/
       meta.json               # version, time, step_count, config
       regions/
-        <name>.npz             # all neuron + synapse arrays
+        <name>.pt             # all neuron + synapse arrays (torch)
       projections/
-        <src>_to_<tgt>.npz     # inter-region synapse arrays
-      memory.json              # memory traces
-      subsystems.json          # plasticity, growth, oscillator state
+        <src>_to_<tgt>.pt    # inter-region synapse arrays (torch)
+      memory.json             # memory traces
+      subsystems.json         # plasticity, growth, oscillator state
 """
 
 from __future__ import annotations
@@ -22,16 +22,17 @@ import json
 import shutil
 from pathlib import Path
 
-import numpy as np
+import torch
 
 from .brain import Brain, Projection
+from .device import DEVICE
 from .growth import GrowthStats
 from .memory import MemoryTrace
 from .oscillator import FrequencyBand
 from .region import MAX_DELAY_STEPS, Region, RegionType, _SYN_SPECS
 from .stimulus import EncodingStrategy
 
-_VERSION = 3
+_VERSION = 4
 
 
 def save_brain(brain: Brain, path: str | Path) -> None:
@@ -51,18 +52,20 @@ def save_brain(brain: Brain, path: str | Path) -> None:
         "dt": brain.dt,
         "stats_interval": brain._stats_interval,
         "region_names": list(brain.regions.keys()),
-        "rng_state": brain._rng.bit_generator.state,
     }
     _write_json(root / "meta.json", meta)
 
+    # Save brain RNG
+    torch.save(brain._rng.get_state(), root / "brain_rng.pt")
+
     # ── Regions ──────────────────────────────────────────────────
     for name, region in brain.regions.items():
-        _save_region(root / "regions" / f"{name}.npz", region)
+        _save_region(root / "regions" / f"{name}.pt", region)
 
     # ── Projections ──────────────────────────────────────────────
     proj_info = []
     for i, proj in enumerate(brain.projections):
-        fname = f"{proj.source_name}_to_{proj.target_name}_{i}.npz"
+        fname = f"{proj.source_name}_to_{proj.target_name}_{i}.pt"
         _save_projection(root / "projections" / fname, proj)
         proj_info.append({
             "source": proj.source_name,
@@ -79,7 +82,6 @@ def save_brain(brain: Brain, path: str | Path) -> None:
         "replay_strength": brain.memory.replay_strength,
         "trace_threshold": brain.memory.trace_threshold,
         "step_counter": brain.memory._step_counter,
-        "rng_state": brain.memory._rng.bit_generator.state,
         "traces": [
             {
                 "neuron_indices": t.neuron_indices.tolist(),
@@ -93,6 +95,7 @@ def save_brain(brain: Brain, path: str | Path) -> None:
         ],
     }
     _write_json(root / "memory.json", memory_data)
+    torch.save(brain.memory._rng.get_state(), root / "memory_rng.pt")
 
     # ── Subsystems ───────────────────────────────────────────────
     subsystems = {
@@ -113,6 +116,8 @@ def save_brain(brain: Brain, path: str | Path) -> None:
             "scaling_rate": brain.homeostasis.scaling_rate,
             "check_interval": brain.homeostasis.check_interval,
             "step_counter": brain.homeostasis._step_counter,
+            "theta_plus": brain.homeostasis.theta_plus,
+            "theta_leak": brain.homeostasis.theta_leak,
         },
         "metaplasticity": {
             "adaptation_rate": brain.metaplasticity.adaptation_rate,
@@ -127,7 +132,6 @@ def save_brain(brain: Brain, path: str | Path) -> None:
             "max_new_synapses_per_cycle": brain.growth.max_new_synapses_per_cycle,
             "max_new_neurons_per_cycle": brain.growth.max_new_neurons_per_cycle,
             "step_counter": brain.growth._step_counter,
-            "rng_state": brain.growth._rng.bit_generator.state,
             "history": [
                 {
                     "neurons_born": g.neurons_born,
@@ -146,6 +150,8 @@ def save_brain(brain: Brain, path: str | Path) -> None:
         },
     }
     _write_json(root / "subsystems.json", subsystems)
+    torch.save(brain.growth._rng.get_state(), root / "growth_rng.pt")
+    torch.save(brain.encoder._rng.get_state(), root / "encoder_rng.pt")
 
 
 def load_brain(path: str | Path) -> Brain:
@@ -159,12 +165,14 @@ def load_brain(path: str | Path) -> Brain:
     brain.time = meta["time"]
     brain.step_count = meta["step_count"]
     brain._stats_interval = meta["stats_interval"]
-    brain._rng = np.random.default_rng()
-    brain._rng.bit_generator.state = meta["rng_state"]
+
+    rng_state_path = root / "brain_rng.pt"
+    if rng_state_path.exists():
+        brain._rng.set_state(torch.load(rng_state_path, weights_only=True))
 
     # ── Regions ──────────────────────────────────────────────────
     for name in meta["region_names"]:
-        region = _load_region(root / "regions" / f"{name}.npz", brain.dt)
+        region = _load_region(root / "regions" / f"{name}.pt", brain.dt)
         brain.regions[name] = region
         brain.oscillators.add_region(name, region.region_type)
 
@@ -185,12 +193,13 @@ def load_brain(path: str | Path) -> Brain:
     brain.memory.replay_strength = mem_data["replay_strength"]
     brain.memory.trace_threshold = mem_data["trace_threshold"]
     brain.memory._step_counter = mem_data["step_counter"]
-    brain.memory._rng = np.random.default_rng()
-    brain.memory._rng.bit_generator.state = mem_data["rng_state"]
+    mem_rng_path = root / "memory_rng.pt"
+    if mem_rng_path.exists():
+        brain.memory._rng.set_state(torch.load(mem_rng_path, weights_only=True))
     brain.memory.traces = [
         MemoryTrace(
-            neuron_indices=np.array(t["neuron_indices"], dtype=np.int32),
-            activity_snapshot=np.array(t["activity_snapshot"]),
+            neuron_indices=torch.tensor(t["neuron_indices"], dtype=torch.int64, device=DEVICE),
+            activity_snapshot=torch.tensor(t["activity_snapshot"], dtype=torch.float32, device=DEVICE),
             region_name=t["region_name"],
             strength=t["strength"],
             replay_count=t["replay_count"],
@@ -216,6 +225,8 @@ def load_brain(path: str | Path) -> Brain:
     brain.homeostasis.scaling_rate = sub["homeostasis"]["scaling_rate"]
     brain.homeostasis.check_interval = sub["homeostasis"]["check_interval"]
     brain.homeostasis._step_counter = sub["homeostasis"]["step_counter"]
+    brain.homeostasis.theta_plus = sub["homeostasis"].get("theta_plus", 0.10)
+    brain.homeostasis.theta_leak = sub["homeostasis"].get("theta_leak", 0.005)
 
     brain.metaplasticity.adaptation_rate = sub["metaplasticity"]["adaptation_rate"]
 
@@ -229,8 +240,9 @@ def load_brain(path: str | Path) -> Brain:
     brain.growth.max_new_synapses_per_cycle = g["max_new_synapses_per_cycle"]
     brain.growth.max_new_neurons_per_cycle = g["max_new_neurons_per_cycle"]
     brain.growth._step_counter = g["step_counter"]
-    brain.growth._rng = np.random.default_rng()
-    brain.growth._rng.bit_generator.state = g["rng_state"]
+    growth_rng_path = root / "growth_rng.pt"
+    if growth_rng_path.exists():
+        brain.growth._rng.set_state(torch.load(growth_rng_path, weights_only=True))
     brain.growth.history = [
         GrowthStats(**h) for h in g["history"]
     ]
@@ -240,6 +252,9 @@ def load_brain(path: str | Path) -> Brain:
     brain.encoder.strategy = EncodingStrategy(sub["encoder"]["strategy"])
     brain.encoder.max_current = sub["encoder"]["max_current"]
     brain.encoder.noise_level = sub["encoder"]["noise_level"]
+    encoder_rng_path = root / "encoder_rng.pt"
+    if encoder_rng_path.exists():
+        brain.encoder._rng.set_state(torch.load(encoder_rng_path, weights_only=True))
 
     return brain
 
@@ -247,15 +262,15 @@ def load_brain(path: str | Path) -> Brain:
 # ── Internal helpers ─────────────────────────────────────────────────
 
 def _save_region(path: Path, region: Region) -> None:
-    """Save region neuron + synapse arrays to NPZ."""
+    """Save region neuron + synapse arrays."""
     n = region.n_neurons
     ns = region.n_synapses
 
-    arrays = {
-        "region_type": np.array([region.region_type.value], dtype="U20"),
-        "max_neurons": np.array([region.max_neurons]),
-        "n_neurons": np.array([n]),
-        "n_synapses": np.array([ns]),
+    state = {
+        "region_type": region.region_type.value,
+        "max_neurons": region.max_neurons,
+        "n_neurons": n,
+        "n_synapses": ns,
         # Neuron arrays
         "v": region.v[:n],
         "u": region.u[:n],
@@ -271,33 +286,28 @@ def _save_region(path: Path, region: Region) -> None:
         "last_spike_time": region.last_spike_time[:n],
         "current": region.current[:n],
         "fired": region.fired[:n],
+        "theta": region.theta[:n],
         # Spike buffer
         "spike_buffer": region.spike_buffer[:, :n],
+        # RNG
+        "rng_state": region._rng.get_state(),
     }
 
     # Synapse arrays
     for attr, dtype, default in _SYN_SPECS:
-        arrays[attr] = getattr(region, attr)[:ns]
+        state[attr] = getattr(region, attr)[:ns]
 
-    # RNG state
-    rng_state = region._rng.bit_generator.state
-    arrays["rng_state_kind"] = np.array([rng_state["bit_generator"]], dtype="U30")
-
-    np.savez_compressed(path, **arrays)
-
-    # Save RNG state separately as JSON (complex nested dict)
-    rng_path = path.with_suffix(".rng.json")
-    _write_json(rng_path, rng_state)
+    torch.save(state, path)
 
 
 def _load_region(path: Path, dt: float) -> Region:
-    """Load region from NPZ."""
-    data = np.load(path, allow_pickle=False)
+    """Load region from torch checkpoint."""
+    data = torch.load(path, map_location=DEVICE, weights_only=True)
 
-    region_type = RegionType(str(data["region_type"][0]))
-    max_neurons = int(data["max_neurons"][0])
-    n = int(data["n_neurons"][0])
-    ns = int(data["n_synapses"][0])
+    region_type = RegionType(data["region_type"])
+    max_neurons = data["max_neurons"]
+    n = data["n_neurons"]
+    ns = data["n_synapses"]
 
     region = Region(
         name=path.stem,
@@ -321,6 +331,8 @@ def _load_region(path: Path, dt: float) -> Region:
     region.last_spike_time[:n] = data["last_spike_time"]
     region.current[:n] = data["current"]
     region.fired[:n] = data["fired"]
+    if "theta" in data:
+        region.theta[:n] = data["theta"]
     region.spike_buffer[:, :n] = data["spike_buffer"]
 
     # Synapse arrays
@@ -331,26 +343,23 @@ def _load_region(path: Path, dt: float) -> Region:
             getattr(region, attr)[:ns] = data[attr]
 
     # RNG state
-    rng_path = path.with_suffix(".rng.json")
-    if rng_path.exists():
-        rng_state = _read_json(rng_path)
-        region._rng = np.random.default_rng()
-        region._rng.bit_generator.state = rng_state
+    if "rng_state" in data:
+        region._rng.set_state(data["rng_state"])
 
     return region
 
 
 def _save_projection(path: Path, proj: Projection) -> None:
     ns = proj.n_synapses
-    arrays = {"n_synapses": np.array([ns])}
+    state = {"n_synapses": ns}
     for attr, dtype, default in _SYN_SPECS:
-        arrays[attr] = getattr(proj, attr)[:ns]
-    np.savez_compressed(path, **arrays)
+        state[attr] = getattr(proj, attr)[:ns]
+    torch.save(state, path)
 
 
 def _load_projection(path: Path, source: str, target: str) -> Projection:
-    data = np.load(path, allow_pickle=False)
-    ns = int(data["n_synapses"][0])
+    data = torch.load(path, map_location=DEVICE, weights_only=True)
+    ns = data["n_synapses"]
 
     proj = Projection(source, target)
     proj._ensure_capacity(ns)
@@ -406,13 +415,7 @@ def _read_json(path: Path) -> dict:
 
 
 def _json_default(obj):
-    """Handle numpy types in JSON serialization."""
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if isinstance(obj, np.floating):
-        return float(obj)
-    if isinstance(obj, np.ndarray):
+    """Handle torch types in JSON serialization."""
+    if isinstance(obj, torch.Tensor):
         return obj.tolist()
-    if isinstance(obj, np.bool_):
-        return bool(obj)
     raise TypeError(f"Object of type {type(obj)} is not JSON serializable")

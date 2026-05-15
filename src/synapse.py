@@ -2,7 +2,7 @@
 Synapse type definitions and neurotransmitter properties.
 
 Actual synaptic state (weights, delays, STP variables) is stored as
-dense NumPy arrays in Region and Projection objects.
+dense PyTorch tensors in Region and Projection objects.
 """
 
 from __future__ import annotations
@@ -11,11 +11,11 @@ import enum
 
 
 class NeurotransmitterType(enum.Enum):
-    GLUTAMATE = "glutamate"
-    GABA = "gaba"
-    DOPAMINE = "dopamine"
-    SEROTONIN = "serotonin"
-    ACETYLCHOLINE = "acetylcholine"
+    GLUTAMATE = 1
+    GABA = 2
+    DOPAMINE = 3
+    SEROTONIN = 4
+    ACETYLCHOLINE = 5
 
 
 # (sign, modulation_factor) per neurotransmitter

@@ -35,7 +35,7 @@ The brain starts small and grows organically as it receives input, forming new n
 
 ## Quickstart
 
-**Requirements:** Python >= 3.10, plus numpy, matplotlib, networkx, scikit-learn (all pinned in `requirements.txt`).
+**Requirements:** Python >= 3.10, plus PyTorch, matplotlib, networkx, scikit-learn (all pinned in `requirements.txt`).
 
 ```bash
 pip install -r requirements.txt
@@ -55,7 +55,8 @@ src/
 ├── __init__.py      # Public API re-exports
 ├── neuron.py        # Neuron types and Izhikevich parameters
 ├── synapse.py       # Neurotransmitter types and properties
-├── region.py        # Brain region (vectorized NumPy arrays)
+├── device.py        # Compute device selection (CPU/MPS/CUDA)
+├── region.py        # Brain region (vectorized PyTorch tensors)
 ├── brain.py         # Top-level orchestrator + inter-region projections
 ├── plasticity.py    # STDP, R-STDP, homeostatic, metaplasticity (BCM)
 ├── growth.py        # Neurogenesis, synaptogenesis, pruning, apoptosis
@@ -158,37 +159,41 @@ Cook 2015 architecture:
 - `784` input neurons (full `28x28`, rate coded) with L1 intensity equalization
 - `400` excitatory + `400` inhibitory cortex neurons (`254k` total synapses)
 - unsupervised STDP on `input->cortex` with per-neuron weight normalization
-- leaky adaptive excitability threshold during training, with a safety cap
+- leaky adaptive excitability threshold (theta) integrated into `Region` state
+  and updated every step by `HomeostaticPlasticity`
 - **1:1 matched exc-inh wiring** (Diehl & Cook WTA): each exc[i] drives
   inh[i], each inh[i] suppresses all other exc neurons
 - blended readout over cortex spike and voltage templates
 
 The current configuration reaches **62.2%** test accuracy on 10-class MNIST
 (chance: 10%), with all 10 classes receiving dedicated excitatory neurons
-and zero no-response samples. The full run completes in under **19 minutes**
-(training: 649s, readout: 381s, evaluation: 62s) with `1,584` neurons and
+and zero no-response samples. The full run completes in under **17 minutes**
+(training: 636s, readout: 316s, evaluation: 48s) with `1,584` neurons and
 `254k` synapses (`300` training images per class, `3` epochs).
 
 The gap to the Diehl & Cook target (87% with 400 exc neurons) is mainly due
 to fewer training images (`300`/class vs `6,000` in the paper) and shorter
-presentation windows (`25` steps vs `700`). Earlier runs showed that a hard
-`theta` cap alone was not enough to scale training cleanly; the current leaky
-theta update is what makes the `300`/class, `3`-epoch regime stable.
+presentation windows (`25` steps vs `700`). The leaky theta update integrated
+into `HomeostaticPlasticity` is what makes the `300`/class, `3`-epoch regime
+stable.
 
 ## Performance
 
-All neuron and synapse state lives in dense NumPy arrays (structure-of-arrays layout). A single `Region.step()` call advances thousands of neurons in parallel rather than looping over individual Python objects.
+All neuron and synapse state lives in dense PyTorch tensors (structure-of-arrays layout). A single `Region.step()` call advances thousands of neurons in parallel rather than looping over individual Python objects.
 
 Key techniques:
 
+- **PyTorch tensors** on CPU — profiling showed CPU is 16x faster than MPS (Apple GPU) for SNN workloads due to kernel launch overhead dominating at this tensor size. Override with `BRAIN_DEVICE=mps` for large networks (10k+ neurons).
 - **Vectorized Izhikevich integration** with configurable sub-stepping (`dt / 0.5`)
-- **Ring buffer** for spike delays — `np.add.at` deposits postsynaptic currents into future slots; each timestep reads and clears the current slot
-- **Event-driven STDP** — nearest-neighbor pairing updates only synapses whose pre or post neuron fired this step, not the entire weight matrix every timestep
-- **Sparse-like propagation** — synapses are stored as COO-style parallel arrays; spike delivery filters on `fired[syn_pre]` so only active synapses are touched
+- **Ring buffer** for spike delays — `index_add_` deposits postsynaptic currents into future slots; each timestep reads and clears the current slot
+- **Event-driven STDP** — nearest-neighbor pairing updates only synapses whose pre or post neuron fired this step, not the entire weight matrix every timestep. Sync-free implementation avoids GPU stalls.
+- **Sparse-like propagation** — synapses are stored as COO-style parallel arrays; spike delivery filters on `fired[syn_pre]` so only active synapses are touched (O(active) not O(all))
+- **Vectorized stimulus encoding** — rate/temporal/population coding computed in a single tensor operation instead of per-neuron Python loops
+- **Vectorized synaptogenesis** — co-activity scoring via `torch.outer` instead of nested Python loops
 - **Pre-allocated neuron arrays** up to `max_neurons`; synapse arrays grow via capacity-doubling when needed
 - **Dead flags** (`syn_alive`, `neuron_alive`) for pruning and apoptosis — no costly array compaction
 
-Current limitations: the per-neuron scans in homeostatic plasticity and metaplasticity have already been vectorized, and weight normalization uses fully vectorized `np.add.at` rather than per-neuron loops. The main remaining large-scale bottlenecks are synaptogenesis pair enumeration, pattern completion, and the dense per-step memory/bandwidth cost of very large connectivity. The full MNIST benchmark (`784+400+400`, `254k` synapses) runs at ~73ms per training sample, demonstrating feasible simulation speed at this scale.
+The full MNIST benchmark (`784+400+400`, `254k` synapses) runs at ~70ms per training sample on a MacBook Air M2, completing 3 epochs of 3000 samples in ~10.5 minutes.
 
 ## License
 

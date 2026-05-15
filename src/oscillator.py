@@ -19,9 +19,9 @@ phase. This is critical for multi-item working memory.
 from __future__ import annotations
 
 import enum
+import math
+import random
 from dataclasses import dataclass, field
-
-import numpy as np
 
 
 class FrequencyBand(enum.Enum):
@@ -71,22 +71,22 @@ class Oscillator:
         Returns the current oscillatory value in [-amplitude, +amplitude].
         """
         dt_s = dt_ms / 1000.0
-        self.phase += 2.0 * np.pi * self.frequency * dt_s
+        self.phase += 2.0 * math.pi * self.frequency * dt_s
 
         # Phase coupling: pull phase toward coupled oscillator
         if self.coupled_to is not None and self.coupling_strength > 0:
             phase_diff = self.coupled_to.phase - self.phase
-            self.phase += self.coupling_strength * np.sin(phase_diff) * dt_s
+            self.phase += self.coupling_strength * math.sin(phase_diff) * dt_s
 
         # Keep phase in [0, 2π)
-        self.phase = self.phase % (2.0 * np.pi)
+        self.phase = self.phase % (2.0 * math.pi)
 
-        return self.amplitude * np.sin(self.phase)
+        return self.amplitude * math.sin(self.phase)
 
     @property
     def current_phase_normalized(self) -> float:
         """Phase normalized to [0, 1] — 0=trough, 0.25=rising, 0.5=peak, 0.75=falling."""
-        return self.phase / (2.0 * np.pi)
+        return self.phase / (2.0 * math.pi)
 
 
 class OscillatorBank:
@@ -119,7 +119,7 @@ class OscillatorBank:
             osc = Oscillator(
                 frequency=freq,
                 amplitude=amp,
-                phase=np.random.uniform(0, 2 * np.pi),
+                phase=random.uniform(0, 2 * math.pi),
                 band=band,
             )
             oscs.append(osc)
@@ -168,4 +168,4 @@ class OscillatorBank:
         if phase is None:
             return 1.0
         # Peak at phase=0.5 (sin=1), trough at phase=0 (sin=0)
-        return 0.5 + 0.5 * np.sin(2.0 * np.pi * phase)
+        return 0.5 + 0.5 * math.sin(2.0 * math.pi * phase)

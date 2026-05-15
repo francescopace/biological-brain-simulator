@@ -9,7 +9,7 @@ continuous stimulation — just like a developing brain.
 import sys
 from pathlib import Path
 
-import numpy as np
+import random
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -42,7 +42,7 @@ def main():
     print(f"\nStarting state:")
     print(brain.summary())
 
-    rng = np.random.default_rng(42)
+    rng = random.Random(42)
 
     # Simulate continuous varied stimulation
     def varied_stimulus(brain_ref, step):

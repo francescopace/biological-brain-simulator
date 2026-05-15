@@ -11,7 +11,7 @@ differential equations:
     if v >= 30 mV then v = c, u = u + d
 
 Parameters a, b, c, d define the neuron type and firing pattern.
-Actual neuron state is stored as dense NumPy arrays in Region.
+Actual neuron state is stored as dense PyTorch tensors in Region.
 """
 
 from __future__ import annotations

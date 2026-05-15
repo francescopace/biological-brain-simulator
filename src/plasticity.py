@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-import numpy as np
+import torch
 
 if TYPE_CHECKING:
     from .region import Region
@@ -43,73 +43,64 @@ class STDP:
 
     def apply_event(
         self,
-        fired_pre: np.ndarray,            # bool [n_neurons_src]
-        fired_post: np.ndarray,           # bool [n_neurons_dst]
-        syn_pre: np.ndarray,              # int32 [n_syn]
-        syn_post: np.ndarray,             # int32 [n_syn]
-        pre_last_spike_arr: np.ndarray,   # float64 [n_neurons_src]
-        post_last_spike_arr: np.ndarray,  # float64 [n_neurons_dst]
-        A_plus: np.ndarray,
-        A_minus: np.ndarray,
-        alive: np.ndarray,
-        weights: np.ndarray,
-        min_weight: np.ndarray,
-        max_weight: np.ndarray,
+        fired_pre: torch.Tensor,            # bool [n_neurons_src]
+        fired_post: torch.Tensor,           # bool [n_neurons_dst]
+        syn_pre: torch.Tensor,              # int32 [n_syn]
+        syn_post: torch.Tensor,             # int32 [n_syn]
+        pre_last_spike_arr: torch.Tensor,   # float32 [n_neurons_src]
+        post_last_spike_arr: torch.Tensor,  # float32 [n_neurons_dst]
+        A_plus: torch.Tensor,
+        A_minus: torch.Tensor,
+        alive: torch.Tensor,
+        weights: torch.Tensor,
+        min_weight: torch.Tensor,
+        max_weight: torch.Tensor,
         current_time: float,
-        eligibility: np.ndarray | None = None,
+        eligibility: torch.Tensor | None = None,
     ) -> int:
         """
-        Apply nearest-neighbor STDP to synapses whose pre or post fired this step.
+        Apply nearest-neighbor STDP (sync-free for GPU performance).
 
-        LTP arm: post just fired → look back at pre's last spike. dt >= 0 means
-        pre fired before post (causal) → potentiate.
-        LTD arm: pre just fired → look back at post's last spike. dt >= 0 means
-        post fired before pre (anti-causal) → depress.
-
-        If `eligibility` is given, dw is accumulated into the eligibility trace
-        (for reward-modulated STDP). Otherwise dw is applied directly to weights
-        and clipped to [min_weight, max_weight].
-
-        Returns the number of synapses that received a non-zero update.
+        Computes LTP/LTD without CPU-GPU synchronization points
+        (no torch.any() guards). Operations on empty index sets are near-zero cost.
         """
         window = self.stdp_window
-        n_changes = 0
+        pre_i64 = syn_pre.to(torch.int64)
+        post_i64 = syn_post.to(torch.int64)
 
         # ── LTP arm: post fired this step ────────────────────────────
-        post_fired_syn = fired_post[syn_post] & alive
-        if np.any(post_fired_syn):
-            idx = np.where(post_fired_syn)[0]
-            dt = current_time - pre_last_spike_arr[syn_pre[idx]]
-            within = np.isfinite(dt) & (dt >= 0.0) & (dt < window)
-            if np.any(within):
-                sel = idx[within]
-                dw = A_plus[sel] * np.exp(-dt[within] / self.tau_plus) * self.learning_rate
+        post_fired_syn = fired_post[post_i64] & alive
+        idx_ltp = torch.where(post_fired_syn)[0]
+        if idx_ltp.numel() > 0:
+            dt = current_time - pre_last_spike_arr[pre_i64[idx_ltp]]
+            within = (dt >= 0.0) & (dt < window)
+            sel = idx_ltp[within]
+            if sel.numel() > 0:
+                dw = A_plus[sel] * torch.exp(-dt[within] / self.tau_plus) * self.learning_rate
                 if eligibility is not None:
                     eligibility[sel] += dw
                 else:
-                    weights[sel] = np.clip(
+                    weights[sel] = torch.clamp(
                         weights[sel] + dw, min_weight[sel], max_weight[sel],
                     )
-                n_changes += int(sel.size)
 
         # ── LTD arm: pre fired this step ─────────────────────────────
-        pre_fired_syn = fired_pre[syn_pre] & alive
-        if np.any(pre_fired_syn):
-            idx = np.where(pre_fired_syn)[0]
-            dt = current_time - post_last_spike_arr[syn_post[idx]]
-            within = np.isfinite(dt) & (dt >= 0.0) & (dt < window)
-            if np.any(within):
-                sel = idx[within]
-                dw = -A_minus[sel] * np.exp(-dt[within] / self.tau_minus) * self.learning_rate
+        pre_fired_syn = fired_pre[pre_i64] & alive
+        idx_ltd = torch.where(pre_fired_syn)[0]
+        if idx_ltd.numel() > 0:
+            dt = current_time - post_last_spike_arr[post_i64[idx_ltd]]
+            within = (dt >= 0.0) & (dt < window)
+            sel = idx_ltd[within]
+            if sel.numel() > 0:
+                dw = -A_minus[sel] * torch.exp(-dt[within] / self.tau_minus) * self.learning_rate
                 if eligibility is not None:
                     eligibility[sel] += dw
                 else:
-                    weights[sel] = np.clip(
+                    weights[sel] = torch.clamp(
                         weights[sel] + dw, min_weight[sel], max_weight[sel],
                     )
-                n_changes += int(sel.size)
 
-        return n_changes
+        return 0
 
 
 class RewardModulatedSTDP:
@@ -175,19 +166,19 @@ class RewardModulatedSTDP:
     def apply_target(
         self,
         target: str,
-        fired_pre: np.ndarray,
-        fired_post: np.ndarray,
-        syn_pre: np.ndarray,
-        syn_post: np.ndarray,
-        pre_last_spike_arr: np.ndarray,
-        post_last_spike_arr: np.ndarray,
-        weights: np.ndarray,
-        A_plus: np.ndarray,
-        A_minus: np.ndarray,
-        alive: np.ndarray,
-        min_weight: np.ndarray,
-        max_weight: np.ndarray,
-        eligibility: np.ndarray,
+        fired_pre: torch.Tensor,
+        fired_post: torch.Tensor,
+        syn_pre: torch.Tensor,
+        syn_post: torch.Tensor,
+        pre_last_spike_arr: torch.Tensor,
+        post_last_spike_arr: torch.Tensor,
+        weights: torch.Tensor,
+        A_plus: torch.Tensor,
+        A_minus: torch.Tensor,
+        alive: torch.Tensor,
+        min_weight: torch.Tensor,
+        max_weight: torch.Tensor,
+        eligibility: torch.Tensor,
         current_time: float,
     ) -> int:
         """
@@ -209,17 +200,16 @@ class RewardModulatedSTDP:
         )
 
         # 2. Decay eligibility (single vectorized multiply)
-        eligibility *= np.exp(-1.0 / self.tau_eligibility)
+        eligibility *= torch.exp(torch.tensor(-1.0 / self.tau_eligibility, device=eligibility.device))
 
         # 3. Apply eligibility × dopamine if this target has non-baseline dopamine
         da = self.dopamine.get(target, self.baseline_dopamine)
         if abs(da - self.baseline_dopamine) > 1e-6:
             dw = eligibility * da
-            mask = alive & (np.abs(dw) > 1e-8)
-            if np.any(mask):
-                weights[mask] = np.clip(
-                    weights[mask] + dw[mask], min_weight[mask], max_weight[mask],
-                )
+            mask = alive & (torch.abs(dw) > 1e-8)
+            weights[mask] = torch.clamp(
+                weights[mask] + dw[mask], min_weight[mask], max_weight[mask],
+            )
 
         # 4. Decay dopamine[target] toward baseline
         if target in self.dopamine:
@@ -237,21 +227,33 @@ class RewardModulatedSTDP:
 
 
 class HomeostaticPlasticity:
-    """Synaptic scaling to maintain target firing rates."""
+    """Synaptic scaling and adaptive excitability threshold (theta) to maintain target firing rates."""
 
     def __init__(
         self,
         target_rate: float = 5.0,
         scaling_rate: float = 0.001,
         check_interval: int = 100,
+        theta_plus: float = 0.10,
+        theta_leak: float = 0.005,
     ):
         self.target_rate = target_rate
         self.scaling_rate = scaling_rate
         self.check_interval = check_interval
+        self.theta_plus = theta_plus
+        self.theta_leak = theta_leak
         self._step_counter = 0
 
     def apply(self, regions: list[Region], current_time: float) -> None:
         self._step_counter += 1
+
+        # Update adaptive thresholds (theta) every step
+        for region in regions:
+            n = region.n_neurons
+            if n > 0:
+                fired = region.fired[:n].to(torch.float32)
+                region.theta[:n] = region.theta[:n] * (1.0 - self.theta_leak) + self.theta_plus * fired
+
         if self._step_counter % self.check_interval != 0:
             return
 
@@ -262,28 +264,22 @@ class HomeostaticPlasticity:
                 continue
 
             syn = slice(0, ns)
-            post_idx = region.syn_post[syn]
-            valid_post = post_idx < n
+            post_idx = region.syn_post[syn].to(torch.int64)
             alive_syn = region.syn_alive[syn]
-            if not np.any(alive_syn & valid_post):
-                continue
+            alive_n = region.neuron_alive[:n]
+            mask = alive_syn & (post_idx < n) & alive_n[post_idx]
 
             activity = region.activity[:n]
-            alive_n = region.neuron_alive[:n]
             target = self.target_rate * 0.001
-            mask = alive_syn & valid_post & alive_n[post_idx]
-            if not np.any(mask):
-                continue
-
             weights = region.syn_weight[syn]
             min_weight = region.syn_min_weight[syn]
             max_weight = region.syn_max_weight[syn]
-            post_rate = np.maximum(activity[post_idx], 0.001)
+            post_rate = torch.clamp(activity[post_idx], min=0.001)
             ratio = target / post_rate
-            scale = np.clip(1.0 + self.scaling_rate * (ratio - 1.0), 0.95, 1.05)
+            scale = torch.clamp(1.0 + self.scaling_rate * (ratio - 1.0), 0.95, 1.05)
 
             weights[mask] *= scale[mask]
-            weights[mask] = np.clip(
+            weights[mask] = torch.clamp(
                 weights[mask],
                 min_weight[mask],
                 max_weight[mask],
@@ -304,22 +300,19 @@ class Metaplasticity:
                 continue
 
             syn = slice(0, ns)
-            post_idx = region.syn_post[syn]
-            valid_post = post_idx < n
+            post_idx = region.syn_post[syn].to(torch.int64)
             alive_syn = region.syn_alive[syn]
             alive_post = region.neuron_alive[:n]
-            mask = alive_syn & valid_post & alive_post[post_idx]
-            if not np.any(mask):
-                continue
+            mask = alive_syn & (post_idx < n) & alive_post[post_idx]
 
             rate = region.activity[:n][post_idx]
             A_plus = region.syn_A_plus[syn]
             A_minus = region.syn_A_minus[syn]
-            A_plus[mask] = np.maximum(
-                0.001,
+            A_plus[mask] = torch.clamp(
                 0.01 - self.adaptation_rate * rate[mask],
+                min=0.001,
             )
-            A_minus[mask] = np.maximum(
-                0.001,
+            A_minus[mask] = torch.clamp(
                 0.012 + self.adaptation_rate * rate[mask] * 0.5,
+                min=0.001,
             )

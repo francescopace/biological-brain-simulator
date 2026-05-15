@@ -21,8 +21,11 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from src.device import DEVICE
 
 try:
     from sklearn.datasets import fetch_openml
@@ -92,7 +95,8 @@ def _add_seeded_region(
     seed: int,
 ) -> Region:
     region = Region(name, region_type, max_neurons, dt=brain.dt)
-    region._rng = np.random.default_rng(seed)
+    region._rng = torch.Generator(device=DEVICE)
+    region._rng.manual_seed(seed)
     region.populate(n_neurons, connectivity)
     brain.regions[name] = region
     brain.oscillators.add_region(name, region_type)
@@ -124,25 +128,23 @@ def build_brain(seed: int = SEED) -> Brain:
         max_neurons=N_CORTEX_EXC + N_CORTEX_INH,
         seed=seed + 2,
     )
-    cortex_rng = np.random.default_rng(seed + 20)
     for _ in range(N_CORTEX_EXC):
         cortex.add_neuron(NeuronType.EXCITATORY, FiringPattern.REGULAR_SPIKING)
     for _ in range(N_CORTEX_INH):
         cortex.add_neuron(NeuronType.INHIBITORY, FiringPattern.FAST_SPIKING)
-    wire_cortex_microcircuit(cortex, cortex_rng)
+    wire_cortex_microcircuit(cortex)
 
     brain.connect_regions("input", "cortex", density=INPUT_TO_CORTEX_DENSITY)
     proj = feedforward_proj(brain)
     ns = proj.n_synapses
     proj.syn_weight[:ns] *= INPUT_WEIGHT_BOOST
-    np.clip(proj.syn_weight[:ns], proj.syn_min_weight[:ns],
-            proj.syn_max_weight[:ns], out=proj.syn_weight[:ns])
+    proj.syn_weight[:ns] = torch.clamp(proj.syn_weight[:ns], proj.syn_min_weight[:ns], proj.syn_max_weight[:ns])
     proj.syn_A_plus[:ns] = STDP_A_PLUS * STDP_SCALE
     proj.syn_A_minus[:ns] = STDP_A_MINUS * STDP_SCALE
 
     # Learn only on feedforward synapses onto excitatory cortex neurons.
     cortex_types = cortex.neuron_type[:cortex.n_neurons]
-    exc_post = cortex_types[proj.syn_post[:ns]] == NeuronType.EXCITATORY
+    exc_post = cortex_types[proj.syn_post[:ns].to(torch.int64)] == NeuronType.EXCITATORY.value
     proj.syn_A_plus[:ns][~exc_post] = 0.0
     proj.syn_A_minus[:ns][~exc_post] = 0.0
 
@@ -156,12 +158,13 @@ def build_brain(seed: int = SEED) -> Brain:
 
     brain.encoder.max_current = ENCODER_MAX_CURRENT
     brain.encoder.noise_level = ENCODER_NOISE
-    brain.encoder._rng = np.random.default_rng(seed + 100)
+    brain.encoder._rng = torch.Generator(device=DEVICE)
+    brain.encoder._rng.manual_seed(seed + 100)
 
     return brain
 
 
-def wire_cortex_microcircuit(cortex: Region, rng: np.random.Generator) -> None:
+def wire_cortex_microcircuit(cortex: Region) -> None:
     """Wire 1:1 matched exc-inh pairs (Diehl & Cook 2015 WTA).
 
     Each exc[i] drives exactly inh[i]; each inh[i] suppresses every
@@ -173,30 +176,31 @@ def wire_cortex_microcircuit(cortex: Region, rng: np.random.Generator) -> None:
         return
 
     types = cortex.neuron_type[:n]
-    exc_idx = np.where(types == NeuronType.EXCITATORY)[0]
-    inh_idx = np.where(types == NeuronType.INHIBITORY)[0]
+    exc_idx = torch.where(types == NeuronType.EXCITATORY.value)[0]
+    inh_idx = torch.where(types == NeuronType.INHIBITORY.value)[0]
     n_matched = min(len(exc_idx), len(inh_idx))
     if n_matched == 0:
         return
 
     # 1:1 exc[i] -> inh[i] with strong, fast connections.
     cortex.add_synapses(
-        exc_idx[:n_matched].astype(np.int32),
-        inh_idx[:n_matched].astype(np.int32),
-        np.full(n_matched, EXC_TO_INH_WEIGHT),
-        np.full(n_matched, 1.0),
-        np.full(n_matched, NeurotransmitterType.GLUTAMATE.value),
+        exc_idx[:n_matched].to(torch.int32),
+        inh_idx[:n_matched].to(torch.int32),
+        torch.full((n_matched,), EXC_TO_INH_WEIGHT, dtype=torch.float32, device=DEVICE),
+        torch.full((n_matched,), 1.0, dtype=torch.float32, device=DEVICE),
+        torch.full((n_matched,), NeurotransmitterType.GLUTAMATE.value, dtype=torch.int32, device=DEVICE),
     )
 
     # Each inh[i] -> every exc[j != i] (all-to-all minus self-pair).
-    ii, jj = np.meshgrid(np.arange(n_matched), np.arange(n_matched), indexing="ij")
+    ii, jj = torch.meshgrid(torch.arange(n_matched, device=DEVICE), torch.arange(n_matched, device=DEVICE), indexing="ij")
     off_diag = ii != jj
+    n_off_diag = int(off_diag.sum().item())
     cortex.add_synapses(
-        inh_idx[ii[off_diag]].astype(np.int32),
-        exc_idx[jj[off_diag]].astype(np.int32),
-        np.full(int(off_diag.sum()), INH_LATERAL_WEIGHT),
-        np.full(int(off_diag.sum()), 1.0),
-        np.full(int(off_diag.sum()), NeurotransmitterType.GABA.value),
+        inh_idx[ii[off_diag]].to(torch.int32),
+        exc_idx[jj[off_diag]].to(torch.int32),
+        torch.full((n_off_diag,), INH_LATERAL_WEIGHT, dtype=torch.float32, device=DEVICE),
+        torch.full((n_off_diag,), 1.0, dtype=torch.float32, device=DEVICE),
+        torch.full((n_off_diag,), NeurotransmitterType.GABA.value, dtype=torch.int32, device=DEVICE),
     )
 
 
@@ -207,11 +211,11 @@ def feedforward_proj(brain: Brain) -> Projection:
     )
 
 
-def excitatory_cortex_indices(brain: Brain) -> np.ndarray:
+def excitatory_cortex_indices(brain: Brain) -> torch.Tensor:
     cortex = brain.regions["cortex"]
     types = cortex.neuron_type[:cortex.n_neurons]
     alive = cortex.neuron_alive[:cortex.n_neurons]
-    return np.where((types == NeuronType.EXCITATORY) & alive)[0]
+    return torch.where((types == NeuronType.EXCITATORY.value) & alive)[0]
 
 
 # --- Dataset helpers --------------------------------------------------------
@@ -242,6 +246,7 @@ def load_reduced_mnist(
     train_per_class = TRAIN_PER_CLASS if train_per_class is None else train_per_class
     test_per_class = TEST_PER_CLASS if test_per_class is None else test_per_class
     data_home = str(Path(__file__).resolve().parent.parent / ".sklearn_data")
+    print("Fetching MNIST...")
     mnist = fetch_openml(
         "mnist_784",
         version=1,
@@ -315,31 +320,22 @@ def present_sample(
     x: np.ndarray,
     n_steps: int,
     learn: bool = False,
-    theta: np.ndarray | None = None,
-    update_theta: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
     cortex = brain.regions["cortex"]
     exc_idx = excitatory_cortex_indices(brain)
-    before = cortex.total_spikes[exc_idx].copy()
-    voltage_sum = np.zeros(len(exc_idx), dtype=np.float64)
+    before = cortex.total_spikes[exc_idx].clone()
+    voltage_sum = torch.zeros(len(exc_idx), dtype=torch.float32, device=cortex.v.device)
 
     for _ in range(n_steps):
         brain.stimulate("input", x)
-        if theta is not None:
-            cortex.current[exc_idx] -= theta
         brain.step()
         voltage_sum += cortex.v[exc_idx]
         if learn:
             apply_feedforward_stdp(brain)
-        if update_theta and theta is not None:
-            fired_exc = cortex.fired[exc_idx]
-            theta += THETA_PLUS * fired_exc - THETA_LEAK * theta
-            # Keep theta non-negative and add a guardrail for long runs.
-            np.clip(theta, 0.0, THETA_MAX, out=theta)
 
     counts = cortex.total_spikes[exc_idx] - before
     mean_voltage = voltage_sum / max(n_steps, 1)
-    return counts, mean_voltage
+    return counts.cpu().numpy(), mean_voltage.cpu().numpy()
 
 
 def normalize_feedforward_weights(brain: Brain, target_sum: float) -> None:
@@ -347,25 +343,25 @@ def normalize_feedforward_weights(brain: Brain, target_sum: float) -> None:
     proj = feedforward_proj(brain)
     ns = proj.n_synapses
     weights = proj.syn_weight[:ns]
-    post = proj.syn_post[:ns]
+    post = proj.syn_post[:ns].to(torch.int64)
     alive = proj.syn_alive[:ns]
     cortex = brain.regions["cortex"]
     types = cortex.neuron_type[:cortex.n_neurons]
 
-    exc_mask = (types[post] == NeuronType.EXCITATORY) & alive
-    if not np.any(exc_mask):
+    exc_mask = (types[post] == NeuronType.EXCITATORY.value) & alive
+    if not torch.any(exc_mask):
         return
 
-    sums = np.zeros(cortex.n_neurons, dtype=np.float64)
-    np.add.at(sums, post[exc_mask], weights[exc_mask])
+    sums = torch.zeros(cortex.n_neurons, dtype=torch.float32, device=DEVICE)
+    sums.index_add_(0, post[exc_mask], weights[exc_mask].to(torch.float32))
 
     post_sums = sums[post]
     scalable = exc_mask & (post_sums > 1e-9)
-    if np.any(scalable):
-        weights[scalable] *= target_sum / post_sums[scalable]
+    if torch.any(scalable):
+        weights[scalable] *= (target_sum / post_sums[scalable]).to(torch.float32)
 
-    np.clip(weights, proj.syn_min_weight[:ns], proj.syn_max_weight[:ns],
-            out=weights)
+    weights = torch.clamp(weights, proj.syn_min_weight[:ns], proj.syn_max_weight[:ns])
+    proj.syn_weight[:ns] = weights
 
 
 def assign_neuron_labels(
@@ -373,15 +369,14 @@ def assign_neuron_labels(
     X: np.ndarray,
     y: np.ndarray,
     classes: tuple[int, ...] | None = None,
-    theta: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     classes = CLASSES if classes is None else classes
     exc_idx = excitatory_cortex_indices(brain)
-    per_class = np.zeros((len(classes), len(exc_idx)), dtype=np.float64)
+    per_class = np.zeros((len(classes), len(exc_idx)), dtype=np.float32)
 
     class_to_row = {cls: i for i, cls in enumerate(classes)}
     for x, label in zip(X, y):
-        counts, _ = present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False, theta=theta)
+        counts, _ = present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False)
         active = np.flatnonzero(counts > 0)
         if len(active) > 0:
             top_k = min(ASSIGN_TOP_K, len(active))
@@ -392,7 +387,7 @@ def assign_neuron_labels(
     labels = np.full(len(exc_idx), -1, dtype=np.int64)
     active = per_class.max(axis=0) > 0
     labels[active] = np.asarray(classes, dtype=np.int64)[np.argmax(per_class[:, active], axis=0)]
-    return exc_idx, labels
+    return exc_idx.cpu().numpy(), labels
 
 
 def build_response_templates(
@@ -400,21 +395,20 @@ def build_response_templates(
     X: np.ndarray,
     y: np.ndarray,
     classes: tuple[int, ...] | None = None,
-    theta: np.ndarray | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     classes = CLASSES if classes is None else classes
     spike_responses = []
     voltage_responses = []
     for x in X:
-        counts, mean_voltage = present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False, theta=theta)
+        counts, mean_voltage = present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False)
         spike_responses.append(counts.astype(np.float64))
         voltage_responses.append(mean_voltage.astype(np.float64))
         reset_brain_state(brain)
-    spike_arr = np.asarray(spike_responses, dtype=np.float64)
-    voltage_arr = np.asarray(voltage_responses, dtype=np.float64)
+    spike_arr = np.asarray(spike_responses, dtype=np.float32)
+    voltage_arr = np.asarray(voltage_responses, dtype=np.float32)
 
-    spike_templates = np.zeros((len(classes), spike_arr.shape[1]), dtype=np.float64)
-    voltage_templates = np.zeros((len(classes), voltage_arr.shape[1]), dtype=np.float64)
+    spike_templates = np.zeros((len(classes), spike_arr.shape[1]), dtype=np.float32)
+    voltage_templates = np.zeros((len(classes), voltage_arr.shape[1]), dtype=np.float32)
     for i, cls in enumerate(classes):
         cls_spike = spike_arr[y == cls]
         cls_voltage = voltage_arr[y == cls]
@@ -434,13 +428,12 @@ def predict_sample(
     spike_templates: np.ndarray,
     voltage_templates: np.ndarray,
     classes: tuple[int, ...] | None = None,
-    theta: np.ndarray | None = None,
 ) -> tuple[int, np.ndarray]:
     classes = CLASSES if classes is None else classes
-    counts = np.zeros(spike_templates.shape[1], dtype=np.float64)
-    voltage_sum = np.zeros(spike_templates.shape[1], dtype=np.float64)
+    counts = np.zeros(spike_templates.shape[1], dtype=np.float32)
+    voltage_sum = np.zeros(spike_templates.shape[1], dtype=np.float32)
     for _ in range(TEST_REPEATS):
-        spike_counts, mean_voltage = present_sample(brain, x, TEST_PRESENT_STEPS, learn=False, theta=theta)
+        spike_counts, mean_voltage = present_sample(brain, x, TEST_PRESENT_STEPS, learn=False)
         counts += spike_counts
         voltage_sum += mean_voltage
         reset_brain_state(brain)
@@ -463,12 +456,11 @@ def evaluate(
     spike_templates: np.ndarray,
     voltage_templates: np.ndarray,
     classes: tuple[int, ...] | None = None,
-    theta: np.ndarray | None = None,
 ) -> tuple[float, np.ndarray]:
     classes = CLASSES if classes is None else classes
     preds = np.full(len(X), -1, dtype=np.int64)
     for i, x in enumerate(X):
-        preds[i], _ = predict_sample(brain, x, spike_templates, voltage_templates, classes, theta=theta)
+        preds[i], _ = predict_sample(brain, x, spike_templates, voltage_templates, classes)
     return float(np.mean(preds == y)), preds
 
 
@@ -516,18 +508,15 @@ def main() -> None:
     brain = build_brain(seed=SEED)
     print(brain.summary())
 
-    # Adaptive threshold array for excitatory cortex neurons.
-    exc_idx = excitatory_cortex_indices(brain)
-    theta = np.zeros(len(exc_idx), dtype=np.float64)
-
     # Compute initial incoming weight sum per neuron for normalization.
+    exc_idx = excitatory_cortex_indices(brain)
     proj = feedforward_proj(brain)
     ns = proj.n_synapses
-    post = proj.syn_post[:ns]
+    post = proj.syn_post[:ns].to(torch.int64)
     alive = proj.syn_alive[:ns]
-    weight_sums = np.zeros(brain.regions["cortex"].n_neurons, dtype=np.float64)
-    np.add.at(weight_sums, post[alive], proj.syn_weight[:ns][alive])
-    norm_target = float(weight_sums[exc_idx].mean())
+    weight_sums = torch.zeros(brain.regions["cortex"].n_neurons, dtype=torch.float32, device=DEVICE)
+    weight_sums.index_add_(0, post[alive], proj.syn_weight[:ns][alive].to(torch.float32))
+    norm_target = float(weight_sums[exc_idx].mean().item())
     print(f"  Weight normalization target: {norm_target:.1f}")
 
     print("\n" + "-" * 68)
@@ -537,8 +526,7 @@ def main() -> None:
     for epoch in range(EPOCHS):
         order = np.random.default_rng(SEED + epoch).permutation(len(X_train))
         for j, idx in enumerate(order, start=1):
-            present_sample(brain, X_train[idx], TRAIN_PRESENT_STEPS, learn=True,
-                           theta=theta, update_theta=True)
+            present_sample(brain, X_train[idx], TRAIN_PRESENT_STEPS, learn=True)
             normalize_feedforward_weights(brain, norm_target)
             reset_brain_state(brain)
             if j % 50 == 0 or j == len(order):
@@ -551,8 +539,7 @@ def main() -> None:
         w = proj.syn_weight[:proj.n_synapses]
         print(
             f"  -> after epoch {epoch + 1}: "
-            f"feedforward weights mean={w.mean():.4f} max={w.max():.4f}  "
-            f"theta mean={theta.mean():.2f} max={theta.max():.2f}"
+            f"feedforward weights mean={w.mean().item():.4f} max={w.max().item():.4f}"
         )
 
     t2 = time.time()

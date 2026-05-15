@@ -10,7 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
-import numpy as np
+import torch
+
+from .device import DEVICE
 
 if TYPE_CHECKING:
     from .region import Region
@@ -19,8 +21,8 @@ if TYPE_CHECKING:
 @dataclass
 class MemoryTrace:
     """Activity snapshot stored as neuron indices + activity levels."""
-    neuron_indices: np.ndarray
-    activity_snapshot: np.ndarray
+    neuron_indices: torch.Tensor
+    activity_snapshot: torch.Tensor
     region_name: str
     strength: float = 1.0
     replay_count: int = 0
@@ -42,7 +44,7 @@ class MemorySystem:
 
         self.traces: list[MemoryTrace] = []
         self._step_counter = 0
-        self._rng = np.random.default_rng()
+        self._rng = torch.Generator(device=DEVICE)
 
     def capture_trace(
         self,
@@ -57,13 +59,13 @@ class MemorySystem:
             (region.activity[:n] > self.trace_threshold)
             & region.neuron_alive[:n]
         )
-        indices = np.where(active)[0]
+        indices = torch.where(active)[0]
         if len(indices) < 3:
             return None
 
         trace = MemoryTrace(
-            neuron_indices=indices.copy(),
-            activity_snapshot=region.activity[indices].copy(),
+            neuron_indices=indices.clone(),
+            activity_snapshot=region.activity[indices].clone(),
             region_name=region.name,
             creation_time=current_time,
         )
@@ -83,11 +85,9 @@ class MemorySystem:
             return 0
 
         n_replay = min(len(self.traces), 5)
-        weights = np.array([t.strength for t in self.traces])
+        weights = torch.tensor([t.strength for t in self.traces], dtype=torch.float32, device=DEVICE)
         weights /= weights.sum()
-        indices = self._rng.choice(
-            len(self.traces), size=n_replay, replace=False, p=weights
-        )
+        indices = torch.multinomial(weights, n_replay, replacement=False, generator=self._rng).tolist()
 
         replayed = 0
         for idx in indices:
@@ -96,7 +96,6 @@ class MemorySystem:
             if region is None:
                 continue
 
-            # Inject current into remembered neurons (if still alive)
             valid = (
                 (trace.neuron_indices < region.n_neurons)
                 & region.neuron_alive[trace.neuron_indices]
@@ -120,17 +119,17 @@ class MemorySystem:
     def pattern_completion(
         self,
         region: Region,
-        partial_indices: np.ndarray,
+        partial_indices: torch.Tensor,
         boost_current: float = 2.0,
     ) -> int:
-        partial_set = set(partial_indices)
+        partial_set = set(partial_indices.tolist())
         best_trace = None
         best_overlap = 0
 
         for trace in self.traces:
             if trace.region_name != region.name:
                 continue
-            overlap = len(partial_set & set(trace.neuron_indices))
+            overlap = len(partial_set & set(trace.neuron_indices.tolist()))
             if overlap > best_overlap:
                 best_overlap = overlap
                 best_trace = trace
@@ -139,7 +138,7 @@ class MemorySystem:
             return 0
 
         activated = 0
-        for idx in best_trace.neuron_indices:
+        for idx in best_trace.neuron_indices.tolist():
             if idx not in partial_set and idx < region.n_neurons and region.neuron_alive[idx]:
                 region.current[idx] += boost_current
                 activated += 1

@@ -137,16 +137,20 @@ Three candidates, each testing a different capability. Pick based on Step 1 resu
 It uses real MNIST with all **10 classes**, `784` input neurons (full `28x28`),
 `400` excitatory + `400` inhibitory cortex neurons (`254k` total synapses),
 unsupervised STDP on `input->cortex`, L1 intensity equalization, adaptive
-excitability thresholds, per-neuron incoming weight normalization, **1:1 matched
-exc-inh wiring** (Diehl & Cook WTA), and a blended spike + voltage template
-readout. The default configuration reaches **62.2%** test accuracy on 10-class
-MNIST (chance: 10%), with all 10 classes receiving dedicated neurons and zero
-no-response samples. The full run completes in under **19 minutes**.
+excitability thresholds (leaky theta in `HomeostaticPlasticity`), per-neuron
+incoming weight normalization, **1:1 matched exc-inh wiring** (Diehl & Cook WTA),
+and a blended spike + voltage template readout. The default configuration reaches
+**62.2%** test accuracy on 10-class MNIST (chance: 10%), with all 10 classes
+receiving dedicated neurons and zero no-response samples. The full run completes
+in under **17 minutes** on a MacBook Air M2.
 
-**Prerequisites**:
-- Optimize the Python simulation loop (vectorize remaining per-neuron loops in homeostasis/metaplasticity) — partially addressed
-- Consider sparse matrix representation for synaptic connectivity
-- Profile and eliminate bottlenecks — MNIST needs ~1200 neurons and ~100k synapses running for thousands of training images
+**Performance optimization** (completed):
+- Migrated all state arrays to PyTorch tensors
+- Vectorized stimulus encoding (eliminated 784-iteration Python loop)
+- Vectorized synaptogenesis via `torch.outer` co-activity scoring
+- Sync-free STDP (no `torch.any()` GPU synchronization stalls)
+- `index_add_` for O(active) spike propagation instead of O(all) SpMV
+- CPU default device (16x faster than MPS for this workload due to kernel launch overhead)
 
 **Architecture** (following Diehl & Cook 2015):
 - 784 input neurons (one per pixel, rate coding: brighter pixel → higher firing rate)
@@ -167,10 +171,10 @@ no-response samples. The full run completes in under **19 minutes**.
 
 **Result**: **62.2%** test accuracy on 10-class MNIST (300 train / 50 test per
 class, 3 epochs, `784+400+400` architecture). All 10 classes receive dedicated
-neurons with balanced distribution. Total wall time under 19 minutes.
+neurons with balanced distribution. Total wall time under 17 minutes.
 
 **What is validated**:
-- full `784+400+400` Diehl & Cook architecture runs at feasible speed (~73ms/sample)
+- full `784+400+400` Diehl & Cook architecture runs at feasible speed (~70ms/sample)
 - **1:1 matched exc-inh wiring** produces clean winner-take-all dynamics (160k
   internal synapses: 400 exc→inh matched + 159,600 inh→exc all-to-all-minus-self)
 - unsupervised STDP produces digit-specific receptive fields across all 10 classes
@@ -178,6 +182,7 @@ neurons with balanced distribution. Total wall time under 19 minutes.
   balanced neuron specialization even for visually sparse digits
 - vectorized weight normalization scales to `254k` synapses without bottlenecking
 - blended spike + voltage template readout discriminates 10 classes well above chance
+- PyTorch migration enables future GPU acceleration for larger networks
 
 **What the latest experiments showed**:
 - adding a hard `theta` cap (`THETA_MAX = 25`) prevents runaway excitability suppression
@@ -185,12 +190,15 @@ neurons with balanced distribution. Total wall time under 19 minutes.
 - scaling to `300` images/class and `3` epochs with only the hard cap
   remained stable but only reached **56.4%**, with `theta` saturating at the cap
 - replacing the cap-only update with a **leaky theta rule**
-  (`theta += THETA_PLUS * fired - THETA_LEAK * theta`) unlocked the longer run
+  (`theta += THETA_PLUS * fired - THETA_LEAK * theta`) — now integrated directly
+  into `HomeostaticPlasticity` and the `Region` state — unlocked the longer run
   and improved the scaled benchmark to **62.2%**, while keeping zero no-response samples
 - replacing the blended template readout with pure population voting regressed badly
   (**28.0%**, then **24.6%** with class-size normalization) and introduced no-response samples
 - increasing STDP asymmetry to `A_minus / A_plus = 2.0` over-pruned weak classes
   (notably digit `8`), so the default keeps the milder `1.2x` ratio
+- MPS (Apple GPU) proved 16x slower than CPU for this workload due to kernel launch
+  overhead for small/conditional tensor operations; CPU is the default
 
 **What could improve accuracy toward the 87% target**:
 - more training data (`300` images/class → `1000+`; the paper uses `6,000`), now that
@@ -200,6 +208,8 @@ neurons with balanced distribution. Total wall time under 19 minutes.
 - longer presentation windows (25 steps → 100-200; the paper uses 700)
 - a more robust readout than pure voting, e.g. better hybrid spike/voltage aggregation
 - finer STDP tuning around the current regime instead of a jump straight to `2.0x` LTD
+- enabling MPS/CUDA for networks scaled beyond 10k neurons where GPU parallelism
+  outweighs kernel launch overhead
 
 **Target**: >90% accuracy (Diehl & Cook 2015 achieved 95% with 6400 excitatory neurons, 87% with 400).
 

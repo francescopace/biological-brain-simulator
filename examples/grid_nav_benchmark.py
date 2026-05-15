@@ -31,10 +31,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.brain import Brain
+from src.device import DEVICE
 from src.neuron import FiringPattern, NeuronType
 from src.region import Region, RegionType
 from src.synapse import NeurotransmitterType
@@ -150,7 +152,8 @@ def _add_seeded_region(
     seed: int,
 ) -> Region:
     region = Region(name, region_type, max_neurons, dt=brain.dt)
-    region._rng = np.random.default_rng(seed)
+    region._rng = torch.Generator(device=DEVICE)
+    region._rng.manual_seed(seed)
     region.populate(n_neurons, connectivity)
     brain.regions[name] = region
     brain.oscillators.add_region(name, region_type)
@@ -229,9 +232,12 @@ def build_brain(seed: int = SEED) -> Brain:
 
     brain.encoder.max_current = ENCODER_MAX_CURRENT
     brain.encoder.noise_level = ENCODER_NOISE
-    brain.encoder._rng = np.random.default_rng(seed + 100)
-    brain.memory._rng = np.random.default_rng(seed + 101)
-    brain.growth._rng = np.random.default_rng(seed + 102)
+    brain.encoder._rng = torch.Generator(device=DEVICE)
+    brain.encoder._rng.manual_seed(seed + 100)
+    brain.memory._rng = torch.Generator(device=DEVICE)
+    brain.memory._rng.manual_seed(seed + 101)
+    brain.growth._rng = torch.Generator(device=DEVICE)
+    brain.growth._rng.manual_seed(seed + 102)
     brain.reward_stdp.tau_eligibility = TAU_ELIGIBILITY
     brain.reward_stdp.dopamine_decay = DOPAMINE_DECAY
 
@@ -287,28 +293,31 @@ def present_state(
     n_steps: int = STATE_PRESENT_STEPS,
 ) -> tuple[np.ndarray, np.ndarray]:
     motor = brain.regions["motor"]
-    before = motor.total_spikes[:N_MOTOR].copy()
-    voltage_sum = np.zeros(N_MOTOR, dtype=np.float64)
+    before = motor.total_spikes[:N_MOTOR].clone()
+    voltage_sum = torch.zeros(N_MOTOR, dtype=torch.float32, device=DEVICE)
     for _ in range(n_steps):
         brain.stimulate("input", x)
-        brain.inject_current("motor", np.arange(N_MOTOR), MOTOR_BASELINE_CURRENT)
+        brain.inject_current("motor", list(range(N_MOTOR)), MOTOR_BASELINE_CURRENT)
         brain.step()
         voltage_sum += motor.v[:N_MOTOR]
-    counts = motor.total_spikes[:N_MOTOR] - before
-    mean_voltage = voltage_sum / n_steps
+    counts = (motor.total_spikes[:N_MOTOR] - before).cpu().numpy()
+    mean_voltage = (voltage_sum / n_steps).cpu().numpy()
     return counts, mean_voltage
 
 
 def decode_action_scores(brain: Brain, x: np.ndarray) -> np.ndarray:
-    scores = np.zeros(N_MOTOR, dtype=np.float64)
+    scores = torch.zeros(N_MOTOR, dtype=torch.float32, device=DEVICE)
+    x_t = torch.as_tensor(x, dtype=torch.float32, device=DEVICE)
     for proj in brain.projections:
         if proj.source_name != "input" or proj.target_name != "motor":
             continue
         ns = proj.n_synapses
         if ns == 0:
             continue
-        np.add.at(scores, proj.syn_post[:ns], x[proj.syn_pre[:ns]] * proj.syn_weight[:ns])
-    return scores
+        pre_idx = proj.syn_pre[:ns].to(torch.int64)
+        post_idx = proj.syn_post[:ns].to(torch.int64)
+        scores.index_add_(0, post_idx, x_t[pre_idx] * proj.syn_weight[:ns])
+    return scores.cpu().numpy()
 
 
 def mark_executed_action(brain: Brain, x: np.ndarray, action: int) -> None:

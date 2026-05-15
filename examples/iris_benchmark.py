@@ -34,6 +34,7 @@ import time
 from pathlib import Path
 
 import numpy as np
+import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -47,6 +48,7 @@ except ImportError:
     sys.exit(1)
 
 from src.brain import Brain
+from src.device import DEVICE
 from src.neuron import FiringPattern, NeuronType
 from src.region import Region, RegionType
 from src.synapse import NeurotransmitterType
@@ -103,7 +105,8 @@ def _add_seeded_region(
 ) -> Region:
     """Build a region with a deterministic RNG before population."""
     region = Region(name, region_type, max_neurons, dt=brain.dt)
-    region._rng = np.random.default_rng(seed)
+    region._rng = torch.Generator(device=DEVICE)
+    region._rng.manual_seed(seed)
     region.populate(n_neurons, connectivity)
     brain.regions[name] = region
     brain.oscillators.add_region(name, region_type)
@@ -174,9 +177,12 @@ def build_brain(seed: int = SEED) -> Brain:
     # Stronger sensory drive, lower noise for stable per-class patterns
     brain.encoder.max_current = ENCODER_MAX_CURRENT
     brain.encoder.noise_level = ENCODER_NOISE
-    brain.encoder._rng = np.random.default_rng(seed + 100)
-    brain.memory._rng = np.random.default_rng(seed + 101)
-    brain.growth._rng = np.random.default_rng(seed + 102)
+    brain.encoder._rng = torch.Generator(device=DEVICE)
+    brain.encoder._rng.manual_seed(seed + 100)
+    brain.memory._rng = torch.Generator(device=DEVICE)
+    brain.memory._rng.manual_seed(seed + 101)
+    brain.growth._rng = torch.Generator(device=DEVICE)
+    brain.growth._rng.manual_seed(seed + 102)
 
     # Freeze plasticity everywhere except the input → motor readout.
     # Input patterns are inherently discriminative (place-field encoded),
@@ -268,11 +274,12 @@ def reset_between_samples(brain: Brain, n_steps: int = REST_STEPS) -> None:
 def present(brain: Brain, x: np.ndarray, n_steps: int = TEST_PRESENT_STEPS) -> np.ndarray:
     """Present a sample and return per-motor-neuron spike counts."""
     motor = brain.regions["motor"]
-    before = motor.total_spikes[:N_MOTOR].copy()
+    before = motor.total_spikes[:N_MOTOR].clone()
     for _ in range(n_steps):
         brain.stimulate("input", x)
         brain.step()
-    return motor.total_spikes[:N_MOTOR] - before
+    counts = motor.total_spikes[:N_MOTOR] - before
+    return counts.cpu().numpy()
 
 
 def _readout_proj(brain: Brain) -> 'Projection':
@@ -311,9 +318,9 @@ def train_one_sample(
     Returns the teacher-biased prediction (real metric is unbiased test acc).
     """
     motor = brain.regions["motor"]
-    before = motor.total_spikes[:N_MOTOR].copy()
+    before = motor.total_spikes[:N_MOTOR].clone()
 
-    natural_counts = np.zeros(N_MOTOR, dtype=int)
+    natural_counts = torch.zeros(N_MOTOR, dtype=torch.int32, device=DEVICE)
     for step in range(TRAIN_PRESENT_STEPS):
         brain.stimulate("input", x)
         if step >= TEACHER_DELAY:
@@ -323,7 +330,7 @@ def train_one_sample(
             natural_counts = motor.total_spikes[:N_MOTOR] - before
 
     counts = motor.total_spikes[:N_MOTOR] - before
-    pred = int(np.argmax(natural_counts)) if natural_counts.max() > 0 else -1
+    pred = int(torch.argmax(natural_counts).item()) if natural_counts.max().item() > 0 else -1
 
     # Selective credit: only reinforce input→motor[y] synapses
     im = _readout_proj(brain)

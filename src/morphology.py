@@ -22,9 +22,12 @@ Predefined morphology templates:
 from __future__ import annotations
 
 import enum
+import math
 from dataclasses import dataclass, field
 
-import numpy as np
+import torch
+
+from .device import DEVICE
 
 
 class CompartmentType(enum.Enum):
@@ -60,8 +63,8 @@ class Compartment:
         How much a signal is attenuated when traveling through this compartment.
         Longer, thinner compartments attenuate more.
         """
-        length_constant = np.sqrt(self.diameter / (4.0 * self.R_axial * 0.001))
-        return np.exp(-self.length / (length_constant * 1000.0))
+        length_constant = math.sqrt(self.diameter / (4.0 * self.R_axial * 0.001))
+        return math.exp(-self.length / (length_constant * 1000.0))
 
 
 # Pre-built morphology templates
@@ -112,7 +115,7 @@ class NeuronMorphology:
     def __init__(self, template: MorphologyTemplate = MorphologyTemplate.POINT):
         self.template = template
         self.compartments: list[Compartment] = []
-        self._attenuation_to_soma: np.ndarray = np.array([1.0])
+        self._attenuation_to_soma: list[float] = [1.0]
 
         if template != MorphologyTemplate.POINT:
             builder = MORPHOLOGY_TEMPLATES.get(template)
@@ -123,14 +126,13 @@ class NeuronMorphology:
     def _compute_attenuation(self) -> None:
         """Compute cumulative attenuation from each compartment to soma."""
         n = len(self.compartments)
-        self._attenuation_to_soma = np.ones(n)
+        self._attenuation_to_soma = [1.0] * n
 
         for i in range(n):
             if self.compartments[i].ctype == CompartmentType.SOMA:
                 self._attenuation_to_soma[i] = 1.0
                 continue
 
-            # Walk up to soma, multiplying attenuation
             atten = 1.0
             idx = i
             while idx >= 0 and self.compartments[idx].ctype != CompartmentType.SOMA:
@@ -147,7 +149,7 @@ class NeuronMorphology:
         """How much a synaptic input at this compartment is attenuated at the soma."""
         if compartment_idx >= len(self._attenuation_to_soma):
             return 1.0
-        return float(self._attenuation_to_soma[compartment_idx])
+        return self._attenuation_to_soma[compartment_idx]
 
     @property
     def dendritic_compartments(self) -> list[int]:
@@ -179,8 +181,6 @@ class MorphologyManager:
 
     def __init__(self):
         self.neuron_morphologies: dict[int, NeuronMorphology] = {}
-        self.syn_compartment: np.ndarray | None = None
-        self.syn_attenuation: np.ndarray | None = None
 
     def assign_morphology(
         self,
@@ -195,12 +195,12 @@ class MorphologyManager:
     def assign_default_morphologies(
         self,
         n_neurons: int,
-        neuron_types: np.ndarray,
+        neuron_types: torch.Tensor,
     ) -> None:
         """Assign default morphologies based on neuron type."""
         from .neuron import NeuronType
         for i in range(n_neurons):
-            if neuron_types[i] == NeuronType.EXCITATORY:
+            if neuron_types[i] == NeuronType.EXCITATORY.value:
                 self.assign_morphology(i, MorphologyTemplate.PYRAMIDAL)
             else:
                 self.assign_morphology(i, MorphologyTemplate.INTERNEURON)
@@ -208,19 +208,19 @@ class MorphologyManager:
     def compute_synapse_attenuation(
         self,
         n_synapses: int,
-        syn_post: np.ndarray,
-        rng: np.random.Generator,
-    ) -> np.ndarray:
+        syn_post: torch.Tensor,
+        rng: torch.Generator,
+    ) -> torch.Tensor:
         """
         Compute attenuation factor for each synapse based on the
         post-synaptic neuron's morphology and a random compartment assignment.
 
-        Returns array of attenuation values [0, 1] per synapse.
+        Returns tensor of attenuation values [0, 1] per synapse.
         """
-        attenuation = np.ones(n_synapses)
+        attenuation = torch.ones(n_synapses, dtype=torch.float32, device=DEVICE)
 
         for i in range(n_synapses):
-            post_idx = syn_post[i]
+            post_idx = int(syn_post[i].item())
             morph = self.neuron_morphologies.get(post_idx)
             if morph is None or morph.template == MorphologyTemplate.POINT:
                 continue
@@ -229,27 +229,7 @@ class MorphologyManager:
             if not dendrites:
                 continue
 
-            # Randomly assign synapse to a dendritic compartment
-            comp_idx = rng.choice(dendrites)
+            comp_idx = dendrites[int(torch.randint(len(dendrites), (1,), generator=rng, device=DEVICE).item())]
             attenuation[i] = morph.soma_attenuation(comp_idx)
 
         return attenuation
-
-    def apply_attenuation(
-        self,
-        effective_currents: np.ndarray,
-        synapse_indices: np.ndarray,
-        syn_post: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Apply morphological attenuation to synaptic currents.
-        Distal synapses contribute less current to the soma.
-        """
-        if self.syn_attenuation is None:
-            return effective_currents
-
-        result = effective_currents.copy()
-        for i, syn_idx in enumerate(synapse_indices):
-            if syn_idx < len(self.syn_attenuation):
-                result[i] *= self.syn_attenuation[syn_idx]
-        return result

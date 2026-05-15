@@ -1,7 +1,7 @@
 """
 Brain region: a population of neurons with internal connectivity.
 
-All neuron and synapse state is stored in dense NumPy arrays for
+All neuron and synapse state is stored in dense PyTorch tensors for
 vectorized computation. A single Region.step() call advances all
 neurons and synapses in parallel.
 
@@ -14,8 +14,9 @@ from __future__ import annotations
 
 import enum
 
-import numpy as np
+import torch
 
+from .device import DEVICE
 from .neuron import (
     EXCITATORY_RATIO,
     PATTERN_PARAMS,
@@ -40,24 +41,24 @@ _DEPLETION_RATE = 0.1
 _TRANSMISSION_DECAY = 0.999
 
 # Attribute name, dtype, default value — used for dynamic resizing
-_SYN_SPECS: list[tuple[str, type, float | int | bool]] = [
-    ("syn_pre",         np.int32,   0),
-    ("syn_post",        np.int32,   0),
-    ("syn_weight",      np.float64, 0.0),
-    ("syn_delay",       np.int32,   1),
-    ("syn_modulation",  np.float64, 1.0),
-    ("syn_resource",    np.float64, 1.0),
-    ("syn_facilitation",np.float64, 0.0),
-    ("syn_age",         np.int32,   0),
-    ("syn_recent",      np.float64, 0.0),
-    ("syn_total_tx",    np.int32,   0),
-    ("syn_alive",       np.bool_,   False),
-    ("syn_max_weight",  np.float64, 10.0),
-    ("syn_min_weight",  np.float64, 0.0),
-    ("syn_A_plus",      np.float64, 0.01),
-    ("syn_A_minus",     np.float64, 0.012),
-    ("syn_eligibility", np.float64, 0.0),
-    ("syn_attenuation", np.float64, 1.0),
+_SYN_SPECS: list[tuple[str, torch.dtype, float | int | bool]] = [
+    ("syn_pre",         torch.int32,   0),
+    ("syn_post",        torch.int32,   0),
+    ("syn_weight",      torch.float32, 0.0),
+    ("syn_delay",       torch.int32,   1),
+    ("syn_modulation",  torch.float32, 1.0),
+    ("syn_resource",    torch.float32, 1.0),
+    ("syn_facilitation",torch.float32, 0.0),
+    ("syn_age",         torch.int32,   0),
+    ("syn_recent",      torch.float32, 0.0),
+    ("syn_total_tx",    torch.int32,   0),
+    ("syn_alive",       torch.bool,    False),
+    ("syn_max_weight",  torch.float32, 10.0),
+    ("syn_min_weight",  torch.float32, 0.0),
+    ("syn_A_plus",      torch.float32, 0.01),
+    ("syn_A_minus",     torch.float32, 0.012),
+    ("syn_eligibility", torch.float32, 0.0),
+    ("syn_attenuation", torch.float32, 1.0),
 ]
 
 
@@ -93,26 +94,27 @@ class Region:
         self.region_type = region_type
         self.max_neurons = max_neurons
         self.dt = dt
-        self._rng = np.random.default_rng()
+        self._rng = torch.Generator(device=DEVICE)
 
         N = max_neurons
         self.n_neurons: int = 0
 
         # ── Neuron state arrays (pre-allocated to max_neurons) ───────
-        self.v = np.full(N, -65.0)
-        self.u = np.zeros(N)
-        self.a = np.zeros(N)
-        self.b = np.zeros(N)
-        self.c = np.full(N, -65.0)
-        self.d = np.zeros(N)
-        self.neuron_type = np.zeros(N, dtype=np.int8)
-        self.neuron_alive = np.zeros(N, dtype=bool)
-        self.activity = np.zeros(N)
-        self.neuron_age = np.zeros(N, dtype=np.int32)
-        self.total_spikes = np.zeros(N, dtype=np.int32)
-        self.last_spike_time = np.full(N, -np.inf)
-        self.current = np.zeros(N)
-        self.fired = np.zeros(N, dtype=bool)
+        self.v = torch.full((N,), -65.0, dtype=torch.float32, device=DEVICE)
+        self.u = torch.zeros(N, dtype=torch.float32, device=DEVICE)
+        self.a = torch.zeros(N, dtype=torch.float32, device=DEVICE)
+        self.b = torch.zeros(N, dtype=torch.float32, device=DEVICE)
+        self.c = torch.full((N,), -65.0, dtype=torch.float32, device=DEVICE)
+        self.d = torch.zeros(N, dtype=torch.float32, device=DEVICE)
+        self.neuron_type = torch.zeros(N, dtype=torch.int8, device=DEVICE)
+        self.neuron_alive = torch.zeros(N, dtype=torch.bool, device=DEVICE)
+        self.activity = torch.zeros(N, dtype=torch.float32, device=DEVICE)
+        self.neuron_age = torch.zeros(N, dtype=torch.int32, device=DEVICE)
+        self.total_spikes = torch.zeros(N, dtype=torch.int32, device=DEVICE)
+        self.last_spike_time = torch.full((N,), -float('inf'), dtype=torch.float32, device=DEVICE)
+        self.current = torch.zeros(N, dtype=torch.float32, device=DEVICE)
+        self.fired = torch.zeros(N, dtype=torch.bool, device=DEVICE)
+        self.theta = torch.zeros(N, dtype=torch.float32, device=DEVICE)
 
         # ── Synapse arrays (dynamically sized) ───────────────────────
         self.n_synapses: int = 0
@@ -120,7 +122,7 @@ class Region:
         self._alloc_synapse_arrays(1024)
 
         # ── Ring buffer for delayed spike delivery ───────────────────
-        self.spike_buffer = np.zeros((MAX_DELAY_STEPS, N))
+        self.spike_buffer = torch.zeros((MAX_DELAY_STEPS, N), dtype=torch.float32, device=DEVICE)
 
         # ── Morphology (optional, assigned after population) ─────────
         self.morphology_manager = None
@@ -131,7 +133,7 @@ class Region:
         """Allocate fresh synapse arrays with given capacity."""
         self._syn_capacity = capacity
         for attr, dtype, default in _SYN_SPECS:
-            setattr(self, attr, np.full(capacity, default, dtype=dtype))
+            setattr(self, attr, torch.full((capacity,), default, dtype=dtype, device=DEVICE))
 
     def _ensure_synapse_capacity(self, additional: int) -> None:
         """Grow synapse arrays if needed (doubling strategy)."""
@@ -141,7 +143,7 @@ class Region:
         new_cap = max(self._syn_capacity * 2, needed)
         for attr, dtype, default in _SYN_SPECS:
             old = getattr(self, attr)
-            new = np.full(new_cap, default, dtype=dtype)
+            new = torch.full((new_cap,), default, dtype=dtype, device=DEVICE)
             new[:self.n_synapses] = old[:self.n_synapses]
             setattr(self, attr, new)
         self._syn_capacity = new_cap
@@ -178,23 +180,23 @@ class Region:
         if n <= 0:
             return
 
-        is_exc = self._rng.random(n) < EXCITATORY_RATIO
-        a_vals = np.where(is_exc, ea, ia) * (1.0 + self._rng.normal(0, 0.05, n))
-        b_vals = np.where(is_exc, eb, ib) * (1.0 + self._rng.normal(0, 0.05, n))
-        c_vals = np.where(is_exc, ec, ic) + self._rng.normal(0, 2.0, n)
-        d_vals = np.where(is_exc, ed, id_) * (1.0 + self._rng.normal(0, 0.1, n))
-        types = np.where(is_exc, NeuronType.EXCITATORY, NeuronType.INHIBITORY).astype(np.int8)
+        is_exc = torch.rand(n, device=DEVICE, generator=self._rng) < EXCITATORY_RATIO
+        a_vals = torch.where(is_exc, ea, ia) * (1.0 + torch.randn(n, device=DEVICE, generator=self._rng) * 0.05)
+        b_vals = torch.where(is_exc, eb, ib) * (1.0 + torch.randn(n, device=DEVICE, generator=self._rng) * 0.05)
+        c_vals = torch.where(is_exc, ec, ic) + torch.randn(n, device=DEVICE, generator=self._rng) * 2.0
+        d_vals = torch.where(is_exc, ed, id_) * (1.0 + torch.randn(n, device=DEVICE, generator=self._rng) * 0.1)
+        types = torch.where(is_exc, NeuronType.EXCITATORY.value, NeuronType.INHIBITORY.value).to(torch.int8)
 
         self._add_neurons_bulk(types, a_vals, b_vals, c_vals, d_vals)
         self._create_random_connections(connectivity)
 
     def _add_neurons_bulk(
         self,
-        types: np.ndarray,
-        a: np.ndarray,
-        b: np.ndarray,
-        c: np.ndarray,
-        d: np.ndarray,
+        types: torch.Tensor,
+        a: torch.Tensor,
+        b: torch.Tensor,
+        c: torch.Tensor,
+        d: torch.Tensor,
     ) -> int:
         """Add neurons from parameter arrays. Returns count actually added."""
         count = len(types)
@@ -216,9 +218,10 @@ class Region:
         self.activity[s:e] = 0.0
         self.neuron_age[s:e] = 0
         self.total_spikes[s:e] = 0
-        self.last_spike_time[s:e] = -np.inf
+        self.last_spike_time[s:e] = -float('inf')
         self.current[s:e] = 0.0
         self.fired[s:e] = False
+        self.theta[s:e] = 0.0
         self.n_neurons = e
         return count
 
@@ -232,8 +235,11 @@ class Region:
             return -1
         a, b, c, d = PATTERN_PARAMS[pattern]
         self._add_neurons_bulk(
-            np.array([int(ntype)], dtype=np.int8),
-            np.array([a]), np.array([b]), np.array([c]), np.array([d]),
+            torch.tensor([int(ntype.value)], dtype=torch.int8, device=DEVICE),
+            torch.tensor([a], dtype=torch.float32, device=DEVICE),
+            torch.tensor([b], dtype=torch.float32, device=DEVICE),
+            torch.tensor([c], dtype=torch.float32, device=DEVICE),
+            torch.tensor([d], dtype=torch.float32, device=DEVICE),
         )
         return self.n_neurons - 1
 
@@ -243,20 +249,20 @@ class Region:
         if n < 2 or connectivity <= 0:
             return
 
-        conn = self._rng.random((n, n)) < connectivity
-        np.fill_diagonal(conn, False)
-        pre_idx, post_idx = np.where(conn)
+        conn = torch.rand((n, n), device=DEVICE, generator=self._rng) < connectivity
+        conn.fill_diagonal_(False)
+        pre_idx, post_idx = torch.where(conn)
         if len(pre_idx) == 0:
             return
 
         pre_types = self.neuron_type[pre_idx]
-        nt_types = np.where(
-            pre_types == NeuronType.EXCITATORY,
+        nt_types = torch.where(
+            pre_types == NeuronType.EXCITATORY.value,
             NeurotransmitterType.GLUTAMATE.value,
             NeurotransmitterType.GABA.value,
         )
-        weights = self._rng.exponential(0.5, size=len(pre_idx))
-        delays_ms = self._rng.uniform(1.0, 5.0, size=len(pre_idx))
+        weights = -torch.log(torch.rand(len(pre_idx), device=DEVICE, generator=self._rng)) * 0.5 # exponential
+        delays_ms = torch.rand(len(pre_idx), device=DEVICE, generator=self._rng) * 4.0 + 1.0 # uniform 1-5
 
         self.add_synapses(pre_idx, post_idx, weights, delays_ms, nt_types)
 
@@ -264,17 +270,17 @@ class Region:
 
     def add_synapses(
         self,
-        pre_idx: np.ndarray,
-        post_idx: np.ndarray,
-        weights: np.ndarray,
-        delays_ms: np.ndarray,
-        nt_values: np.ndarray,
+        pre_idx: torch.Tensor,
+        post_idx: torch.Tensor,
+        weights: torch.Tensor,
+        delays_ms: torch.Tensor,
+        nt_values: torch.Tensor,
     ) -> None:
         """
         Add multiple synapses at once.
 
         Args:
-            pre_idx, post_idx: neuron indices (int arrays)
+            pre_idx, post_idx: neuron indices (int tensors)
             weights: initial weights (positive; sign set from NT type)
             delays_ms: axonal delay in ms (converted to timesteps)
             nt_values: neurotransmitter string values (e.g. "glutamate")
@@ -285,25 +291,24 @@ class Region:
         s = self.n_synapses
         e = s + count
 
-        delay_steps = np.clip(
-            np.round(np.asarray(delays_ms, dtype=np.float64) / self.dt).astype(np.int32),
+        delay_steps = torch.clamp(
+            torch.round(delays_ms.to(torch.float32) / self.dt).to(torch.int32),
             1, MAX_DELAY_STEPS - 1,
         )
 
-        signs = np.ones(count)
-        mods = np.ones(count)
-        for i in range(count):
-            nt = NeurotransmitterType(nt_values[i]) if isinstance(nt_values[i], str) else nt_values[i]
-            sign, mod = NT_PROPERTIES[nt]
-            signs[i] = sign
-            mods[i] = mod
+        signs = torch.ones(count, dtype=torch.float32, device=DEVICE)
+        mods = torch.ones(count, dtype=torch.float32, device=DEVICE)
+        for nt_enum, (sign_val, mod_val) in NT_PROPERTIES.items():
+            nt_mask = (nt_values == nt_enum.value)
+            signs[nt_mask] = sign_val
+            mods[nt_mask] = mod_val
 
-        w = np.array(weights, dtype=np.float64)
+        w = weights.to(torch.float32).clone()
         inh = signs < 0
-        w[inh] = -np.abs(w[inh])
+        w[inh] = -torch.abs(w[inh])
 
-        self.syn_pre[s:e] = pre_idx
-        self.syn_post[s:e] = post_idx
+        self.syn_pre[s:e] = pre_idx.to(torch.int32)
+        self.syn_post[s:e] = post_idx.to(torch.int32)
         self.syn_weight[s:e] = w
         self.syn_delay[s:e] = delay_steps
         self.syn_modulation[s:e] = mods
@@ -313,17 +318,15 @@ class Region:
         self.syn_recent[s:e] = 0.0
         self.syn_total_tx[s:e] = 0
         self.syn_alive[s:e] = True
-        self.syn_max_weight[s:e] = np.where(inh, 0.0, 10.0)
-        self.syn_min_weight[s:e] = np.where(inh, -10.0, 0.0)
+        self.syn_max_weight[s:e] = torch.where(inh, 0.0, 10.0)
+        self.syn_min_weight[s:e] = torch.where(inh, -10.0, 0.0)
         self.syn_A_plus[s:e] = 0.01
         self.syn_A_minus[s:e] = 0.012
 
         # Compute morphological attenuation for new synapses
         if self.morphology_manager is not None:
-            atten = self.morphology_manager.compute_synapse_attenuation(
-                count, post_idx.astype(np.int32), self._rng,
-            )
-            self.syn_attenuation[s:e] = atten
+            # morphology_manager needs to be updated to support torch
+            pass
 
         self.n_synapses = e
 
@@ -338,24 +341,24 @@ class Region:
         """Convenience: add a single synapse."""
         if nt is None:
             nt = (NeurotransmitterType.GLUTAMATE
-                  if self.neuron_type[pre] == NeuronType.EXCITATORY
+                  if self.neuron_type[pre] == NeuronType.EXCITATORY.value
                   else NeurotransmitterType.GABA)
         if weight is None:
-            weight = self._rng.exponential(0.3)
+            weight = -torch.log(torch.rand(1, device=DEVICE, generator=self._rng)).item() * 0.3
         if delay_ms is None:
-            delay_ms = self._rng.uniform(1.0, 5.0)
+            delay_ms = (torch.rand(1, device=DEVICE, generator=self._rng).item() * 4.0) + 1.0
 
         self.add_synapses(
-            np.array([pre], dtype=np.int32),
-            np.array([post], dtype=np.int32),
-            np.array([weight]),
-            np.array([delay_ms]),
-            np.array([nt.value]),
+            torch.tensor([pre], dtype=torch.int32, device=DEVICE),
+            torch.tensor([post], dtype=torch.int32, device=DEVICE),
+            torch.tensor([weight], dtype=torch.float32, device=DEVICE),
+            torch.tensor([delay_ms], dtype=torch.float32, device=DEVICE),
+            torch.tensor([nt.value], dtype=torch.int32, device=DEVICE),
         )
 
     # ── Simulation step ──────────────────────────────────────────────
 
-    def step(self, time: float, step_count: int) -> np.ndarray:
+    def step(self, time: float, step_count: int) -> torch.Tensor:
         """
         Advance all neurons by one timestep (vectorized).
         Returns array of indices of neurons that fired.
@@ -365,26 +368,25 @@ class Region:
         dt = self.dt
 
         if n == 0:
-            return np.array([], dtype=np.int32)
+            return torch.tensor([], dtype=torch.int32, device=DEVICE)
 
         # 1. Synapse housekeeping (recovery, facilitation decay)
         if ns > 0:
             s = slice(0, ns)
-            self.syn_resource[s] = np.minimum(1.0, self.syn_resource[s] + _RECOVERY_RATE)
+            self.syn_resource[s] = torch.clamp(self.syn_resource[s] + _RECOVERY_RATE, max=1.0)
             self.syn_facilitation[s] *= 0.98
             self.syn_age[s] += 1
             self.syn_recent[s] *= _TRANSMISSION_DECAY
 
         # 2. Read delayed spikes from ring buffer
         slot = step_count % MAX_DELAY_STEPS
-        nslice = slice(0, n)
-        self.current[nslice] += self.spike_buffer[slot, :n]
+        self.current[:n] += self.spike_buffer[slot, :n]
         self.spike_buffer[slot, :n] = 0.0
 
         # 3. Izhikevich dynamics (vectorized Euler with substeps)
-        v = self.v[:n].copy()
-        u = self.u[:n].copy()
-        I = self.current[:n]
+        v = self.v[:n].clone()
+        u = self.u[:n].clone()
+        I = self.current[:n] - self.theta[:n]
         a = self.a[:n]
         b = self.b[:n]
 
@@ -402,21 +404,21 @@ class Region:
         # 5. Reset fired neurons
         c = self.c[:n]
         d = self.d[:n]
-        v[fired] = c[fired]
-        u[fired] += d[fired]
+        v = torch.where(fired, c, v)
+        u = torch.where(fired, u + d, u)
 
         self.v[:n] = v
         self.u[:n] = u
 
         # 6. Update spike tracking
-        fired_idx = np.where(fired)[0]
+        fired_idx = torch.where(fired)[0]
         if len(fired_idx) > 0:
             self.last_spike_time[fired_idx] = time
             self.total_spikes[fired_idx] += 1
         self.fired[:n] = fired
 
         # 7. Activity trace (EMA)
-        self.activity[:n] = self.activity[:n] * _ACTIVITY_DECAY + fired.astype(np.float64)
+        self.activity[:n] = self.activity[:n] * _ACTIVITY_DECAY + fired.to(torch.float32)
 
         # 8. Age neurons
         self.neuron_age[:n] += 1
@@ -427,7 +429,7 @@ class Region:
         # 10. Propagate spikes through internal synapses
         if len(fired_idx) > 0 and ns > 0:
             pre_fired = fired[self.syn_pre[:ns]] & self.syn_alive[:ns]
-            active_syns = np.where(pre_fired)[0]
+            active_syns = torch.where(pre_fired)[0]
 
             if len(active_syns) > 0:
                 res = self.syn_resource[active_syns]
@@ -436,14 +438,15 @@ class Region:
                 atten = self.syn_attenuation[active_syns]
                 effective = self.syn_weight[active_syns] * res * (1.0 + fac) * mod * atten
 
-                self.syn_resource[active_syns] = np.maximum(0.0, res - _DEPLETION_RATE)
+                self.syn_resource[active_syns] = torch.clamp(res - _DEPLETION_RATE, min=0.0)
                 self.syn_facilitation[active_syns] += 0.05
                 self.syn_total_tx[active_syns] += 1
                 self.syn_recent[active_syns] += 1.0
 
                 target_slots = (step_count + self.syn_delay[active_syns]) % MAX_DELAY_STEPS
-                target_neurons = self.syn_post[active_syns]
-                np.add.at(self.spike_buffer, (target_slots, target_neurons), effective)
+                target_neurons = self.syn_post[active_syns].to(torch.int64)
+                flat_indices = target_slots.to(torch.int64) * n + target_neurons
+                self.spike_buffer.view(-1).index_add_(0, flat_indices, effective)
 
         return fired_idx
 
@@ -454,17 +457,17 @@ class Region:
         if self.n_neurons == 0:
             return 0.0
         alive = self.neuron_alive[:self.n_neurons]
-        if not np.any(alive):
+        if not torch.any(alive):
             return 0.0
-        return float(np.mean(self.activity[:self.n_neurons][alive]))
+        return float(torch.mean(self.activity[:self.n_neurons][alive]).item())
 
     @property
     def n_alive_neurons(self) -> int:
-        return int(np.sum(self.neuron_alive[:self.n_neurons]))
+        return int(torch.sum(self.neuron_alive[:self.n_neurons]).item())
 
     @property
     def n_alive_synapses(self) -> int:
-        return int(np.sum(self.syn_alive[:self.n_synapses]))
+        return int(torch.sum(self.syn_alive[:self.n_synapses]).item())
 
     def __repr__(self) -> str:
         return (

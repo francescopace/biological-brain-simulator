@@ -12,8 +12,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
-import numpy as np
+import torch
 
+from .device import DEVICE
 from .neuron import FiringPattern, NeuronType, PATTERN_PARAMS
 from .synapse import NeurotransmitterType
 
@@ -51,7 +52,7 @@ class GrowthController:
         self.max_new_neurons_per_cycle = max_new_neurons_per_cycle
 
         self._step_counter = 0
-        self._rng = np.random.default_rng()
+        self._rng = torch.Generator(device=DEVICE)
         self.history: list[GrowthStats] = []
 
     def step(self, regions: list[Region]) -> GrowthStats | None:
@@ -78,10 +79,10 @@ class GrowthController:
         mask = (
             region.syn_alive[s]
             & (region.syn_age[s] > self.synapse_age_threshold)
-            & (np.abs(region.syn_weight[s]) < self.synapse_prune_threshold)
+            & (torch.abs(region.syn_weight[s]) < self.synapse_prune_threshold)
             & (region.syn_recent[s] < 0.01)
         )
-        count = int(np.sum(mask))
+        count = int(torch.sum(mask).item())
         if count > 0:
             region.syn_alive[:ns][mask] = False
         return count
@@ -99,7 +100,7 @@ class GrowthController:
             & (region.activity[s] < self.apoptosis_threshold)
             & (region.total_spikes[s] < 10)
         )
-        dead = np.where(mask)[0]
+        dead = torch.where(mask)[0]
         if len(dead) == 0:
             return 0
 
@@ -107,9 +108,11 @@ class GrowthController:
 
         # Kill all synapses connected to dead neurons
         if ns > 0:
-            pre_dead = np.isin(region.syn_pre[:ns], dead)
-            post_dead = np.isin(region.syn_post[:ns], dead)
-            region.syn_alive[:ns][pre_dead | post_dead] = False
+            pre_dead = torch.isin(region.syn_pre[:ns], dead)
+            post_dead = torch.isin(region.syn_post[:ns], dead)
+            mask = pre_dead | post_dead
+            if torch.any(mask):
+                region.syn_alive[:ns][mask] = False
 
         return len(dead)
 
@@ -120,40 +123,49 @@ class GrowthController:
             return 0
 
         active_mask = (region.activity[:n] > 0.05) & region.neuron_alive[:n]
-        active = np.where(active_mask)[0]
+        active = torch.where(active_mask)[0]
         if len(active) < 2:
             return 0
 
-        # Build set of existing connections for fast lookup
-        alive_syn = region.syn_alive[:ns]
-        existing = set()
+        # Build dense adjacency matrix for existing connections
+        existing = torch.zeros((n, n), dtype=torch.bool, device=DEVICE)
         if ns > 0:
-            pre_alive = region.syn_pre[:ns][alive_syn]
-            post_alive = region.syn_post[:ns][alive_syn]
-            for p, q in zip(pre_alive, post_alive):
-                existing.add((p, q))
-                existing.add((q, p))
+            alive_syn = region.syn_alive[:ns]
+            pre_alive = region.syn_pre[:ns][alive_syn].to(torch.int64)
+            post_alive = region.syn_post[:ns][alive_syn].to(torch.int64)
+            existing[pre_alive, post_alive] = True
+            existing[post_alive, pre_alive] = True
 
-        # Find unconnected co-active pairs, scored by co-activity
-        pairs = []
+        # Vectorized outer product of activity
         act = region.activity[:n]
-        for i in range(len(active)):
-            for j in range(i + 1, len(active)):
-                a_i, a_j = active[i], active[j]
-                if (a_i, a_j) not in existing:
-                    score = act[a_i] * act[a_j]
-                    pairs.append((a_i, a_j, score))
+        scores = torch.outer(act, act)
+        
+        # Mask out non-active, existing, and self connections
+        scores[~active_mask, :] = 0.0
+        scores[:, ~active_mask] = 0.0
+        scores[existing] = 0.0
+        scores.fill_diagonal_(0.0)
 
-        if not pairs:
+        # We only need upper triangle to avoid duplicate pairs
+        scores = torch.triu(scores)
+
+        # Find top pairs
+        flat_scores = scores.view(-1)
+        k = min(self.max_new_synapses_per_cycle, int((flat_scores > 0).sum().item()))
+        if k == 0:
             return 0
 
-        pairs.sort(key=lambda x: x[2], reverse=True)
+        top_scores, top_idx = torch.topk(flat_scores, k)
+        
         created = 0
-
-        for a_i, a_j, _ in pairs[:self.max_new_synapses_per_cycle]:
-            pre, post = (a_i, a_j) if self._rng.random() < 0.5 else (a_j, a_i)
+        for idx in top_idx:
+            if flat_scores[idx] <= 0:
+                break
+            a_i = (idx // n).item()
+            a_j = (idx % n).item()
+            
+            pre, post = (a_i, a_j) if torch.rand(1, device=DEVICE, generator=self._rng).item() < 0.5 else (a_j, a_i)
             region.add_one_synapse(pre, post)
-            existing.add((pre, post))
             created += 1
 
         return created
@@ -171,7 +183,7 @@ class GrowthController:
         born = 0
 
         for _ in range(n_new):
-            is_exc = self._rng.random() < 0.8
+            is_exc = torch.rand(1, device=DEVICE, generator=self._rng).item() < 0.8
             ntype = NeuronType.EXCITATORY if is_exc else NeuronType.INHIBITORY
             pattern = FiringPattern.REGULAR_SPIKING if is_exc else FiringPattern.FAST_SPIKING
             idx = region.add_neuron(ntype, pattern)
@@ -184,15 +196,16 @@ class GrowthController:
                 & region.neuron_alive[:region.n_neurons]
             )
             active_mask[idx] = False
-            active = np.where(active_mask)[0]
+            active = torch.where(active_mask)[0]
 
             if len(active) > 0:
-                n_connect = min(len(active), self._rng.integers(2, 6))
-                targets = self._rng.choice(active, size=n_connect, replace=False)
+                n_connect = min(len(active), torch.randint(2, 6, (1,), device=DEVICE, generator=self._rng).item())
+                perm = torch.randperm(len(active), device=DEVICE, generator=self._rng)
+                targets = active[perm[:n_connect]]
                 for t in targets:
-                    region.add_one_synapse(t, idx)
-                    if self._rng.random() < 0.3:
-                        region.add_one_synapse(idx, t)
+                    region.add_one_synapse(t.item(), idx)
+                    if torch.rand(1, device=DEVICE, generator=self._rng).item() < 0.3:
+                        region.add_one_synapse(idx, t.item())
 
             born += 1
 
