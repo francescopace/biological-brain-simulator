@@ -5,11 +5,10 @@ This is not the full Step 3 benchmark yet. Instead it validates the core
 protocol on a smaller setting:
 
 - true MNIST digits loaded from OpenML
-- reduced class set (default: digits 0-1)
+- reduced class set (default: digits 0-3)
 - 28x28 images downsampled to 14x14 (196 input neurons)
 - unsupervised STDP only on input->cortex feedforward synapses
-- class readout by assigning excitatory cortex neurons to the class that
-  drove them most during training
+- class readout from cortex response templates built after STDP training
 
 The goal is to prove that the current simulator can support the classic
 "STDP features + neuron-label readout" workflow before attempting the
@@ -40,7 +39,7 @@ from src.region import Region, RegionType
 
 # --- Dataset / prototype scope ---------------------------------------------
 
-CLASSES = (0, 1)
+CLASSES = (0, 1, 2, 3)
 TRAIN_PER_CLASS = 20
 TEST_PER_CLASS = 10
 DOWNSAMPLE = 2
@@ -61,7 +60,7 @@ TEST_PRESENT_STEPS = 20
 REST_STEPS = 10
 EPOCHS = 1
 ASSIGN_TOP_K = 12
-TEST_REPEATS = 1
+TEST_REPEATS = 2
 
 ENCODER_MAX_CURRENT = 30.0
 ENCODER_NOISE = 0.03
@@ -294,22 +293,44 @@ def assign_neuron_labels(
     return exc_idx, labels
 
 
+def build_response_templates(
+    brain: Brain,
+    X: np.ndarray,
+    y: np.ndarray,
+    classes: tuple[int, ...] | None = None,
+) -> np.ndarray:
+    classes = CLASSES if classes is None else classes
+    responses = []
+    for x in X:
+        responses.append(present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False).astype(np.float64))
+        reset_brain_state(brain)
+    responses_arr = np.asarray(responses, dtype=np.float64)
+
+    templates = np.zeros((len(classes), responses_arr.shape[1]), dtype=np.float64)
+    for i, cls in enumerate(classes):
+        cls_resp = responses_arr[y == cls]
+        if len(cls_resp) > 0:
+            templates[i] = cls_resp.mean(axis=0)
+    norms = np.linalg.norm(templates, axis=1, keepdims=True) + 1e-9
+    return templates / norms
+
+
 def predict_sample(
     brain: Brain,
     x: np.ndarray,
-    neuron_labels: np.ndarray,
+    templates: np.ndarray,
     classes: tuple[int, ...] | None = None,
 ) -> tuple[int, np.ndarray]:
     classes = CLASSES if classes is None else classes
-    counts = np.zeros_like(neuron_labels, dtype=np.float64)
+    counts = np.zeros(templates.shape[1], dtype=np.float64)
     for _ in range(TEST_REPEATS):
         counts += present_sample(brain, x, TEST_PRESENT_STEPS, learn=False)
         reset_brain_state(brain)
-    scores = np.zeros(len(classes), dtype=np.float64)
-    for i, cls in enumerate(classes):
-        mask = neuron_labels == cls
-        if np.any(mask):
-            scores[i] = float(np.sum(counts[mask]) / max(np.sum(mask), 1))
+    if counts.sum() <= 0:
+        return -1, np.zeros(len(classes), dtype=np.float64)
+
+    query = counts / (np.linalg.norm(counts) + 1e-9)
+    scores = templates @ query
     if scores.max() <= 0:
         return -1, scores
     return int(classes[int(np.argmax(scores))]), scores
@@ -319,13 +340,13 @@ def evaluate(
     brain: Brain,
     X: np.ndarray,
     y: np.ndarray,
-    neuron_labels: np.ndarray,
+    templates: np.ndarray,
     classes: tuple[int, ...] | None = None,
 ) -> tuple[float, np.ndarray]:
     classes = CLASSES if classes is None else classes
     preds = np.full(len(X), -1, dtype=np.int64)
     for i, x in enumerate(X):
-        preds[i], _ = predict_sample(brain, x, neuron_labels, classes)
+        preds[i], _ = predict_sample(brain, x, templates, classes)
     return float(np.mean(preds == y)), preds
 
 
@@ -349,7 +370,7 @@ def confusion_matrix(
 
 def main() -> None:
     print("=" * 68)
-    print("  REDUCED MNIST PROTOTYPE - Unsupervised STDP + Neuron Readout")
+    print("  REDUCED MNIST PROTOTYPE - Unsupervised STDP + Template Readout")
     print("  (Validate the protocol before full Step 3 scaling)")
     print("=" * 68)
 
@@ -396,9 +417,10 @@ def main() -> None:
         )
 
     print("\n" + "-" * 68)
-    print("  Assigning neuron labels")
+    print("  Building readout")
     print("-" * 68)
     exc_idx, neuron_labels = assign_neuron_labels(brain, X_train, y_train)
+    templates = build_response_templates(brain, X_train, y_train)
     labelled = neuron_labels >= 0
     print(f"  Excitatory cortex neurons: {len(exc_idx)}")
     print(f"  Labelled excitatory neurons: {int(np.sum(labelled))}/{len(exc_idx)}")
@@ -408,7 +430,7 @@ def main() -> None:
     print("\n" + "-" * 68)
     print("  Evaluation")
     print("-" * 68)
-    acc, preds = evaluate(brain, X_test, y_test, neuron_labels)
+    acc, preds = evaluate(brain, X_test, y_test, templates)
     no_response = int(np.sum(preds < 0))
     cm = confusion_matrix(y_test, preds)
 
@@ -421,12 +443,12 @@ def main() -> None:
         print(f"    {cls:>5d}:  {row}")
 
     print("\n" + "=" * 68)
-    if acc >= 0.75:
-        print("  OK: the reduced MNIST prototype validates STDP + neuron-label readout.")
+    if acc >= 0.60:
+        print("  OK: the reduced 4-class MNIST prototype validates STDP + template readout.")
     elif acc >= 0.50:
-        print("  PARTIAL: the protocol learns above chance, but needs tuning before full MNIST.")
+        print("  PARTIAL: the 4-class protocol is promising, but still needs tuning before full MNIST.")
     else:
-        print("  FAIL: the reduced prototype does not yet validate the protocol.")
+        print("  FAIL: the reduced 4-class prototype does not yet validate the protocol.")
     print("=" * 68)
 
 

@@ -156,18 +156,19 @@ not the full MNIST benchmark yet; instead it validates the end-to-end
 unsupervised workflow on a much smaller setup:
 
 - real MNIST loaded from OpenML
-- binary task (`0` vs `1`)
+- reduced `4-class` task (`0-3`)
 - `28x28 -> 14x14` downsampling (`196` input neurons)
 - unsupervised STDP on `input->cortex`
-- simple neuron-label readout over excitatory cortex neurons
+- template-based readout over cortex response patterns
 
-The prototype currently learns above chance and reached about **70%**
-accuracy in the best reduced smoke test, which is enough to validate the
-dataset plumbing and the STDP/readout loop, but not enough to claim Phase 3
-is solved.
+The current `4-class` prototype learns clearly above chance (`25%`) and
+reached about **65%** in the best reduced smoke test, with the default
+configuration landing around **50%**. That is enough to validate the
+dataset plumbing and the STDP/readout loop on a multi-class image task,
+but not enough to claim Phase 3 is solved.
 
 The main remaining work is improving competitive self-organization and
-readout stability so the same approach can scale from binary MNIST to the
+readout stability so the same approach can scale from reduced `4-class` MNIST to the
 planned 10-class benchmark.
 
 ## Performance
