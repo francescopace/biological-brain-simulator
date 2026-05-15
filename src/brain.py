@@ -34,6 +34,9 @@ from .stimulus import EncodingStrategy, StimulusEncoder
 from .synapse import NT_PROPERTIES, NeurotransmitterType
 
 
+DISABLED_GROWTH_INTERVAL = 10**9
+
+
 # ── Inter-region projection ─────────────────────────────────────────
 
 class Projection:
@@ -95,6 +98,7 @@ class Brain:
 
     def __init__(self, dt: float = 1.0, seed: int | None = None):
         self.dt = dt
+        self.seed = seed
         self.time: float = 0.0
         self.step_count: int = 0
 
@@ -109,13 +113,27 @@ class Brain:
         self.memory = MemorySystem()
         self.encoder = StimulusEncoder(strategy=EncodingStrategy.RATE)
         self.oscillators = OscillatorBank()
+        self.metaplasticity_enabled = True
 
         self.stats_history: list[BrainStats] = []
         self._stats_interval = 500
 
         self._rng = torch.Generator(device=DEVICE)
+        self._region_seed_counter = 0
+        self._seed_generator(self._rng, seed)
+        self._seed_generator(self.encoder._rng, self._derived_seed(100))
+        self._seed_generator(self.memory._rng, self._derived_seed(101))
+        self._seed_generator(self.growth._rng, self._derived_seed(102))
+
+    def _derived_seed(self, offset: int) -> int | None:
+        if self.seed is None:
+            return None
+        return int(self.seed + offset)
+
+    @staticmethod
+    def _seed_generator(generator: torch.Generator, seed: int | None) -> None:
         if seed is not None:
-            self._rng.manual_seed(seed)
+            generator.manual_seed(seed)
 
     # ── Region management ────────────────────────────────────────────
 
@@ -126,12 +144,24 @@ class Brain:
         n_neurons: int = 50,
         connectivity: float = 0.1,
         max_neurons: int = 1000,
+        seed: int | None = None,
     ) -> Region:
         region = Region(name, region_type, max_neurons, dt=self.dt)
+        self._region_seed_counter += 1
+        self._seed_generator(
+            region._rng,
+            seed if seed is not None else self._derived_seed(self._region_seed_counter),
+        )
         region.populate(n_neurons, connectivity)
         self.regions[name] = region
         self.oscillators.add_region(name, region_type)
         return region
+
+    def get_projection(self, source: str, target: str) -> Projection:
+        for proj in self.projections:
+            if proj.source_name == source and proj.target_name == target:
+                return proj
+        raise KeyError(f"Projection {source}->{target} not found")
 
     def connect_regions(
         self,
@@ -260,6 +290,50 @@ class Brain:
         valid = idx < region.n_neurons
         region.current[idx[valid]] += current
 
+    def reset_traces(self) -> None:
+        for region in self.regions.values():
+            ns = region.n_synapses
+            if ns:
+                region.syn_eligibility[:ns] = 0.0
+        for proj in self.projections:
+            ns = proj.n_synapses
+            if ns:
+                proj.syn_eligibility[:ns] = 0.0
+        self.reward_stdp.dopamine.clear()
+
+    @staticmethod
+    def _set_plasticity(
+        synapses: Region | Projection,
+        A_plus: float,
+        A_minus: float,
+    ) -> None:
+        ns = synapses.n_synapses
+        if ns == 0:
+            return
+        synapses.syn_A_plus[:ns] = A_plus
+        synapses.syn_A_minus[:ns] = A_minus
+
+    def freeze_structural_plasticity(self) -> None:
+        self.growth.growth_interval = DISABLED_GROWTH_INTERVAL
+        self.metaplasticity_enabled = False
+
+    def freeze_plasticity(self) -> None:
+        for region in self.regions.values():
+            self._set_plasticity(region, 0.0, 0.0)
+        for proj in self.projections:
+            self._set_plasticity(proj, 0.0, 0.0)
+
+    def enable_projection_plasticity(
+        self,
+        source: str,
+        target: str,
+        A_plus: float = 0.01,
+        A_minus: float = 0.012,
+    ) -> Projection:
+        proj = self.get_projection(source, target)
+        self._set_plasticity(proj, A_plus, A_minus)
+        return proj
+
     # ── Simulation step ──────────────────────────────────────────────
 
     def step(self) -> dict[str, torch.Tensor]:
@@ -381,7 +455,8 @@ class Brain:
         self.homeostasis.apply(list(self.regions.values()), self.time)
 
         # 8. Metaplasticity
-        self.metaplasticity.update_thresholds(list(self.regions.values()), self.time)
+        if self.metaplasticity_enabled:
+            self.metaplasticity.update_thresholds(list(self.regions.values()), self.time)
 
         # 9. Growth / pruning
         self.growth.step(list(self.regions.values()))

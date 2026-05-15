@@ -117,6 +117,27 @@ for step in range(5000):
     brain.step()
 ```
 
+### Convenience helpers
+
+The core simulator now exposes a few helpers that are useful when building
+benchmarks or structured training loops:
+
+- `brain.reset_traces()` clears all synaptic eligibility traces and per-target dopamine
+- `brain.freeze_structural_plasticity()` disables growth and metaplasticity for stable experiments
+- `brain.freeze_plasticity()` disables STDP everywhere
+- `brain.enable_projection_plasticity("input", "output")` re-enables STDP on one projection
+- `brain.get_projection("input", "output")` fetches an inter-region projection safely
+- `brain.regions["output"].add_lateral_inhibition(weight=5.0)` creates all-to-all lateral inhibition
+
+Example:
+
+```python
+brain.freeze_plasticity()
+brain.enable_projection_plasticity("input", "output", A_plus=0.01, A_minus=0.012)
+brain.freeze_structural_plasticity()
+brain.regions["output"].add_lateral_inhibition(weight=5.0)
+```
+
 ## Iris Benchmark
 
 `examples/iris_benchmark.py` is the most complete supervised benchmark in the repo.

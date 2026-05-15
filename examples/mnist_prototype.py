@@ -25,6 +25,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from examples._utils import confusion_matrix, quiet_steps
 from src.device import DEVICE
 
 try:
@@ -34,7 +35,7 @@ except ImportError:
     print("  pip install scikit-learn")
     raise SystemExit(1)
 
-from src.brain import Brain, Projection
+from src.brain import Brain
 from src.neuron import FiringPattern, NeuronType
 from src.region import Region, RegionType
 from src.synapse import NeurotransmitterType
@@ -85,48 +86,27 @@ SEED = 42
 
 # --- Brain construction -----------------------------------------------------
 
-def _add_seeded_region(
-    brain: Brain,
-    name: str,
-    region_type: RegionType,
-    n_neurons: int,
-    connectivity: float,
-    max_neurons: int,
-    seed: int,
-) -> Region:
-    region = Region(name, region_type, max_neurons, dt=brain.dt)
-    region._rng = torch.Generator(device=DEVICE)
-    region._rng.manual_seed(seed)
-    region.populate(n_neurons, connectivity)
-    brain.regions[name] = region
-    brain.oscillators.add_region(name, region_type)
-    return region
-
 
 def build_brain(seed: int = SEED) -> Brain:
     brain = Brain(dt=1.0, seed=seed)
 
     # Input region: all sensory neurons are excitatory so every pixel can project.
-    input_region = _add_seeded_region(
-        brain,
+    input_region = brain.add_region(
         "input",
         RegionType.SENSORY,
         n_neurons=0,
         connectivity=0.0,
         max_neurons=N_INPUT,
-        seed=seed + 1,
     )
     for _ in range(N_INPUT):
         input_region.add_neuron(NeuronType.EXCITATORY, FiringPattern.REGULAR_SPIKING)
 
-    cortex = _add_seeded_region(
-        brain,
+    cortex = brain.add_region(
         "cortex",
         RegionType.ASSOCIATION,
         n_neurons=0,
         connectivity=0.0,
         max_neurons=N_CORTEX_EXC + N_CORTEX_INH,
-        seed=seed + 2,
     )
     for _ in range(N_CORTEX_EXC):
         cortex.add_neuron(NeuronType.EXCITATORY, FiringPattern.REGULAR_SPIKING)
@@ -135,12 +115,20 @@ def build_brain(seed: int = SEED) -> Brain:
     wire_cortex_microcircuit(cortex)
 
     brain.connect_regions("input", "cortex", density=INPUT_TO_CORTEX_DENSITY)
-    proj = feedforward_proj(brain)
+    brain.freeze_plasticity()
+    proj = brain.enable_projection_plasticity(
+        "input",
+        "cortex",
+        A_plus=STDP_A_PLUS * STDP_SCALE,
+        A_minus=STDP_A_MINUS * STDP_SCALE,
+    )
     ns = proj.n_synapses
     proj.syn_weight[:ns] *= INPUT_WEIGHT_BOOST
-    proj.syn_weight[:ns] = torch.clamp(proj.syn_weight[:ns], proj.syn_min_weight[:ns], proj.syn_max_weight[:ns])
-    proj.syn_A_plus[:ns] = STDP_A_PLUS * STDP_SCALE
-    proj.syn_A_minus[:ns] = STDP_A_MINUS * STDP_SCALE
+    proj.syn_weight[:ns] = torch.clamp(
+        proj.syn_weight[:ns],
+        proj.syn_min_weight[:ns],
+        proj.syn_max_weight[:ns],
+    )
 
     # Learn only on feedforward synapses onto excitatory cortex neurons.
     cortex_types = cortex.neuron_type[:cortex.n_neurons]
@@ -150,16 +138,13 @@ def build_brain(seed: int = SEED) -> Brain:
 
     # Disable unrelated mechanisms so the prototype isolates STDP + readout.
     brain.reward_stdp.apply_target = lambda *args, **kwargs: 0
-    brain.reward_stdp.dopamine.clear()
-    brain.growth.growth_interval = 10**9
+    brain.reset_traces()
+    brain.freeze_structural_plasticity()
     brain.memory.capture_trace = lambda *args, **kwargs: None
     brain.memory.consolidate = lambda *args, **kwargs: 0
-    brain.metaplasticity.update_thresholds = lambda *args, **kwargs: None
 
     brain.encoder.max_current = ENCODER_MAX_CURRENT
     brain.encoder.noise_level = ENCODER_NOISE
-    brain.encoder._rng = torch.Generator(device=DEVICE)
-    brain.encoder._rng.manual_seed(seed + 100)
 
     return brain
 
@@ -202,14 +187,6 @@ def wire_cortex_microcircuit(cortex: Region) -> None:
         torch.full((n_off_diag,), 1.0, dtype=torch.float32, device=DEVICE),
         torch.full((n_off_diag,), NeurotransmitterType.GABA.value, dtype=torch.int32, device=DEVICE),
     )
-
-
-def feedforward_proj(brain: Brain) -> Projection:
-    return next(
-        p for p in brain.projections
-        if p.source_name == "input" and p.target_name == "cortex"
-    )
-
 
 def excitatory_cortex_indices(brain: Brain) -> torch.Tensor:
     cortex = brain.regions["cortex"]
@@ -279,20 +256,16 @@ def load_reduced_mnist(
 # --- Simulation helpers -----------------------------------------------------
 
 def reset_brain_state(brain: Brain, rest_steps: int = REST_STEPS) -> None:
-    for _ in range(rest_steps):
-        brain.step()
+    quiet_steps(brain, rest_steps)
     for region in brain.regions.values():
         n = region.n_neurons
         region.current[:n] = 0.0
         region.fired[:n] = False
-    for proj in brain.projections:
-        ns = proj.n_synapses
-        if ns:
-            proj.syn_eligibility[:ns] = 0.0
+    brain.reset_traces()
 
 
 def apply_feedforward_stdp(brain: Brain) -> int:
-    proj = feedforward_proj(brain)
+    proj = brain.get_projection("input", "cortex")
     source = brain.regions["input"]
     target = brain.regions["cortex"]
     ns = proj.n_synapses
@@ -340,7 +313,7 @@ def present_sample(
 
 def normalize_feedforward_weights(brain: Brain, target_sum: float) -> None:
     """Normalize incoming feedforward weight sum per excitatory cortex neuron."""
-    proj = feedforward_proj(brain)
+    proj = brain.get_projection("input", "cortex")
     ns = proj.n_synapses
     weights = proj.syn_weight[:ns]
     post = proj.syn_post[:ns].to(torch.int64)
@@ -464,22 +437,6 @@ def evaluate(
     return float(np.mean(preds == y)), preds
 
 
-def confusion_matrix(
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    classes: tuple[int, ...] | None = None,
-) -> np.ndarray:
-    classes = CLASSES if classes is None else classes
-    n = len(classes)
-    cm = np.zeros((n, n), dtype=np.int64)
-    class_to_row = {cls: i for i, cls in enumerate(classes)}
-    for t, p in zip(y_true, y_pred):
-        if p < 0:
-            continue
-        cm[class_to_row[int(t)], class_to_row[int(p)]] += 1
-    return cm
-
-
 # --- Main -------------------------------------------------------------------
 
 def main() -> None:
@@ -510,7 +467,7 @@ def main() -> None:
 
     # Compute initial incoming weight sum per neuron for normalization.
     exc_idx = excitatory_cortex_indices(brain)
-    proj = feedforward_proj(brain)
+    proj = brain.get_projection("input", "cortex")
     ns = proj.n_synapses
     post = proj.syn_post[:ns].to(torch.int64)
     alive = proj.syn_alive[:ns]
@@ -564,7 +521,7 @@ def main() -> None:
     t4 = time.time()
     acc, preds = evaluate(brain, X_test, y_test, spike_templates, voltage_templates)
     no_response = int(np.sum(preds < 0))
-    cm = confusion_matrix(y_test, preds)
+    cm = confusion_matrix(y_test, preds, labels=CLASSES)
     eval_time = time.time() - t4
 
     print(f"  Test accuracy:            {acc:.1%}")

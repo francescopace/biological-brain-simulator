@@ -38,6 +38,8 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from examples._utils import confusion_matrix, quiet_steps
+
 try:
     from sklearn.datasets import load_iris
     from sklearn.linear_model import LogisticRegression
@@ -50,8 +52,7 @@ except ImportError:
 from src.brain import Brain
 from src.device import DEVICE
 from src.neuron import FiringPattern, NeuronType
-from src.region import Region, RegionType
-from src.synapse import NeurotransmitterType
+from src.region import RegionType
 
 
 # ── Hyperparameters ──────────────────────────────────────────────────
@@ -94,54 +95,32 @@ TAU_ELIGIBILITY = 200.0        # ms; short enough to keep credit sample-local
 
 # ── Brain construction ───────────────────────────────────────────────
 
-def _add_seeded_region(
-    brain: Brain,
-    name: str,
-    region_type: RegionType,
-    n_neurons: int,
-    connectivity: float,
-    max_neurons: int,
-    seed: int,
-) -> Region:
-    """Build a region with a deterministic RNG before population."""
-    region = Region(name, region_type, max_neurons, dt=brain.dt)
-    region._rng = torch.Generator(device=DEVICE)
-    region._rng.manual_seed(seed)
-    region.populate(n_neurons, connectivity)
-    brain.regions[name] = region
-    brain.oscillators.add_region(name, region_type)
-    return region
-
-
 def build_brain(seed: int = SEED) -> Brain:
     brain = Brain(dt=1.0, seed=seed)
 
     # Input: pure feedforward, no internal connectivity
-    _add_seeded_region(
-        brain,
-        "input", RegionType.SENSORY,
+    brain.add_region(
+        "input",
+        RegionType.SENSORY,
         n_neurons=N_INPUT, connectivity=0.0,
         max_neurons=N_INPUT,
-        seed=seed + 1,
     )
 
     # Cortex: sparsely recurrent association area
-    _add_seeded_region(
-        brain,
-        "cortex", RegionType.ASSOCIATION,
+    brain.add_region(
+        "cortex",
+        RegionType.ASSOCIATION,
         n_neurons=N_CORTEX, connectivity=0.05,
         max_neurons=N_CORTEX,
-        seed=seed + 2,
     )
 
     # Motor: 3 guaranteed-excitatory chattering neurons (one per class).
     # Manually populated to avoid the random 80/20 excitatory/inhibitory split.
-    _add_seeded_region(
-        brain,
-        "motor", RegionType.MOTOR,
+    brain.add_region(
+        "motor",
+        RegionType.MOTOR,
         n_neurons=0, connectivity=0.0,
         max_neurons=N_MOTOR,
-        seed=seed + 3,
     )
     motor = brain.regions["motor"]
     for _ in range(N_MOTOR):
@@ -150,13 +129,7 @@ def build_brain(seed: int = SEED) -> Brain:
     # Lateral inhibition: each motor neuron strongly inhibits the others.
     # This implements winner-take-all dynamics so one motor neuron's
     # firing actively suppresses the others, making the readout decisive.
-    for i in range(N_MOTOR):
-        for j in range(N_MOTOR):
-            if i != j:
-                motor.add_one_synapse(
-                    i, j, weight=LATERAL_INHIBITION, delay_ms=1.0,
-                    nt=NeurotransmitterType.GABA,
-                )
+    motor.add_lateral_inhibition(weight=LATERAL_INHIBITION, delay_ms=1.0)
 
     # Projections
     brain.connect_regions("input", "cortex", density=PROJECTION_DENSITY_INPUT_CORTEX)
@@ -177,29 +150,18 @@ def build_brain(seed: int = SEED) -> Brain:
     # Stronger sensory drive, lower noise for stable per-class patterns
     brain.encoder.max_current = ENCODER_MAX_CURRENT
     brain.encoder.noise_level = ENCODER_NOISE
-    brain.encoder._rng = torch.Generator(device=DEVICE)
-    brain.encoder._rng.manual_seed(seed + 100)
-    brain.memory._rng = torch.Generator(device=DEVICE)
-    brain.memory._rng.manual_seed(seed + 101)
-    brain.growth._rng = torch.Generator(device=DEVICE)
-    brain.growth._rng.manual_seed(seed + 102)
 
     # Freeze plasticity everywhere except the input → motor readout.
     # Input patterns are inherently discriminative (place-field encoded),
     # so learning on input→motor gives much cleaner credit assignment
     # than on cortex→motor (whose dense random patterns overlap heavily).
-    for region in brain.regions.values():
-        ns = region.n_synapses
-        region.syn_A_plus[:ns] = 0.0
-        region.syn_A_minus[:ns] = 0.0
-    for proj in brain.projections:
-        ns = proj.n_synapses
-        if proj.source_name == "input" and proj.target_name == "motor":
-            proj.syn_A_plus[:ns] = 0.01 * STDP_SCALE
-            proj.syn_A_minus[:ns] = 0.012 * STDP_SCALE
-        else:
-            proj.syn_A_plus[:ns] = 0.0
-            proj.syn_A_minus[:ns] = 0.0
+    brain.freeze_plasticity()
+    brain.enable_projection_plasticity(
+        "input",
+        "motor",
+        A_plus=0.01 * STDP_SCALE,
+        A_minus=0.012 * STDP_SCALE,
+    )
 
     # Eligibility decay + dopamine decay tuned so a reward pulse acts
     # like a short, focused credit signal (≈ a few-step impulse).
@@ -208,26 +170,9 @@ def build_brain(seed: int = SEED) -> Brain:
 
     # Stable substrate for this benchmark — disable structural growth so we
     # isolate R-STDP learning. (Re-enable in a follow-up to test if growth helps.)
-    brain.growth.growth_interval = 10**9
-
-    # Disable metaplasticity: it adapts A_plus/A_minus per neuron every step
-    # with a Python loop (slow + undoes our scaling). Not useful for this benchmark.
-    brain.metaplasticity.update_thresholds = lambda *a, **kw: None
+    brain.freeze_structural_plasticity()
 
     return brain
-
-
-def reset_traces(brain: Brain) -> None:
-    """Zero eligibility traces and dopamine so each sample starts clean."""
-    for region in brain.regions.values():
-        ns = region.n_synapses
-        if ns:
-            region.syn_eligibility[:ns] = 0.0
-    for proj in brain.projections:
-        ns = proj.n_synapses
-        if ns:
-            proj.syn_eligibility[:ns] = 0.0
-    brain.reward_stdp.dopamine.clear()
 
 
 # ── Stimulus / readout helpers ──────────────────────────────────────
@@ -266,9 +211,8 @@ def place_field_encode(
 
 def reset_between_samples(brain: Brain, n_steps: int = REST_STEPS) -> None:
     """Run quietly so spike buffers drain, then hard-reset traces & dopamine."""
-    for _ in range(n_steps):
-        brain.step()
-    reset_traces(brain)
+    quiet_steps(brain, n_steps)
+    brain.reset_traces()
 
 
 def present(brain: Brain, x: np.ndarray, n_steps: int = TEST_PRESENT_STEPS) -> np.ndarray:
@@ -284,8 +228,7 @@ def present(brain: Brain, x: np.ndarray, n_steps: int = TEST_PRESENT_STEPS) -> n
 
 def _readout_proj(brain: Brain) -> 'Projection':
     """Return the input→motor readout projection."""
-    return next(p for p in brain.projections
-                if p.source_name == 'input' and p.target_name == 'motor')
+    return brain.get_projection("input", "motor")
 
 
 _READOUT_TARGET = Brain.projection_target("input", "motor")
@@ -337,8 +280,7 @@ def train_one_sample(
     _keep_only_motor_eligibility(im, y)
 
     brain.reward(reward_amount, target=_READOUT_TARGET)
-    for _ in range(10):
-        brain.step()
+    quiet_steps(brain, 10)
 
     # Actively weaken the strongest wrong readout so classes separate faster.
     wrong_pred = pred if pred >= 0 and pred != y else -1
@@ -349,8 +291,7 @@ def train_one_sample(
             brain.step()
         _keep_only_motor_eligibility(im, wrong_pred)
         brain.punish(punish_amount, target=_READOUT_TARGET)
-        for _ in range(10):
-            brain.step()
+        quiet_steps(brain, 10)
 
     reset_between_samples(brain)
     return pred
@@ -379,17 +320,6 @@ def evaluate(brain: Brain, X: np.ndarray, y: np.ndarray) -> tuple[float, np.ndar
         all_counts[i] = counts
     acc = float(np.mean(preds == y))
     return acc, preds, all_counts
-
-
-def confusion_matrix(y_true: np.ndarray, y_pred: np.ndarray, n_classes: int = 3) -> np.ndarray:
-    cm = np.zeros((n_classes, n_classes), dtype=int)
-    for t, p in zip(y_true, y_pred):
-        if p < 0:
-            continue
-        cm[t, p] += 1
-    return cm
-
-
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -471,7 +401,7 @@ def main():
     # ── Final evaluation ─────────────────────────────────────────────
     if best_brain is not None:
         brain = best_brain
-        reset_traces(brain)
+        brain.reset_traces()
 
     print("\n" + "─" * 64)
     print("  Final Results")
@@ -484,7 +414,7 @@ def main():
     print(f"  Best checkpoint epoch:        {best_epoch} ({best_test_acc:.1%})")
     print(f"  Samples with no motor spikes: {no_response}/{len(y_test)}")
 
-    cm = confusion_matrix(y_test, preds)
+    cm = confusion_matrix(y_test, preds, labels=range(3))
     print(f"\n  Confusion matrix (rows=true, cols=predicted):")
     header = "             " + "  ".join(f"{n:>10s}" for n in iris.target_names)
     print(header)

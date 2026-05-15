@@ -356,6 +356,39 @@ class Region:
             torch.tensor([nt.value], dtype=torch.int32, device=DEVICE),
         )
 
+    def add_lateral_inhibition(
+        self,
+        weight: float,
+        delay_ms: float = 1.0,
+        nt: NeurotransmitterType = NeurotransmitterType.GABA,
+        neuron_indices: torch.Tensor | list[int] | None = None,
+    ) -> int:
+        """Add all-to-all inhibitory wiring across a neuron subset."""
+        if neuron_indices is None:
+            indices = torch.arange(self.n_neurons, dtype=torch.int64, device=DEVICE)
+        elif isinstance(neuron_indices, torch.Tensor):
+            indices = neuron_indices.to(dtype=torch.int64, device=DEVICE)
+        else:
+            indices = torch.as_tensor(neuron_indices, dtype=torch.int64, device=DEVICE)
+
+        if len(indices) < 2:
+            return 0
+
+        pre_grid, post_grid = torch.meshgrid(indices, indices, indexing="ij")
+        mask = pre_grid != post_grid
+        count = int(torch.sum(mask).item())
+        if count == 0:
+            return 0
+
+        self.add_synapses(
+            pre_grid[mask].to(torch.int32),
+            post_grid[mask].to(torch.int32),
+            torch.full((count,), weight, dtype=torch.float32, device=DEVICE),
+            torch.full((count,), delay_ms, dtype=torch.float32, device=DEVICE),
+            torch.full((count,), nt.value, dtype=torch.int32, device=DEVICE),
+        )
+        return count
+
     # ── Simulation step ──────────────────────────────────────────────
 
     def step(self, time: float, step_count: int) -> torch.Tensor:

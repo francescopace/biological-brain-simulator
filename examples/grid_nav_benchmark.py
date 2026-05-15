@@ -35,11 +35,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from examples._utils import quiet_steps
 from src.brain import Brain
 from src.device import DEVICE
 from src.neuron import FiringPattern, NeuronType
-from src.region import Region, RegionType
-from src.synapse import NeurotransmitterType
+from src.region import RegionType
 
 
 # --- Task setup ------------------------------------------------------------
@@ -142,68 +142,35 @@ class GridWorld:
 
 # --- Brain construction ----------------------------------------------------
 
-def _add_seeded_region(
-    brain: Brain,
-    name: str,
-    region_type: RegionType,
-    n_neurons: int,
-    connectivity: float,
-    max_neurons: int,
-    seed: int,
-) -> Region:
-    region = Region(name, region_type, max_neurons, dt=brain.dt)
-    region._rng = torch.Generator(device=DEVICE)
-    region._rng.manual_seed(seed)
-    region.populate(n_neurons, connectivity)
-    brain.regions[name] = region
-    brain.oscillators.add_region(name, region_type)
-    return region
-
-
 def build_brain(seed: int = SEED) -> Brain:
     brain = Brain(dt=1.0, seed=seed)
 
-    _add_seeded_region(
-        brain,
+    brain.add_region(
         "input",
         RegionType.SENSORY,
         n_neurons=N_INPUT,
         connectivity=0.0,
         max_neurons=N_INPUT,
-        seed=seed + 1,
     )
-    _add_seeded_region(
-        brain,
+    brain.add_region(
         "place_cells",
         RegionType.MEMORY,
         n_neurons=N_PLACE_CELLS,
         connectivity=0.05,
         max_neurons=N_PLACE_CELLS,
-        seed=seed + 2,
     )
-    _add_seeded_region(
-        brain,
+    brain.add_region(
         "motor",
         RegionType.MOTOR,
         n_neurons=0,
         connectivity=0.0,
         max_neurons=N_MOTOR,
-        seed=seed + 3,
     )
 
     motor = brain.regions["motor"]
     for _ in range(N_MOTOR):
         motor.add_neuron(NeuronType.EXCITATORY, FiringPattern.CHATTERING)
-    for i in range(N_MOTOR):
-        for j in range(N_MOTOR):
-            if i != j:
-                motor.add_one_synapse(
-                    i,
-                    j,
-                    weight=LATERAL_INHIBITION,
-                    delay_ms=1.0,
-                    nt=NeurotransmitterType.GABA,
-                )
+    motor.add_lateral_inhibition(weight=LATERAL_INHIBITION, delay_ms=1.0)
 
     brain.connect_regions("input", "place_cells", density=PROJECTION_DENSITY_INPUT_PLACE)
     brain.connect_regions("place_cells", "motor", density=PROJECTION_DENSITY_PLACE_MOTOR)
@@ -217,27 +184,22 @@ def build_brain(seed: int = SEED) -> Brain:
             proj.syn_weight[:ns] = READOUT_INIT_WEIGHT
 
     # Keep plasticity focused on state -> action pathways.
-    for region in brain.regions.values():
-        ns = region.n_synapses
-        region.syn_A_plus[:ns] = 0.0
-        region.syn_A_minus[:ns] = 0.0
-    for proj in brain.projections:
-        ns = proj.n_synapses
-        if proj.target_name == "motor":
-            proj.syn_A_plus[:ns] = 0.01 * STDP_SCALE
-            proj.syn_A_minus[:ns] = 0.012 * STDP_SCALE
-        else:
-            proj.syn_A_plus[:ns] = 0.0
-            proj.syn_A_minus[:ns] = 0.0
+    brain.freeze_plasticity()
+    brain.enable_projection_plasticity(
+        "place_cells",
+        "motor",
+        A_plus=0.01 * STDP_SCALE,
+        A_minus=0.012 * STDP_SCALE,
+    )
+    brain.enable_projection_plasticity(
+        "input",
+        "motor",
+        A_plus=0.01 * STDP_SCALE,
+        A_minus=0.012 * STDP_SCALE,
+    )
 
     brain.encoder.max_current = ENCODER_MAX_CURRENT
     brain.encoder.noise_level = ENCODER_NOISE
-    brain.encoder._rng = torch.Generator(device=DEVICE)
-    brain.encoder._rng.manual_seed(seed + 100)
-    brain.memory._rng = torch.Generator(device=DEVICE)
-    brain.memory._rng.manual_seed(seed + 101)
-    brain.growth._rng = torch.Generator(device=DEVICE)
-    brain.growth._rng.manual_seed(seed + 102)
     brain.reward_stdp.tau_eligibility = TAU_ELIGIBILITY
     brain.reward_stdp.dopamine_decay = DOPAMINE_DECAY
 
@@ -248,30 +210,17 @@ def build_brain(seed: int = SEED) -> Brain:
     brain.memory.consolidation_interval = REST_STEPS
 
     # Keep the substrate stable while we test reward learning + replay.
-    brain.growth.growth_interval = 10**9
-    brain.metaplasticity.update_thresholds = lambda *a, **kw: None
+    brain.freeze_structural_plasticity()
 
     return brain
 
 
 # --- Helpers ---------------------------------------------------------------
 
-def reset_traces(brain: Brain) -> None:
-    for region in brain.regions.values():
-        ns = region.n_synapses
-        if ns:
-            region.syn_eligibility[:ns] = 0.0
-    for proj in brain.projections:
-        ns = proj.n_synapses
-        if ns:
-            proj.syn_eligibility[:ns] = 0.0
-    brain.reward_stdp.dopamine.clear()
-
 
 def reset_between_steps(brain: Brain, n_steps: int = INTER_STEP_REST) -> None:
-    for _ in range(n_steps):
-        brain.step()
-    reset_traces(brain)
+    quiet_steps(brain, n_steps)
+    brain.reset_traces()
 
 
 def position_encode(
@@ -384,8 +333,7 @@ def apply_reinforcement(
             brain.reward(amount, target=target)
         else:
             brain.punish(amount, target=target)
-    for _ in range(POST_REWARD_STEPS):
-        brain.step()
+    quiet_steps(brain, POST_REWARD_STEPS)
 
 
 def best_actions_for_position(env: GridWorld, pos: tuple[int, int]) -> np.ndarray:
@@ -488,7 +436,7 @@ def evaluate_policy(
     n_episodes: int = EVAL_EPISODES,
 ) -> dict[str, float]:
     eval_brain = copy.deepcopy(brain)
-    reset_traces(eval_brain)
+    eval_brain.reset_traces()
 
     successes = 0
     steps = []
@@ -559,9 +507,8 @@ def rest_and_measure(
     n_eval_episodes: int = 40,
 ) -> tuple[dict[str, float], dict[str, float]]:
     before = evaluate_policy(brain, env, rng, n_episodes=n_eval_episodes)
-    for _ in range(REST_STEPS):
-        brain.step()
-    reset_traces(brain)
+    quiet_steps(brain, REST_STEPS)
+    brain.reset_traces()
     after = evaluate_policy(brain, env, rng, n_episodes=n_eval_episodes)
     return before, after
 
@@ -661,7 +608,7 @@ def main() -> None:
 
     if best_brain is not None:
         brain = best_brain
-        reset_traces(brain)
+        brain.reset_traces()
 
     final_eval = evaluate_policy(brain, env, np.random.default_rng(SEED + 5000))
 
