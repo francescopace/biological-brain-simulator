@@ -75,11 +75,16 @@ src/
 └── persistence.py   # Full brain serialization and deserialization
 
 examples/
-├── association_demo.py    # Pavlovian conditioning with spiking neurons
-├── growth_demo.py         # A brain that grows from scratch
-├── iris_benchmark.py      # Iris classification with R-STDP
-├── grid_nav_benchmark.py  # Grid navigation with R-STDP
-└── mnist_benchmark.py     # MNIST benchmark: 10-class unsupervised STDP
+├── association_demo.py       # Pavlovian conditioning with spiking neurons
+├── growth_demo.py            # A brain that grows from scratch
+├── iris_benchmark.py         # Iris classification with R-STDP
+├── grid_nav_benchmark.py     # Grid navigation with R-STDP
+├── mnist_benchmark.py        # MNIST benchmark: 10-class unsupervised STDP
+├── fewshot_benchmark.py      # Few-shot learning: SNN vs MLP data efficiency
+├── forgetting_benchmark.py   # Catastrophic forgetting: sequential task retention
+├── degradation_benchmark.py  # Graceful degradation: robustness to neuron damage
+├── sleep_benchmark.py        # Sleep/replay: consolidation benefit measurement
+└── growth_benchmark.py       # Growth vs fixed: structural plasticity ablation
 
 BENCHMARKS.md              # Concise benchmark notes, results, and caveats
 ```
@@ -153,7 +158,7 @@ The repository currently includes three validated reference benchmarks:
 |---|---|---|---|
 | Iris classification | `examples/iris_benchmark.py` | Can reward-modulated local plasticity solve a standard supervised classification task? | **86.7%** test accuracy, **90.0%** best checkpoint |
 | Grid navigation | `examples/grid_nav_benchmark.py` | Can the simulator learn a usable control policy with reward-modulated spiking dynamics? | **100.0%** success, **4.38** mean steps-to-goal |
-| MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | **62.2%** test accuracy (400 exc); 51.8% with 1600 exc (training regime undersaturation — see BENCHMARKS.md) |
+| MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | **64.6%** test accuracy (400 exc, full MNIST 6000/class, 200ms, 15M timesteps) — see BENCHMARKS.md |
 
 `BENCHMARKS.md` contains the detailed benchmark notes, including research setup, caveats, runtime observations, and interpretation. Use the benchmark scripts themselves as the source of truth for exact hyperparameters.
 

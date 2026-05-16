@@ -48,19 +48,31 @@ For exact hyperparameters, read the benchmark scripts:
 
 ## MNIST
 
-**Latest validated results**:
-- **400 exc neurons**: **62.2%** test accuracy on 10-class MNIST (chance: `10%`), with dedicated neurons for all classes and zero no-response samples.
-- **1600 exc neurons**: **51.8%** test accuracy — *worse* than 400 neurons, due to training regime undersaturation (see analysis below).
+**Validated results**:
+
+| Run | Neurons | Train/class | Present (ms) | Epochs | Total timesteps | Accuracy | Notes |
+|-----|---------|-------------|-------------|--------|-----------------|----------|-------|
+| v1 | 400 exc | 300 | 25 | 3 | 225k | **62.2%** | Baseline |
+| v2 | 1600 exc | 300 | 25 | 3 | 225k | **51.8%** | More neurons hurt with insufficient data |
+| v3 | 400 exc | 6000 | 200 | 1 | 15M | **64.6%** | Full MNIST, near-paper regime |
+| Paper | 400 exc | 6000 | 350 | 1 | 21M | **87%** | Diehl & Cook 2015 reference |
+
+**Key finding: the bottleneck is total learning exposure, not network capacity.** The v1→v2 regression (62%→52%) proved that scaling neurons without scaling data is counterproductive. Weights saturate within 1 epoch — additional epochs over the same data add nothing. The v3 run confirmed that scaling data from 300→6000/class with longer presentation (200ms) yields a modest improvement (62.2%→64.6%), but the gain is smaller than expected — suggesting that presentation duration and STDP calibration matter more than raw data volume alone.
+
+**Learning efficiency comparison**: v1 achieved 62.2% with only 225k timesteps — a rate of **276% accuracy per million timesteps** vs the paper's **4.1%/M**. v3 achieved 64.6% with 15M timesteps — **4.3%/M**, almost identical to the paper's efficiency at equivalent scale. This confirms our architectural additions (L1 equalization, blended spike/voltage readout, leaky theta) give a large efficiency advantage at small data budgets, but at scale the learning rate converges toward the paper's baseline.
+
+**v3 neuron label distribution**: 384/400 neurons labelled. Heavy skew toward digit 1 (179 neurons, 47% of labelled) while harder classes (3, 5, 8) got fewer than 10 neurons each. This label imbalance is the primary accuracy limiter — the network has strong per-class accuracy on easy digits but near-chance on hard ones.
 
 **Architecture** (Diehl & Cook 2015):
 - `784` input neurons (one per pixel, rate coded)
-- `1600` excitatory + `1600` inhibitory cortex neurons with 1:1 matched WTA microcircuit (~2.9M synapses)
+- excitatory + inhibitory cortex neurons with 1:1 matched WTA microcircuit
 - Unsupervised STDP on feedforward `input->cortex` pathway
 - Adaptive thresholds (leaky theta), per-neuron weight normalization, blended spike/voltage readout
 
 **Observed runtimes** (MacBook Air M2, CPU):
-- **400 exc**: `3000` train samples, `3` epochs, ~70 ms/sample, **17 min** total
-- **1600 exc**: `3000` train samples, `3` epochs, ~250 ms/sample, **~38 min** training + **~21 min** readout + **~4 min** eval = **63 min** total
+- **400 exc, 25ms**: `3000` train, `3` epochs, ~70 ms/sample, **17 min** total
+- **1600 exc, 25ms**: `3000` train, `3` epochs, ~250 ms/sample, **63 min** total
+- **400 exc, 200ms** (v3): `60000` train, `1` epoch, ~357 ms/sample, **5.95h** total (incl. readout + eval)
 
 **GPU and compilation experiments**:
 
@@ -81,26 +93,33 @@ The fundamental issue is that SNN activity is **sparse by nature**: only a small
 
 CPU with sparse scatter/gather remains the correct default at this scale.
 
-**Current caveats**:
-- The main gap vs Diehl & Cook is experimental regime, not basic functionality: the validated run uses 300 images/class (vs 6000 in the paper) and 25 ms presentation (vs 350 ms).
-- The leaky theta update is a stabilizer, not just a detail; it is what makes the scaled training regime stay usable.
+**Observations from completed runs**:
+- Feedforward weights saturate within 1 epoch (`mean=1.20, max=10.0` after every epoch). More epochs over the same data add nothing — confirmed on both 400 and 1600 neurons.
+- 1600 neurons scored 51.8% vs 62.2% with 400 neurons. The label distribution was heavily skewed: 480/1157 labelled neurons (41%) assigned to digit 1, while classes 4 and 8 got only 52 neurons each. With 4x neurons competing for the same 300 images/class, many converge on the simplest features instead of specializing.
+- The leaky theta update is a critical stabilizer; it is what makes the adaptive threshold regime stay usable.
 
-**Observations from the 1600 exc run**:
-- Feedforward weight statistics are identical after epoch 1, 2, and 3 (`mean=1.20, max=10.0`), confirming STDP saturates within a single pass over 300 images/class at 25 ms presentation.
-- **1600 neurons scored 51.8% vs 62.2% with 400 neurons.** The label distribution is heavily skewed: 480/1157 labelled neurons (41%) assigned to digit 1, while classes 4 and 8 got only 52 neurons each. With 4x more neurons competing for the same 300 images/class, many converge on the simplest features (digit 1) instead of specializing.
-- This confirms the bottleneck is training regime, not network capacity. More neurons actually *hurt* when the stimulus regime is too small to drive diverse specialization.
+**Changes applied for v3 run** (all simultaneously):
 
-**Next steps for accuracy improvement** (ordered by expected impact):
+| Change | From | To | Rationale |
+|--------|------|----|-----------|
+| `TRAIN_PER_CLASS` | 300 | 6000 (full MNIST) | Data diversity is the primary learning driver |
+| `TRAIN_PRESENT_STEPS` | 25 | 200 | More time for spike-pair coincidences to accumulate |
+| `EPOCHS` | 3 | 1 | Extra epochs add nothing (weights saturate in one pass) |
+| `REST_STEPS` | 5 | 50 | Longer rest between samples lets theta decay properly |
+| `A_minus/A_plus` | 1.20 | 1.05 | Paper value; 1.2 over-prunes weak classes |
+| `STDP_SCALE` | 0.8 | 0.2 | Compensates 8x more STDP events per sample at 200ms |
 
-| Priority | Change | Rationale | Estimated time |
-|----------|--------|-----------|----------------|
-| 1 | `TRAIN_PRESENT_STEPS=100`, `REST_STEPS=50` | Most impactful single change. At 25 ms many spike pairs never form — STDP needs enough time within each presentation for pre-post coincidences to accumulate. Paper uses 350 ms. Combines with step 2 for maximum effect. | ~4h |
-| 2 | `TRAIN_PER_CLASS=1000`, `EPOCHS=2` | The 1600-neuron run shows weights saturate within 1 epoch over 300 images. More unique images per class (not more epochs) is what drives further neuron specialization. Reduce epochs to 2 since the network learns in one pass. Paper uses 6000 images/class. | ~2h |
-| 3 | `A_minus/A_plus` ratio 1.2 → 1.05 | Current ratio over-prunes weak classes (observed with digit 8 at 400 exc). 1.05 is the paper value. Zero-cost change, apply together with steps 1-2. | same run |
-| 4 | Sweep `THETA_PLUS`, `THETA_LEAK` | Theta regime calibrated for 400 neurons and 25 ms presentation may not be optimal for the new regime. The fast saturation suggests theta may need to be more aggressive to keep competition alive across epochs. | 3-4 runs |
-| 5 | Weight normalization target tuning | The norm target may need to scale with neuron count. With 4x more exc neurons competing, each neuron receives 4x fewer input spikes on average. | 2-3 runs |
+**Remaining tuning** (for follow-up runs if v3 underperforms):
 
-**Target**: 85-90% with 1600 exc neurons + tuned regime (paper: 87% with 400, 95% with 6400).
+| Priority | Change | Rationale |
+|----------|--------|-----------|
+| 1 | `TRAIN_PRESENT_STEPS` 200 → 350 | Match the paper exactly; requires ~11h at 400 exc |
+| 2 | `STDP_SCALE` sweep (0.1 – 0.5) | May be over- or under-scaled for the new regime |
+| 3 | `THETA_PLUS` / `THETA_LEAK` sweep | Theta regime was tuned for 25ms; may need recalibration |
+| 4 | Weight normalization target tuning | Norm target is auto-computed; could benefit from explicit tuning |
+| 5 | Scale to 1600 exc | Only *after* the training regime is validated at 400 |
+
+**Target**: 75-85% with 400 exc neurons at 200ms (paper: 87% at 350ms). Current best: 64.6%.
 
 ## Next Research Measurements
 

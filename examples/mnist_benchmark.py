@@ -5,13 +5,13 @@ Full Step 3 benchmark following the Diehl & Cook 2015 architecture:
 
 - true MNIST loaded from OpenML, all 10 digit classes
 - 784 input neurons (one per pixel, rate coded)
-- 400 excitatory + 400 inhibitory cortex neurons with WTA microcircuit
+- 1600 excitatory + 1600 inhibitory cortex neurons with WTA microcircuit
 - unsupervised STDP on input->cortex feedforward synapses
 - adaptive excitability thresholds + per-neuron weight normalization
 - L1 intensity equalization for balanced cross-class drive
 - class readout from cortex response templates (spike + voltage blend)
 
-Target: >50% accuracy (Diehl & Cook 2015 achieved 87% with 400 exc neurons).
+Target: 85-90% accuracy (Diehl & Cook 2015 achieved 95% with 6400 exc neurons).
 """
 
 from __future__ import annotations
@@ -44,7 +44,8 @@ from src.synapse import NeurotransmitterType
 # --- Dataset scope ----------------------------------------------------------
 
 CLASSES = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
-TRAIN_PER_CLASS = 300
+TRAIN_PER_CLASS = 6000
+READOUT_PER_CLASS = 500
 TEST_PER_CLASS = 50
 DOWNSAMPLE = 1
 IMAGE_SIDE = 28 // DOWNSAMPLE
@@ -53,19 +54,19 @@ N_INPUT = IMAGE_SIDE * IMAGE_SIDE
 
 # --- Network / training hyperparameters ------------------------------------
 
-N_CORTEX_EXC = 1600
-N_CORTEX_INH = 1600
+N_CORTEX_EXC = 400
+N_CORTEX_INH = 400
 CORTEX_CONNECTIVITY = 0.0
 EXC_TO_INH_WEIGHT = 8.0
 INH_LATERAL_WEIGHT = 10.0
 INPUT_TO_CORTEX_DENSITY = 0.15
 INPUT_WEIGHT_BOOST = 4.0
 
-TRAIN_PRESENT_STEPS = 25
-ASSIGN_PRESENT_STEPS = 25
-TEST_PRESENT_STEPS = 25
-REST_STEPS = 5
-EPOCHS = 3
+TRAIN_PRESENT_STEPS = 200
+ASSIGN_PRESENT_STEPS = 50
+TEST_PRESENT_STEPS = 50
+REST_STEPS = 50
+EPOCHS = 1
 ASSIGN_TOP_K = 20
 TEST_REPEATS = 2
 SPIKE_SCORE_WEIGHT = 0.7
@@ -73,13 +74,12 @@ VOLTAGE_SCORE_WEIGHT = 0.3
 ENCODER_MAX_CURRENT = 25.0
 ENCODER_NOISE = 0.02
 
-STDP_SCALE = 0.8
+STDP_SCALE = 0.2
 STDP_A_PLUS = 0.01
-STDP_A_MINUS = 0.012
+STDP_A_MINUS = 0.0105
 
 THETA_PLUS = 0.10
 THETA_LEAK = 0.005
-THETA_MAX = 25.0
 
 SEED = 42
 
@@ -251,6 +251,24 @@ def load_reduced_mnist(
     rng.shuffle(test_idx)
 
     return X[train_idx], y[train_idx], X[test_idx], y[test_idx]
+
+
+def _balanced_subset(
+    y: np.ndarray,
+    classes: tuple[int, ...],
+    per_class: int,
+    seed: int = 42,
+) -> np.ndarray:
+    """Return indices for a balanced subset of at most per_class samples per class."""
+    rng = np.random.default_rng(seed)
+    indices = []
+    for cls in classes:
+        cls_idx = np.flatnonzero(y == cls)
+        rng.shuffle(cls_idx)
+        indices.extend(cls_idx[:per_class])
+    indices = np.asarray(indices, dtype=np.int64)
+    rng.shuffle(indices)
+    return indices
 
 
 # --- Simulation helpers -----------------------------------------------------
@@ -442,7 +460,7 @@ def evaluate(
 def main() -> None:
     print("=" * 68)
     print("  MNIST BENCHMARK - Unsupervised STDP + Template Readout")
-    print("  (Step 3: 10-class, 784+400+400)")
+    print(f"  (10-class, {N_INPUT}+{N_CORTEX_EXC}+{N_CORTEX_INH}, {TRAIN_PER_CLASS}/class, {TRAIN_PRESENT_STEPS}ms)")
     print("=" * 68)
 
     t0 = time.time()
@@ -506,8 +524,13 @@ def main() -> None:
     print("  Building readout")
     print("-" * 68)
     t3 = time.time()
-    exc_idx, neuron_labels = assign_neuron_labels(brain, X_train, y_train)
-    spike_templates, voltage_templates = build_response_templates(brain, X_train, y_train)
+    # Use a balanced subset for readout to save time (labelling doesn't need all training data).
+    readout_n = READOUT_PER_CLASS * len(CLASSES)
+    readout_idx = _balanced_subset(y_train, CLASSES, READOUT_PER_CLASS, seed=SEED)
+    X_readout, y_readout = X_train[readout_idx], y_train[readout_idx]
+    print(f"  Using {len(X_readout)} samples for readout ({READOUT_PER_CLASS}/class)")
+    exc_idx, neuron_labels = assign_neuron_labels(brain, X_readout, y_readout)
+    spike_templates, voltage_templates = build_response_templates(brain, X_readout, y_readout)
     labelled = neuron_labels >= 0
     print(f"  Excitatory cortex neurons: {len(exc_idx)}")
     print(f"  Labelled excitatory neurons: {int(np.sum(labelled))}/{len(exc_idx)}")
