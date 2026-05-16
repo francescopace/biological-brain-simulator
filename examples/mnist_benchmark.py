@@ -143,6 +143,9 @@ def build_brain(seed: int = SEED) -> Brain:
     brain.memory.capture_trace = lambda *args, **kwargs: None
     brain.memory.consolidate = lambda *args, **kwargs: 0
 
+    # Keep benchmark-level theta settings explicit so sweeps can override them.
+    brain.homeostasis.theta_plus = THETA_PLUS
+    brain.homeostasis.theta_leak = THETA_LEAK
     brain.encoder.max_current = ENCODER_MAX_CURRENT
     brain.encoder.noise_level = ENCODER_NOISE
 
@@ -355,6 +358,17 @@ def normalize_feedforward_weights(brain: Brain, target_sum: float) -> None:
     proj.syn_weight[:ns] = weights
 
 
+def compute_norm_target(brain: Brain) -> float:
+    exc_idx = excitatory_cortex_indices(brain)
+    proj = brain.get_projection("input", "cortex")
+    ns = proj.n_synapses
+    post = proj.syn_post[:ns].to(torch.int64)
+    alive = proj.syn_alive[:ns]
+    weight_sums = torch.zeros(brain.regions["cortex"].n_neurons, dtype=torch.float32, device=DEVICE)
+    weight_sums.index_add_(0, post[alive], proj.syn_weight[:ns][alive].to(torch.float32))
+    return float(weight_sums[exc_idx].mean().item())
+
+
 def assign_neuron_labels(
     brain: Brain,
     X: np.ndarray,
@@ -455,6 +469,73 @@ def evaluate(
     return float(np.mean(preds == y)), preds
 
 
+def build_readout_subset(
+    X_train: np.ndarray,
+    y_train: np.ndarray,
+    readout_per_class: int = READOUT_PER_CLASS,
+    classes: tuple[int, ...] | None = None,
+    seed: int = SEED,
+) -> tuple[np.ndarray, np.ndarray]:
+    classes = CLASSES if classes is None else classes
+    readout_idx = _balanced_subset(y_train, classes, readout_per_class, seed=seed)
+    return X_train[readout_idx], y_train[readout_idx]
+
+
+def neuron_label_counts(
+    neuron_labels: np.ndarray,
+    classes: tuple[int, ...] | None = None,
+) -> dict[int, int]:
+    classes = CLASSES if classes is None else classes
+    return {int(cls): int(np.sum(neuron_labels == cls)) for cls in classes}
+
+
+def train_unsupervised(
+    brain: Brain,
+    X_train: np.ndarray,
+    epochs: int = EPOCHS,
+    train_present_steps: int = TRAIN_PRESENT_STEPS,
+    seed: int = SEED,
+    log_every: int = 50,
+) -> float:
+    norm_target = compute_norm_target(brain)
+    print(f"  Weight normalization target: {norm_target:.1f}")
+
+    t0 = time.time()
+    for epoch in range(epochs):
+        order = np.random.default_rng(seed + epoch).permutation(len(X_train))
+        for j, idx in enumerate(order, start=1):
+            present_sample(brain, X_train[idx], train_present_steps, learn=True)
+            normalize_feedforward_weights(brain, norm_target)
+            reset_brain_state(brain)
+            if log_every > 0 and (j % log_every == 0 or j == len(order)):
+                print(
+                    f"  Epoch {epoch + 1}/{epochs}  "
+                    f"sample {j:4d}/{len(order)}  "
+                    f"elapsed={time.time() - t0:5.1f}s"
+                )
+        proj = brain.get_projection("input", "cortex")
+        w = proj.syn_weight[:proj.n_synapses]
+        print(
+            f"  -> after epoch {epoch + 1}: "
+            f"feedforward weights mean={w.mean().item():.4f} max={w.max().item():.4f}"
+        )
+
+    print(f"  Training time: {time.time() - t0:.1f}s")
+    return norm_target
+
+
+def build_readout(
+    brain: Brain,
+    X_readout: np.ndarray,
+    y_readout: np.ndarray,
+    classes: tuple[int, ...] | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    classes = CLASSES if classes is None else classes
+    exc_idx, neuron_labels = assign_neuron_labels(brain, X_readout, y_readout, classes)
+    spike_templates, voltage_templates = build_response_templates(brain, X_readout, y_readout, classes)
+    return exc_idx, neuron_labels, spike_templates, voltage_templates
+
+
 # --- Main -------------------------------------------------------------------
 
 def main() -> None:
@@ -483,59 +564,24 @@ def main() -> None:
     brain = build_brain(seed=SEED)
     print(brain.summary())
 
-    # Compute initial incoming weight sum per neuron for normalization.
-    exc_idx = excitatory_cortex_indices(brain)
-    proj = brain.get_projection("input", "cortex")
-    ns = proj.n_synapses
-    post = proj.syn_post[:ns].to(torch.int64)
-    alive = proj.syn_alive[:ns]
-    weight_sums = torch.zeros(brain.regions["cortex"].n_neurons, dtype=torch.float32, device=DEVICE)
-    weight_sums.index_add_(0, post[alive], proj.syn_weight[:ns][alive].to(torch.float32))
-    norm_target = float(weight_sums[exc_idx].mean().item())
-    print(f"  Weight normalization target: {norm_target:.1f}")
-
     print("\n" + "-" * 68)
     print("  Unsupervised training")
     print("-" * 68)
-    t1 = time.time()
-    for epoch in range(EPOCHS):
-        order = np.random.default_rng(SEED + epoch).permutation(len(X_train))
-        for j, idx in enumerate(order, start=1):
-            present_sample(brain, X_train[idx], TRAIN_PRESENT_STEPS, learn=True)
-            normalize_feedforward_weights(brain, norm_target)
-            reset_brain_state(brain)
-            if j % 50 == 0 or j == len(order):
-                print(
-                    f"  Epoch {epoch + 1}/{EPOCHS}  "
-                    f"sample {j:4d}/{len(order)}  "
-                    f"elapsed={time.time() - t1:5.1f}s"
-                )
-        proj = brain.get_projection("input", "cortex")
-        w = proj.syn_weight[:proj.n_synapses]
-        print(
-            f"  -> after epoch {epoch + 1}: "
-            f"feedforward weights mean={w.mean().item():.4f} max={w.max().item():.4f}"
-        )
-
-    t2 = time.time()
-    print(f"  Training time: {t2 - t1:.1f}s")
+    train_unsupervised(brain, X_train)
 
     print("\n" + "-" * 68)
     print("  Building readout")
     print("-" * 68)
     t3 = time.time()
     # Use a balanced subset for readout to save time (labelling doesn't need all training data).
-    readout_n = READOUT_PER_CLASS * len(CLASSES)
-    readout_idx = _balanced_subset(y_train, CLASSES, READOUT_PER_CLASS, seed=SEED)
-    X_readout, y_readout = X_train[readout_idx], y_train[readout_idx]
+    X_readout, y_readout = build_readout_subset(X_train, y_train)
     print(f"  Using {len(X_readout)} samples for readout ({READOUT_PER_CLASS}/class)")
-    exc_idx, neuron_labels = assign_neuron_labels(brain, X_readout, y_readout)
-    spike_templates, voltage_templates = build_response_templates(brain, X_readout, y_readout)
+    exc_idx, neuron_labels, spike_templates, voltage_templates = build_readout(brain, X_readout, y_readout)
     labelled = neuron_labels >= 0
     print(f"  Excitatory cortex neurons: {len(exc_idx)}")
     print(f"  Labelled excitatory neurons: {int(np.sum(labelled))}/{len(exc_idx)}")
-    for cls in CLASSES:
-        print(f"    class {cls}: {int(np.sum(neuron_labels == cls))} neurons")
+    for cls, count in neuron_label_counts(neuron_labels).items():
+        print(f"    class {cls}: {count} neurons")
     print(f"  Readout build time: {time.time() - t3:.1f}s")
 
     print("\n" + "-" * 68)

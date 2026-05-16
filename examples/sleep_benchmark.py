@@ -31,13 +31,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from examples.mnist_benchmark import (
     CLASSES,
     SEED,
+    THETA_LEAK,
+    THETA_PLUS,
+    build_readout,
+    build_readout_subset,
+    compute_norm_target,
     load_reduced_mnist,
     present_sample,
     reset_brain_state,
     normalize_feedforward_weights,
-    excitatory_cortex_indices,
-    build_response_templates,
-    predict_sample,
+    evaluate,
 )
 from src.brain import Brain
 from src.device import DEVICE
@@ -47,6 +50,7 @@ from src.persistence import save_brain, load_brain
 
 TRAIN_PER_CLASS = 300
 TEST_PER_CLASS = 50
+READOUT_PER_CLASS = 30
 PRESENT_STEPS = 200
 REST_STEPS = 50
 SLEEP_STEPS = 5000
@@ -109,6 +113,8 @@ def build_brain_with_memory(seed: int = SEED) -> Brain:
     brain.memory.replay_strength = 1.0
     brain.memory.trace_threshold = 0.10
 
+    brain.homeostasis.theta_plus = THETA_PLUS
+    brain.homeostasis.theta_leak = THETA_LEAK
     brain.encoder.max_current = ENCODER_MAX_CURRENT
     brain.encoder.noise_level = ENCODER_NOISE
 
@@ -116,14 +122,7 @@ def build_brain_with_memory(seed: int = SEED) -> Brain:
 
 
 def train_snn(brain, X_train, y_train):
-    exc_idx = excitatory_cortex_indices(brain)
-    proj = brain.get_projection("input", "cortex")
-    ns = proj.n_synapses
-    post = proj.syn_post[:ns].to(torch.int64)
-    alive = proj.syn_alive[:ns]
-    weight_sums = torch.zeros(brain.regions["cortex"].n_neurons, dtype=torch.float32, device=DEVICE)
-    weight_sums.index_add_(0, post[alive], proj.syn_weight[:ns][alive].to(torch.float32))
-    norm_target = float(weight_sums[exc_idx].mean().item())
+    norm_target = compute_norm_target(brain)
 
     order = np.random.default_rng(SEED).permutation(len(X_train))
     for idx in order:
@@ -133,14 +132,10 @@ def train_snn(brain, X_train, y_train):
     return norm_target
 
 
-def eval_snn(brain, X_train, y_train, X_test, y_test):
-    spike_t, voltage_t = build_response_templates(brain, X_train, y_train, CLASSES)
-    correct = 0
-    for x, label in zip(X_test, y_test):
-        pred, _ = predict_sample(brain, x, spike_t, voltage_t, CLASSES)
-        if pred == int(label):
-            correct += 1
-    return correct / len(y_test)
+def eval_snn(brain, X_readout, y_readout, X_test, y_test):
+    _, _, spike_t, voltage_t = build_readout(brain, X_readout, y_readout, CLASSES)
+    acc, _ = evaluate(brain, X_test, y_test, spike_t, voltage_t, CLASSES)
+    return acc
 
 
 def sleep_phase(brain, n_steps, enable_replay=True):
@@ -167,6 +162,13 @@ def main():
     X_train, y_train, X_test, y_test = load_reduced_mnist(
         classes=CLASSES, train_per_class=TRAIN_PER_CLASS, test_per_class=TEST_PER_CLASS,
     )
+    X_readout, y_readout = build_readout_subset(
+        X_train,
+        y_train,
+        readout_per_class=READOUT_PER_CLASS,
+        classes=CLASSES,
+        seed=SEED,
+    )
 
     # --- Train ---
     print("\n  Training SNN...")
@@ -178,7 +180,7 @@ def main():
 
     # --- Evaluate before sleep ---
     print("  Evaluating before sleep...")
-    acc_before = eval_snn(brain, X_train, y_train, X_test, y_test)
+    acc_before = eval_snn(brain, X_readout, y_readout, X_test, y_test)
     print(f"    Accuracy before sleep: {acc_before:.1%}")
 
     # Save for control experiment
@@ -191,7 +193,7 @@ def main():
     sleep_phase(brain, SLEEP_STEPS, enable_replay=True)
     print(f"    done in {time.time() - t1:.1f}s")
 
-    acc_with_replay = eval_snn(brain, X_train, y_train, X_test, y_test)
+    acc_with_replay = eval_snn(brain, X_readout, y_readout, X_test, y_test)
     print(f"    Accuracy after sleep+replay: {acc_with_replay:.1%}")
 
     # --- Sleep WITHOUT replay (control) ---
@@ -201,7 +203,7 @@ def main():
     sleep_phase(brain_ctrl, SLEEP_STEPS, enable_replay=False)
     print(f"    done in {time.time() - t2:.1f}s")
 
-    acc_no_replay = eval_snn(brain_ctrl, X_train, y_train, X_test, y_test)
+    acc_no_replay = eval_snn(brain_ctrl, X_readout, y_readout, X_test, y_test)
     print(f"    Accuracy after sleep (no replay): {acc_no_replay:.1%}")
 
     # --- Summary ---

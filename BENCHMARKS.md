@@ -63,6 +63,16 @@ For exact hyperparameters, read the benchmark scripts:
 
 **v3 neuron label distribution**: 384/400 neurons labelled. Heavy skew toward digit 1 (179 neurons, 47% of labelled) while harder classes (3, 5, 8) got fewer than 10 neurons each. This label imbalance is the primary accuracy limiter — the network has strong per-class accuracy on easy digits but near-chance on hard ones.
 
+**Partial diagnosis: readout-only stress test** (reduced protocol: `100/class` train, `20/class` test, `100ms` train, `25ms` rest):
+
+| Variant | Accuracy | Label entropy | Max class share | Takeaway |
+|---------|----------|---------------|-----------------|----------|
+| `baseline_50x2_blend` | **48.0%** | `0.972` | `0.192` | Baseline diagnostic run |
+| `matched_100x2_blend` | **47.0%** | `0.963` | `0.199` | Matching readout window to training does not help |
+| `matched_100x5_blend` | **48.5%** | `0.963` | `0.199` | More test repeats add little |
+
+**Interpretation**: the first diagnosis pass does **not** support the idea that the MNIST gap is mainly caused by an underpowered decoder. Readout changes moved accuracy by only ±1.5 points on the reduced protocol, while neuron-label balance stayed healthy. This shifts the focus from `build_response_templates()` / `predict_sample()` toward training dynamics: competition strength, STDP calibration, and adaptive-threshold behavior.
+
 **Architecture** (Diehl & Cook 2015):
 - `784` input neurons (one per pixel, rate coded)
 - excitatory + inhibitory cortex neurons with 1:1 matched WTA microcircuit
@@ -109,17 +119,28 @@ CPU with sparse scatter/gather remains the correct default at this scale.
 | `A_minus/A_plus` | 1.20 | 1.05 | Paper value; 1.2 over-prunes weak classes |
 | `STDP_SCALE` | 0.8 | 0.2 | Compensates 8x more STDP events per sample at 200ms |
 
-**Remaining tuning** (for follow-up runs if v3 underperforms):
+**Diagnosis-driven next steps**:
 
-| Priority | Change | Rationale |
-|----------|--------|-----------|
-| 1 | `TRAIN_PRESENT_STEPS` 200 → 350 | Match the paper exactly; requires ~11h at 400 exc |
-| 2 | `STDP_SCALE` sweep (0.1 – 0.5) | May be over- or under-scaled for the new regime |
-| 3 | `THETA_PLUS` / `THETA_LEAK` sweep | Theta regime was tuned for 25ms; may need recalibration |
-| 4 | Weight normalization target tuning | Norm target is auto-computed; could benefit from explicit tuning |
-| 5 | Scale to 1600 exc | Only *after* the training regime is validated at 400 |
+| Priority | Change | Why it moved up |
+|----------|--------|-----------------|
+| 1 | Sweep `INH_LATERAL_WEIGHT` (and optionally `EXC_TO_INH_WEIGHT`) | The main failure mode now looks like winner lock-in / class monopolization rather than decoder weakness |
+| 2 | Sweep `STDP_SCALE` (`0.1 – 0.5`) | Long presentations change event counts sharply; pair-based STDP may now be miscalibrated |
+| 3 | Sweep `brain.homeostasis.theta_plus` / `theta_leak` | Adaptive thresholds are active during MNIST and likely shape which neurons ever get recruited |
+| 4 | Consider richer plasticity than nearest-neighbor pair STDP | Recent literature increasingly favors adaptive or triplet-style rules when pair-based STDP converges too early |
+| 5 | Consider a short post-training adaptation phase (e.g. STP / replay) | Newer work suggests frozen-weight evaluation can leave performance on the table |
+| 6 | Only then rerun `TRAIN_PRESENT_STEPS` 200 → 350 or other long-run changes | Another 8–11h run is only justified after isolating which stabilizer actually helps |
 
 **Target**: 75-85% with 400 exc neurons at 200ms (paper: 87% at 350ms). Current best: 64.6%.
+
+## Literature Pointers
+
+Recent papers and reviews that appear directly relevant to the current MNIST gap:
+
+- **Zhuang et al., 2023** — [An unsupervised STDP-based spiking neural network inspired by biologically plausible learning rules and connections](https://www.sciencedirect.com/science/article/pii/S0893608023003301): combines adaptive synaptic filtering, adaptive threshold balancing, adaptive lateral inhibition, and temporal-batch STDP. The article text reports **97.9% on MNIST** and **87.0% on CIFAR-10**. The important lesson for this repo is not the exact number, but that **static inhibition + fixed thresholding + simple STDP is often not enough**.
+- **Wu et al., 2024** — [Inhibition SNN: unveiling the efficacy of various lateral inhibition learning in image pattern recognition](https://link.springer.com/article/10.1007/s42452-024-06332-z): shows that **inhibition architecture itself** matters, not just inhibition strength. Their simplified inhibition design reports **86% on MNIST** with an unsupervised `784-100` SNN.
+- **Arefnadia et al., 2025** — [Unsupervised post-training learning in spiking neural networks](https://www.nature.com/articles/s41598-025-01749-x): argues that a trained SNN should not necessarily be frozen after the main STDP phase. They combine **triplet STDP** during training with **post-training STP** to improve recognition without changing long-term weights.
+- **Khan et al., 2025 review** — [Modulated spike-time dependent plasticity (STDP)-based learning for spiking neural network (SNN): A review](https://www.sciencedirect.com/science/article/abs/pii/S0925231224019416): emphasizes recurring practical bottlenecks in SNN classification, especially **threshold regulation, competition control, parameter optimization, and scalability**.
+- **Biologically plausible unsupervised learning for self-organizing spiking neural networks with dendritic computation** (2025 article text surfaced via web search): proposes **adaptive self-organizing inhibition** to keep neurons organized into richer feature groups instead of letting a few easy features dominate.
 
 ## Next Research Measurements
 

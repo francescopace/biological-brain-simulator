@@ -33,22 +33,24 @@ from examples.mnist_benchmark import (
     CLASSES,
     SEED,
     build_brain,
+    build_readout,
+    build_readout_subset,
+    compute_norm_target,
     load_reduced_mnist,
     present_sample,
     reset_brain_state,
     normalize_feedforward_weights,
-    excitatory_cortex_indices,
-    build_response_templates,
-    predict_sample,
+    evaluate,
 )
 from src.device import DEVICE
 from src.persistence import save_brain, load_brain
 
-TRAIN_PER_CLASS = 300
-TEST_PER_CLASS = 50
-PRESENT_STEPS = 200
-REST_STEPS = 50
-DAMAGE_LEVELS = [0.0, 0.05, 0.10, 0.20, 0.30, 0.50]
+TRAIN_PER_CLASS = 100
+TEST_PER_CLASS = 30
+READOUT_PER_CLASS = 10
+PRESENT_STEPS = 100
+REST_STEPS = 25
+DAMAGE_LEVELS = [0.0, 0.10, 0.20, 0.30, 0.50]
 
 
 # --- MLP baseline -----------------------------------------------------------
@@ -148,14 +150,10 @@ def snn_damage(brain, frac, seed=42):
             proj.syn_alive[:pns][post_dead] = False
 
 
-def snn_eval(brain, X_train, y_train, X_test, y_test, classes):
-    spike_t, voltage_t = build_response_templates(brain, X_train, y_train, classes)
-    correct = 0
-    for x, label in zip(X_test, y_test):
-        pred, _ = predict_sample(brain, x, spike_t, voltage_t, classes)
-        if pred == int(label):
-            correct += 1
-    return correct / len(y_test)
+def snn_eval(brain, X_readout, y_readout, X_test, y_test, classes):
+    _, _, spike_t, voltage_t = build_readout(brain, X_readout, y_readout, classes)
+    acc, _ = evaluate(brain, X_test, y_test, spike_t, voltage_t, classes)
+    return acc
 
 
 # --- Main -------------------------------------------------------------------
@@ -169,19 +167,19 @@ def main():
     X_train, y_train, X_test, y_test = load_reduced_mnist(
         classes=CLASSES, train_per_class=TRAIN_PER_CLASS, test_per_class=TEST_PER_CLASS,
     )
+    X_readout, y_readout = build_readout_subset(
+        X_train,
+        y_train,
+        readout_per_class=READOUT_PER_CLASS,
+        classes=CLASSES,
+        seed=SEED,
+    )
 
     # --- Train SNN ---
     print("\n  Training SNN...")
     t0 = time.time()
     brain = build_brain(seed=SEED)
-    exc_idx = excitatory_cortex_indices(brain)
-    proj = brain.get_projection("input", "cortex")
-    ns = proj.n_synapses
-    post = proj.syn_post[:ns].to(torch.int64)
-    alive = proj.syn_alive[:ns]
-    weight_sums = torch.zeros(brain.regions["cortex"].n_neurons, dtype=torch.float32, device=DEVICE)
-    weight_sums.index_add_(0, post[alive], proj.syn_weight[:ns][alive].to(torch.float32))
-    norm_target = float(weight_sums[exc_idx].mean().item())
+    norm_target = compute_norm_target(brain)
 
     order = np.random.default_rng(SEED).permutation(len(X_train))
     for idx in order:
@@ -208,7 +206,7 @@ def main():
         # SNN: reload clean brain and damage
         brain_d = load_brain(save_path)
         snn_damage(brain_d, frac, seed=SEED)
-        snn_acc = snn_eval(brain_d, X_train, y_train, X_test, y_test, CLASSES)
+        snn_acc = snn_eval(brain_d, X_readout, y_readout, X_test, y_test, CLASSES)
 
         # MLP: damage weights
         W1d, b1d, W2d, b2d = mlp_damage(W1, b1, W2, b2, frac, seed=SEED)

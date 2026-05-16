@@ -29,21 +29,21 @@ from examples.mnist_benchmark import (
     CLASSES,
     SEED,
     build_brain,
+    compute_norm_target,
     load_reduced_mnist,
     present_sample,
     reset_brain_state,
     normalize_feedforward_weights,
-    excitatory_cortex_indices,
     build_response_templates,
     predict_sample,
     _balanced_subset,
 )
 from src.device import DEVICE
 
-BUDGETS = [1, 5, 10, 50, 100, 300]
-PRESENT_STEPS = 200
-REST_STEPS = 50
-TEST_PER_CLASS = 50
+BUDGETS = [1, 5, 10, 50]
+PRESENT_STEPS = 50
+REST_STEPS = 10
+TEST_PER_CLASS = 30
 
 
 # --- MLP baseline -----------------------------------------------------------
@@ -100,15 +100,7 @@ def mlp_baseline(X_train, y_train, X_test, y_test, classes, hidden=128, epochs=5
 def snn_fewshot(X_train, y_train, X_test, y_test, classes):
     """Train the SNN on the given (small) dataset and return test accuracy."""
     brain = build_brain(seed=SEED)
-
-    exc_idx = excitatory_cortex_indices(brain)
-    proj = brain.get_projection("input", "cortex")
-    ns = proj.n_synapses
-    post = proj.syn_post[:ns].to(torch.int64)
-    alive = proj.syn_alive[:ns]
-    weight_sums = torch.zeros(brain.regions["cortex"].n_neurons, dtype=torch.float32, device=DEVICE)
-    weight_sums.index_add_(0, post[alive], proj.syn_weight[:ns][alive].to(torch.float32))
-    norm_target = float(weight_sums[exc_idx].mean().item())
+    norm_target = compute_norm_target(brain)
 
     order = np.random.default_rng(SEED).permutation(len(X_train))
     for idx in order:

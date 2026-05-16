@@ -30,13 +30,14 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from examples.mnist_benchmark import (
     SEED,
     build_brain,
+    build_readout,
+    build_readout_subset,
+    compute_norm_target,
     load_reduced_mnist,
     present_sample,
     reset_brain_state,
     normalize_feedforward_weights,
-    excitatory_cortex_indices,
-    build_response_templates,
-    predict_sample,
+    evaluate,
 )
 from src.device import DEVICE
 
@@ -45,6 +46,7 @@ TASK_B_CLASSES = (5, 6, 7, 8, 9)
 ALL_CLASSES = TASK_A_CLASSES + TASK_B_CLASSES
 TRAIN_PER_CLASS = 300
 TEST_PER_CLASS = 50
+READOUT_PER_CLASS = 30
 PRESENT_STEPS = 200
 REST_STEPS = 50
 
@@ -106,15 +108,7 @@ def mlp_train_eval(X_train, y_train, X_test, y_test, classes,
 def snn_sequential(X_a, y_a, X_b, y_b, X_test_a, y_test_a, X_test_b, y_test_b):
     """Train SNN on task A then B; evaluate after each phase."""
     brain = build_brain(seed=SEED)
-
-    exc_idx = excitatory_cortex_indices(brain)
-    proj = brain.get_projection("input", "cortex")
-    ns = proj.n_synapses
-    post = proj.syn_post[:ns].to(torch.int64)
-    alive = proj.syn_alive[:ns]
-    weight_sums = torch.zeros(brain.regions["cortex"].n_neurons, dtype=torch.float32, device=DEVICE)
-    weight_sums.index_add_(0, post[alive], proj.syn_weight[:ns][alive].to(torch.float32))
-    norm_target = float(weight_sums[exc_idx].mean().item())
+    norm_target = compute_norm_target(brain)
 
     def train_phase(X, y):
         order = np.random.default_rng(SEED).permutation(len(X))
@@ -123,14 +117,30 @@ def snn_sequential(X_a, y_a, X_b, y_b, X_test_a, y_test_a, X_test_b, y_test_b):
             normalize_feedforward_weights(brain, norm_target)
             reset_brain_state(brain, REST_STEPS)
 
-    def eval_phase(X_train_for_templates, y_train_for_templates, X_test, y_test, classes):
-        spike_t, voltage_t = build_response_templates(brain, X_train_for_templates, y_train_for_templates, classes)
-        correct = 0
-        for x, label in zip(X_test, y_test):
-            pred, _ = predict_sample(brain, x, spike_t, voltage_t, classes)
-            if pred == int(label):
-                correct += 1
-        return correct / len(y_test)
+    def eval_phase(X_readout_for_templates, y_readout_for_templates, X_test, y_test, classes):
+        _, _, spike_t, voltage_t = build_readout(
+            brain,
+            X_readout_for_templates,
+            y_readout_for_templates,
+            classes,
+        )
+        acc, _ = evaluate(brain, X_test, y_test, spike_t, voltage_t, classes)
+        return acc
+
+    X_readout_a, y_readout_a = build_readout_subset(
+        X_a,
+        y_a,
+        readout_per_class=READOUT_PER_CLASS,
+        classes=TASK_A_CLASSES,
+        seed=SEED,
+    )
+    X_readout_b, y_readout_b = build_readout_subset(
+        X_b,
+        y_b,
+        readout_per_class=READOUT_PER_CLASS,
+        classes=TASK_B_CLASSES,
+        seed=SEED,
+    )
 
     # Phase 1: Train on Task A
     print("  Training on Task A (digits 0-4)...")
@@ -139,7 +149,7 @@ def snn_sequential(X_a, y_a, X_b, y_b, X_test_a, y_test_a, X_test_b, y_test_b):
     print(f"    done in {time.time() - t0:.0f}s")
 
     # Evaluate on Task A
-    acc_a_before = eval_phase(X_a, y_a, X_test_a, y_test_a, TASK_A_CLASSES)
+    acc_a_before = eval_phase(X_readout_a, y_readout_a, X_test_a, y_test_a, TASK_A_CLASSES)
     print(f"  Task A accuracy after training A: {acc_a_before:.1%}")
 
     # Phase 2: Train on Task B (same network)
@@ -149,11 +159,11 @@ def snn_sequential(X_a, y_a, X_b, y_b, X_test_a, y_test_a, X_test_b, y_test_b):
     print(f"    done in {time.time() - t1:.0f}s")
 
     # Evaluate on Task B
-    acc_b = eval_phase(X_b, y_b, X_test_b, y_test_b, TASK_B_CLASSES)
+    acc_b = eval_phase(X_readout_b, y_readout_b, X_test_b, y_test_b, TASK_B_CLASSES)
     print(f"  Task B accuracy after training B: {acc_b:.1%}")
 
     # Re-evaluate on Task A (forgetting test)
-    acc_a_after = eval_phase(X_a, y_a, X_test_a, y_test_a, TASK_A_CLASSES)
+    acc_a_after = eval_phase(X_readout_a, y_readout_a, X_test_a, y_test_a, TASK_A_CLASSES)
     print(f"  Task A accuracy after training B: {acc_a_after:.1%}")
 
     return acc_a_before, acc_b, acc_a_after

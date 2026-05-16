@@ -28,13 +28,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from examples.mnist_benchmark import (
     CLASSES,
     SEED,
+    THETA_LEAK,
+    THETA_PLUS,
+    build_readout,
+    build_readout_subset,
+    compute_norm_target,
     load_reduced_mnist,
     present_sample,
     reset_brain_state,
     normalize_feedforward_weights,
-    excitatory_cortex_indices,
-    build_response_templates,
-    predict_sample,
+    evaluate,
 )
 from src.brain import Brain
 from src.device import DEVICE
@@ -43,6 +46,7 @@ from src.region import RegionType
 
 TRAIN_PER_CLASS = 300
 TEST_PER_CLASS = 50
+READOUT_PER_CLASS = 30
 PRESENT_STEPS = 200
 REST_STEPS = 50
 
@@ -111,13 +115,15 @@ def build_brain_growth(seed: int, enable_growth: bool) -> Brain:
     else:
         brain.freeze_structural_plasticity()
 
+    brain.homeostasis.theta_plus = THETA_PLUS
+    brain.homeostasis.theta_leak = THETA_LEAK
     brain.encoder.max_current = ENCODER_MAX_CURRENT
     brain.encoder.noise_level = ENCODER_NOISE
 
     return brain
 
 
-def run_experiment(enable_growth: bool, X_train, y_train, X_test, y_test):
+def run_experiment(enable_growth: bool, X_train, y_train, X_readout, y_readout, X_test, y_test):
     label = "GROWTH" if enable_growth else "FIXED"
     print(f"\n  --- {label} ---")
 
@@ -125,14 +131,7 @@ def run_experiment(enable_growth: bool, X_train, y_train, X_test, y_test):
     snap_before = brain._snapshot()
     print(f"    Before: {snap_before.total_neurons} neurons, {snap_before.total_synapses} synapses")
 
-    exc_idx = excitatory_cortex_indices(brain)
-    proj = brain.get_projection("input", "cortex")
-    ns = proj.n_synapses
-    post = proj.syn_post[:ns].to(torch.int64)
-    alive = proj.syn_alive[:ns]
-    weight_sums = torch.zeros(brain.regions["cortex"].n_neurons, dtype=torch.float32, device=DEVICE)
-    weight_sums.index_add_(0, post[alive], proj.syn_weight[:ns][alive].to(torch.float32))
-    norm_target = float(weight_sums[exc_idx].mean().item())
+    norm_target = compute_norm_target(brain)
 
     t0 = time.time()
     order = np.random.default_rng(SEED).permutation(len(X_train))
@@ -154,13 +153,8 @@ def run_experiment(enable_growth: bool, X_train, y_train, X_test, y_test):
         print(f"    Growth: +{total_born} neurons born, +{total_created} synapses, "
               f"-{total_pruned} pruned, -{total_died} died")
 
-    spike_t, voltage_t = build_response_templates(brain, X_train, y_train, CLASSES)
-    correct = 0
-    for x, label_val in zip(X_test, y_test):
-        pred, _ = predict_sample(brain, x, spike_t, voltage_t, CLASSES)
-        if pred == int(label_val):
-            correct += 1
-    acc = correct / len(y_test)
+    _, _, spike_t, voltage_t = build_readout(brain, X_readout, y_readout, CLASSES)
+    acc, _ = evaluate(brain, X_test, y_test, spike_t, voltage_t, CLASSES)
     print(f"    Accuracy: {acc:.1%}")
     return acc, snap_before, snap_after
 
@@ -176,9 +170,16 @@ def main():
     X_train, y_train, X_test, y_test = load_reduced_mnist(
         classes=CLASSES, train_per_class=TRAIN_PER_CLASS, test_per_class=TEST_PER_CLASS,
     )
+    X_readout, y_readout = build_readout_subset(
+        X_train,
+        y_train,
+        readout_per_class=READOUT_PER_CLASS,
+        classes=CLASSES,
+        seed=SEED,
+    )
 
-    acc_fixed, _, _ = run_experiment(False, X_train, y_train, X_test, y_test)
-    acc_growth, _, _ = run_experiment(True, X_train, y_train, X_test, y_test)
+    acc_fixed, _, _ = run_experiment(False, X_train, y_train, X_readout, y_readout, X_test, y_test)
+    acc_growth, _, _ = run_experiment(True, X_train, y_train, X_readout, y_readout, X_test, y_test)
 
     # --- Summary ---
     print("\n" + "=" * 68)
