@@ -101,6 +101,22 @@ For exact hyperparameters, read the benchmark scripts:
 
 **Interpretation**: at least in the first tested point, reducing `STDP_SCALE` did **not** recover accuracy. That does not rule out a better point at `0.2-0.4`, but it makes inhibition retuning look like the higher-value lever.
 
+**Partial diagnosis: theta / homeostasis sweep** (on top of `INH_LATERAL_WEIGHT=12.0`, larger reduced protocol):
+
+| Variant | Accuracy | Label entropy | Max class share | Takeaway |
+|---------|----------|---------------|-----------------|----------|
+| `theta_default_12` | **67.0%** | `0.882` | `0.269` | Best accuracy overall |
+| `theta_low_plus_12` | **65.7%** | `0.927` | `0.221` | Better balance, but lower accuracy |
+| `theta_high_plus_12` | **56.0%** | `0.924` | `0.251` | Clearly harmful |
+| `theta_fast_leak_12` | **57.3%** | `0.974` | `0.171` | Very balanced, but too much accuracy loss |
+
+**Interpretation**: once inhibition is retuned to `12.0`, the default theta regime is still the best **accuracy-first** choice. Some theta variants improve class balance, but none beat the default on test accuracy. This means the best validated configuration so far is:
+
+- `INH_LATERAL_WEIGHT = 12.0`
+- `THETA_PLUS = 0.10`
+- `THETA_LEAK = 0.005`
+- `STDP_SCALE = 0.2` (still provisional; only `0.10` has been tested and it underperformed)
+
 **Architecture** (Diehl & Cook 2015):
 - `784` input neurons (one per pixel, rate coded)
 - excitatory + inhibitory cortex neurons with 1:1 matched WTA microcircuit
@@ -151,12 +167,11 @@ CPU with sparse scatter/gather remains the correct default at this scale.
 
 | Priority | Change | Why it moved up |
 |----------|--------|-----------------|
-| 1 | Sweep `brain.homeostasis.theta_plus` / `theta_leak` on top of `INH_LATERAL_WEIGHT=12.0` | `12.0` is now the best inhibition setting observed; theta is the next highest-value uncertainty |
-| 2 | Resume `STDP_SCALE` sweep from `0.2` upward only | `0.10` underperformed; if STDP matters, the useful region is more likely near or above the current baseline |
-| 3 | If theta gives no clear win, launch the next full-MNIST run with `INH_LATERAL_WEIGHT=12.0` as the new default | `12.0` is the best-validated competition setting so far |
-| 4 | Consider richer plasticity than nearest-neighbor pair STDP | Recent literature increasingly favors adaptive or triplet-style rules when pair-based STDP converges too early |
-| 5 | Consider a short post-training adaptation phase (e.g. STP / replay) | Newer work suggests frozen-weight evaluation can leave performance on the table |
-| 6 | Only then rerun `TRAIN_PRESENT_STEPS` 200 → 350 or other long-run changes | Another 8–11h run is only justified after isolating which stabilizer actually helps |
+| 1 | Launch the next full-MNIST run with `INH_LATERAL_WEIGHT=12.0` and default theta | This is the best validated configuration so far (`67.0%` on the larger reduced protocol) |
+| 2 | Resume `STDP_SCALE` sweep from `0.2` upward only if more confidence is needed before the long run | `0.10` underperformed; if STDP matters, the useful region is more likely near or above the current baseline |
+| 3 | Consider richer plasticity than nearest-neighbor pair STDP | Recent literature increasingly favors adaptive or triplet-style rules when pair-based STDP converges too early |
+| 4 | Consider a short post-training adaptation phase (e.g. STP / replay) | Newer work suggests frozen-weight evaluation can leave performance on the table |
+| 5 | Only then rerun `TRAIN_PRESENT_STEPS` 200 → 350 or other long-run changes | Another 8–11h run is only justified after isolating which stabilizer actually helps |
 
 **Target**: 75-85% with 400 exc neurons at 200ms (paper: 87% at 350ms). Current best: 64.6%.
 

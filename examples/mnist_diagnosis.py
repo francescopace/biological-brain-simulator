@@ -49,7 +49,7 @@ class ProtocolConfig:
     stdp_scale: float = 0.2
     stdp_a_plus: float = 0.01
     stdp_a_minus: float = 0.0105
-    inh_lateral_weight: float = 10.0
+    inh_lateral_weight: float = 12.0
     exc_to_inh_weight: float = 8.0
     theta_plus: float = 0.10
     theta_leak: float = 0.005
