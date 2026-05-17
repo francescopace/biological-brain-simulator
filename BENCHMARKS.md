@@ -73,6 +73,34 @@ For exact hyperparameters, read the benchmark scripts:
 
 **Interpretation**: the first diagnosis pass does **not** support the idea that the MNIST gap is mainly caused by an underpowered decoder. Readout changes moved accuracy by only ±1.5 points on the reduced protocol, while neuron-label balance stayed healthy. This shifts the focus from `build_response_templates()` / `predict_sample()` toward training dynamics: competition strength, STDP calibration, and adaptive-threshold behavior.
 
+**Partial diagnosis: competition sweep** (same reduced protocol):
+
+| `INH_LATERAL_WEIGHT` | Accuracy | Label entropy | Max class share | Takeaway |
+|----------------------|----------|---------------|-----------------|----------|
+| `6.0` | **54.5%** | `0.957` | `0.185` | Clear gain over the readout baseline |
+| `8.0` | **52.0%** | `0.958` | `0.225` | Worse than both `6.0` and `10.0+` |
+| `10.0` | **53.0%** | `0.982` | `0.155` | Best balance, moderate accuracy |
+| `12.0` | **59.0%** | `0.971` | `0.157` | Best overall short-run result so far |
+
+**Interpretation**: the inhibition sweep produced the strongest signal seen so far. The best point (`12.0`) improved the reduced-protocol accuracy from **48.0%** (readout baseline) to **59.0%** without changing the decoder or the STDP rule. This strongly suggests the MNIST gap is driven more by **competition dynamics** than by readout quality.
+
+**Follow-up validation: larger reduced protocol** (`300/class` train, `30/class` test, `100ms` train, `25ms` rest):
+
+| Variant | Accuracy | Label entropy | Max class share | Takeaway |
+|---------|----------|---------------|-----------------|----------|
+| `inh_lateral=10.0_bigger` | **63.0%** | `0.888` | `0.280` | Better than the small-protocol baseline, but class balance degrades |
+| `inh_lateral=12.0_bigger` | **64.3%** | `0.928` | `0.213` | Best larger-protocol point so far; wins on both accuracy and balance |
+
+**Interpretation**: `INH_LATERAL_WEIGHT=12.0` held up when the reduced protocol was made more demanding. It improved not only the short-run accuracy but also the balance of neuron specialization relative to `10.0`. This is now the strongest candidate for the next full-MNIST run.
+
+**Partial diagnosis: STDP scale sweep** (interrupted after first point):
+
+| `STDP_SCALE` | Accuracy | Label entropy | Max class share | Takeaway |
+|--------------|----------|---------------|-----------------|----------|
+| `0.10` | **47.5%** | `0.959` | `0.206` | Lower than the readout baseline; not promising |
+
+**Interpretation**: at least in the first tested point, reducing `STDP_SCALE` did **not** recover accuracy. That does not rule out a better point at `0.2-0.4`, but it makes inhibition retuning look like the higher-value lever.
+
 **Architecture** (Diehl & Cook 2015):
 - `784` input neurons (one per pixel, rate coded)
 - excitatory + inhibitory cortex neurons with 1:1 matched WTA microcircuit
@@ -123,9 +151,9 @@ CPU with sparse scatter/gather remains the correct default at this scale.
 
 | Priority | Change | Why it moved up |
 |----------|--------|-----------------|
-| 1 | Sweep `INH_LATERAL_WEIGHT` (and optionally `EXC_TO_INH_WEIGHT`) | The main failure mode now looks like winner lock-in / class monopolization rather than decoder weakness |
-| 2 | Sweep `STDP_SCALE` (`0.1 – 0.5`) | Long presentations change event counts sharply; pair-based STDP may now be miscalibrated |
-| 3 | Sweep `brain.homeostasis.theta_plus` / `theta_leak` | Adaptive thresholds are active during MNIST and likely shape which neurons ever get recruited |
+| 1 | Sweep `brain.homeostasis.theta_plus` / `theta_leak` on top of `INH_LATERAL_WEIGHT=12.0` | `12.0` is now the best inhibition setting observed; theta is the next highest-value uncertainty |
+| 2 | Resume `STDP_SCALE` sweep from `0.2` upward only | `0.10` underperformed; if STDP matters, the useful region is more likely near or above the current baseline |
+| 3 | If theta gives no clear win, launch the next full-MNIST run with `INH_LATERAL_WEIGHT=12.0` as the new default | `12.0` is the best-validated competition setting so far |
 | 4 | Consider richer plasticity than nearest-neighbor pair STDP | Recent literature increasingly favors adaptive or triplet-style rules when pair-based STDP converges too early |
 | 5 | Consider a short post-training adaptation phase (e.g. STP / replay) | Newer work suggests frozen-weight evaluation can leave performance on the table |
 | 6 | Only then rerun `TRAIN_PRESENT_STEPS` 200 → 350 or other long-run changes | Another 8–11h run is only justified after isolating which stabilizer actually helps |

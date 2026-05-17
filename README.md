@@ -54,6 +54,7 @@ python examples/growth_demo.py
 python examples/iris_benchmark.py      # classification benchmark
 python examples/grid_nav_benchmark.py  # grid navigation benchmark
 python examples/mnist_benchmark.py     # MNIST benchmark (10-class, 784+1600+1600)
+python examples/mnist_diagnosis.py     # short MNIST diagnosis sweeps
 ```
 
 ## Project structure
@@ -80,6 +81,7 @@ examples/
 ├── iris_benchmark.py         # Iris classification with R-STDP
 ├── grid_nav_benchmark.py     # Grid navigation with R-STDP
 ├── mnist_benchmark.py        # MNIST benchmark: 10-class unsupervised STDP
+├── mnist_diagnosis.py        # MNIST diagnosis: readout / inhibition / STDP / theta sweeps
 ├── fewshot_benchmark.py      # Few-shot learning: SNN vs MLP data efficiency
 ├── forgetting_benchmark.py   # Catastrophic forgetting: sequential task retention
 ├── degradation_benchmark.py  # Graceful degradation: robustness to neuron damage
@@ -158,7 +160,7 @@ The repository currently includes three validated reference benchmarks:
 |---|---|---|---|
 | Iris classification | `examples/iris_benchmark.py` | Can reward-modulated local plasticity solve a standard supervised classification task? | **86.7%** test accuracy, **90.0%** best checkpoint |
 | Grid navigation | `examples/grid_nav_benchmark.py` | Can the simulator learn a usable control policy with reward-modulated spiking dynamics? | **100.0%** success, **4.38** mean steps-to-goal |
-| MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | **64.6%** test accuracy (400 exc, full MNIST 6000/class, 200ms, 15M timesteps). Ongoing diagnosis suggests the main bottleneck is training dynamics (competition / STDP / theta), not the template readout — see BENCHMARKS.md |
+| MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | **64.6%** test accuracy (400 exc, full MNIST 6000/class, 200ms, 15M timesteps). Ongoing diagnosis suggests the main bottleneck is training dynamics (competition / STDP / theta); a stronger inhibition setting (`INH_LATERAL_WEIGHT=12.0`) is currently the best-validated candidate for the next long run — see BENCHMARKS.md |
 
 `BENCHMARKS.md` contains the detailed benchmark notes, including research setup, caveats, runtime observations, and interpretation. Use the benchmark scripts themselves as the source of truth for exact hyperparameters.
 
