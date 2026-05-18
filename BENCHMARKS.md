@@ -55,13 +55,21 @@ For exact hyperparameters, read the benchmark scripts:
 | v1 | 400 exc | 300 | 25 | 3 | 225k | **62.2%** | Baseline |
 | v2 | 1600 exc | 300 | 25 | 3 | 225k | **51.8%** | More neurons hurt with insufficient data |
 | v3 | 400 exc | 6000 | 200 | 1 | 15M | **64.6%** | Full MNIST, near-paper regime |
+| v4 | 400 exc | 6000 | 200 | 1 | 15M | **66.0%** | Same as v3 + `INH_LATERAL_WEIGHT=12.0` |
 | Paper | 400 exc | 6000 | 350 | 1 | 21M | **87%** | Diehl & Cook 2015 reference |
 
-**Key finding: the bottleneck is total learning exposure, not network capacity.** The v1→v2 regression (62%→52%) proved that scaling neurons without scaling data is counterproductive. Weights saturate within 1 epoch — additional epochs over the same data add nothing. The v3 run confirmed that scaling data from 300→6000/class with longer presentation (200ms) yields a modest improvement (62.2%→64.6%), but the gain is smaller than expected — suggesting that presentation duration and STDP calibration matter more than raw data volume alone.
+**Key finding: the bottleneck is no longer just total learning exposure.** The v1→v2 regression (62%→52%) proved that scaling neurons without scaling data is counterproductive. The v3 run showed that scaling data from 300→6000/class with longer presentation (200ms) yields only a modest improvement (62.2%→64.6%). The v4 run then showed that fixing competition dynamics with `INH_LATERAL_WEIGHT=12.0` improves accuracy again (**64.6% -> 66.0%**) and removes most of the class-collapse pathology. At this point the remaining gap appears to be in **feature learning / plasticity calibration**, not only in exposure or readout.
 
-**Learning efficiency comparison**: v1 achieved 62.2% with only 225k timesteps — a rate of **276% accuracy per million timesteps** vs the paper's **4.1%/M**. v3 achieved 64.6% with 15M timesteps — **4.3%/M**, almost identical to the paper's efficiency at equivalent scale. This confirms our architectural additions (L1 equalization, blended spike/voltage readout, leaky theta) give a large efficiency advantage at small data budgets, but at scale the learning rate converges toward the paper's baseline.
+**Learning efficiency comparison**: v1 achieved 62.2% with only 225k timesteps — a rate of **276% accuracy per million timesteps** vs the paper's **4.1%/M**. v3 achieved 64.6% with 15M timesteps — **4.3%/M**. v4 reached **66.0%** with the same 15M timesteps — **4.4%/M**. So the inhibition fix helps, but the learning efficiency at scale still sits far below what would be needed to close the remaining gap to the paper.
 
 **v3 neuron label distribution**: 384/400 neurons labelled. Heavy skew toward digit 1 (179 neurons, 47% of labelled) while harder classes (3, 5, 8) got fewer than 10 neurons each. This label imbalance is the primary accuracy limiter — the network has strong per-class accuracy on easy digits but near-chance on hard ones.
+
+**v4 neuron label distribution**: 398/400 neurons labelled, with a much healthier class spread:
+
+- `0:58`, `1:41`, `2:39`, `3:41`, `4:32`
+- `5:25`, `6:34`, `7:56`, `8:32`, `9:40`
+
+This is the strongest evidence so far that the old benchmark was over-inhibited. The neuron population is no longer collapsing onto one easy digit. Since accuracy improved only to **66.0%**, the main residual bottleneck is now likely **plasticity / feature quality**, not class-balance collapse.
 
 **Partial diagnosis: readout-only stress test** (reduced protocol: `100/class` train, `20/class` test, `100ms` train, `25ms` rest):
 
@@ -117,6 +125,16 @@ For exact hyperparameters, read the benchmark scripts:
 - `THETA_LEAK = 0.005`
 - `STDP_SCALE = 0.2` (still provisional; only `0.10` has been tested and it underperformed)
 
+**Full-MNIST confirmation run** (same `6000/class`, `200ms`, `1 epoch`, but with `INH_LATERAL_WEIGHT=12.0`):
+
+- **Accuracy:** `66.0%`
+- **Training time:** `49346.6s` (~`13.7h`)
+- **Readout build:** `1140.2s`
+- **Eval time:** `111.9s`
+- **Total wall time:** `50607s`
+
+**Interpretation**: the competition fix transferred to the full benchmark, but only modestly (`64.6% -> 66.0%`). This confirms that inhibition was a real bottleneck, but also that fixing inhibition alone is **not enough** to reach the 75-85% target. The next high-value lever should target **plasticity quality** rather than readout or competition.
+
 **Architecture** (Diehl & Cook 2015):
 - `784` input neurons (one per pixel, rate coded)
 - excitatory + inhibitory cortex neurons with 1:1 matched WTA microcircuit
@@ -167,13 +185,12 @@ CPU with sparse scatter/gather remains the correct default at this scale.
 
 | Priority | Change | Why it moved up |
 |----------|--------|-----------------|
-| 1 | Launch the next full-MNIST run with `INH_LATERAL_WEIGHT=12.0` and default theta | This is the best validated configuration so far (`67.0%` on the larger reduced protocol) |
-| 2 | Resume `STDP_SCALE` sweep from `0.2` upward only if more confidence is needed before the long run | `0.10` underperformed; if STDP matters, the useful region is more likely near or above the current baseline |
-| 3 | Consider richer plasticity than nearest-neighbor pair STDP | Recent literature increasingly favors adaptive or triplet-style rules when pair-based STDP converges too early |
-| 4 | Consider a short post-training adaptation phase (e.g. STP / replay) | Newer work suggests frozen-weight evaluation can leave performance on the table |
-| 5 | Only then rerun `TRAIN_PRESENT_STEPS` 200 → 350 or other long-run changes | Another 8–11h run is only justified after isolating which stabilizer actually helps |
+| 1 | Resume `STDP_SCALE` sweep from `0.2` upward | `0.10` underperformed, but the inhibition + theta baseline is now fixed; plasticity is the next unresolved bottleneck |
+| 2 | Consider richer plasticity than nearest-neighbor pair STDP | Recent literature increasingly favors adaptive or triplet-style rules when pair-based STDP converges too early |
+| 3 | Consider a short post-training adaptation phase (e.g. STP / replay) | Newer work suggests frozen-weight evaluation can leave performance on the table |
+| 4 | Only then rerun `TRAIN_PRESENT_STEPS` 200 → 350 or other long-run changes | Another 8–14h run is only justified after isolating which plasticity-side stabilizer actually helps |
 
-**Target**: 75-85% with 400 exc neurons at 200ms (paper: 87% at 350ms). Current best: 64.6%.
+**Target**: 75-85% with 400 exc neurons at 200ms (paper: 87% at 350ms). Current best: **66.0%**.
 
 ## Literature Pointers
 

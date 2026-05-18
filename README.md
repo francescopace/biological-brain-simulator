@@ -160,7 +160,7 @@ The repository currently includes three validated reference benchmarks:
 |---|---|---|---|
 | Iris classification | `examples/iris_benchmark.py` | Can reward-modulated local plasticity solve a standard supervised classification task? | **86.7%** test accuracy, **90.0%** best checkpoint |
 | Grid navigation | `examples/grid_nav_benchmark.py` | Can the simulator learn a usable control policy with reward-modulated spiking dynamics? | **100.0%** success, **4.38** mean steps-to-goal |
-| MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | **64.6%** test accuracy (400 exc, full MNIST 6000/class, 200ms, 15M timesteps). Ongoing diagnosis suggests the main bottleneck is training dynamics (competition / STDP / theta); the best validated next-run configuration so far is `INH_LATERAL_WEIGHT=12.0` with the default theta regime — see BENCHMARKS.md |
+| MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | **66.0%** test accuracy (400 exc, full MNIST 6000/class, 200ms, 15M timesteps) after promoting `INH_LATERAL_WEIGHT=12.0`. Ongoing diagnosis suggests competition was a real bottleneck, but the next remaining gap is now in plasticity / feature learning — see BENCHMARKS.md |
 
 `BENCHMARKS.md` contains the detailed benchmark notes, including research setup, caveats, runtime observations, and interpretation. Use the benchmark scripts themselves as the source of truth for exact hyperparameters.
 
