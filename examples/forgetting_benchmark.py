@@ -8,7 +8,7 @@ Protocol:
   2. Evaluate on 0-4 → accuracy_A_before
   3. Train on MNIST digits 5-9 (Task B) — same network, no reset
   4. Evaluate on 5-9 → accuracy_B
-  5. Re-evaluate on 0-4 → accuracy_A_after
+  5. Re-evaluate on 0-4 with the unchanged Task A decoder → accuracy_A_after
   6. Forgetting = accuracy_A_before - accuracy_A_after
   7. Compare SNN forgetting vs MLP forgetting
 
@@ -92,12 +92,16 @@ def mlp_train_eval(X_train, y_train, X_test, y_test, classes,
         W2 -= lr * dW2
         b2 -= lr * db2
 
-    # Evaluate on the specified test set
+    # Both models receive the task identity and choose among its classes.
     X_te = torch.tensor(X_test, dtype=torch.float32, device=DEVICE)
     y_te_idx = torch.tensor([class_to_idx[int(c)] for c in y_test], dtype=torch.int64, device=DEVICE)
     with torch.no_grad():
         h_te = torch.relu(X_te @ W1 + b1)
-        preds = (h_te @ W2 + b2).argmax(dim=1)
+        candidate_idx = torch.tensor(
+            [class_to_idx[int(c)] for c in classes], device=DEVICE,
+        )
+        logits = h_te @ W2 + b2
+        preds = candidate_idx[logits[:, candidate_idx].argmax(dim=1)]
         correct = (preds == y_te_idx).sum().item()
 
     return correct / len(y_test), W1, b1, W2, b2
@@ -116,16 +120,6 @@ def snn_sequential(X_a, y_a, X_b, y_b, X_test_a, y_test_a, X_test_b, y_test_b):
             present_sample(brain, X[idx], PRESENT_STEPS, learn=True)
             normalize_feedforward_weights(brain, norm_target)
             reset_brain_state(brain, REST_STEPS)
-
-    def eval_phase(X_readout_for_templates, y_readout_for_templates, X_test, y_test, classes):
-        _, _, spike_t, voltage_t = build_readout(
-            brain,
-            X_readout_for_templates,
-            y_readout_for_templates,
-            classes,
-        )
-        acc, _ = evaluate(brain, X_test, y_test, spike_t, voltage_t, classes)
-        return acc
 
     X_readout_a, y_readout_a = build_readout_subset(
         X_a,
@@ -149,7 +143,12 @@ def snn_sequential(X_a, y_a, X_b, y_b, X_test_a, y_test_a, X_test_b, y_test_b):
     print(f"    done in {time.time() - t0:.0f}s")
 
     # Evaluate on Task A
-    acc_a_before = eval_phase(X_readout_a, y_readout_a, X_test_a, y_test_a, TASK_A_CLASSES)
+    _, _, spike_a, voltage_a = build_readout(
+        brain, X_readout_a, y_readout_a, TASK_A_CLASSES,
+    )
+    acc_a_before, _ = evaluate(
+        brain, X_test_a, y_test_a, spike_a, voltage_a, TASK_A_CLASSES,
+    )
     print(f"  Task A accuracy after training A: {acc_a_before:.1%}")
 
     # Phase 2: Train on Task B (same network)
@@ -159,11 +158,18 @@ def snn_sequential(X_a, y_a, X_b, y_b, X_test_a, y_test_a, X_test_b, y_test_b):
     print(f"    done in {time.time() - t1:.0f}s")
 
     # Evaluate on Task B
-    acc_b = eval_phase(X_readout_b, y_readout_b, X_test_b, y_test_b, TASK_B_CLASSES)
+    _, _, spike_b, voltage_b = build_readout(
+        brain, X_readout_b, y_readout_b, TASK_B_CLASSES,
+    )
+    acc_b, _ = evaluate(
+        brain, X_test_b, y_test_b, spike_b, voltage_b, TASK_B_CLASSES,
+    )
     print(f"  Task B accuracy after training B: {acc_b:.1%}")
 
-    # Re-evaluate on Task A (forgetting test)
-    acc_a_after = eval_phase(X_readout_a, y_readout_a, X_test_a, y_test_a, TASK_A_CLASSES)
+    # Measure forgetting with the decoder fitted before Task B; no A refit.
+    acc_a_after, _ = evaluate(
+        brain, X_test_a, y_test_a, spike_a, voltage_a, TASK_A_CLASSES,
+    )
     print(f"  Task A accuracy after training B: {acc_a_after:.1%}")
 
     return acc_a_before, acc_b, acc_a_after

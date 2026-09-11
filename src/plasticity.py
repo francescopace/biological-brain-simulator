@@ -12,6 +12,10 @@ Plasticity rules operating on vectorized synapse arrays.
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator
+from contextlib import contextmanager
+import math
+import operator
 from typing import TYPE_CHECKING
 
 import torch
@@ -132,6 +136,41 @@ class RewardModulatedSTDP:
         self.baseline_dopamine = baseline_dopamine
         self.dopamine: dict[str, float] = {}
         self._stdp = STDP()
+        self.enabled = True
+        self._post_restrictions: dict[str, tuple[int, ...]] = {}
+
+    @contextmanager
+    def restrict_to_posts(self, target: str, post_indices: Iterable[int]) -> Iterator[None]:
+        """Apply a reinforcement pulse only to the selected postsynaptic cells.
+
+        Every ``apply_target`` inside the context clears eligibility on other
+        synapses and excludes them from new STDP events and dopamine updates.
+        Dopamine is reset to baseline on entry to isolate the new pulse, and
+        again on exit (including exceptions) so it cannot spill into the next
+        unrestricted step.
+        Restrictions are transient; use ExitStack for several distinct targets.
+        Nested restrictions on the same target are rejected.
+
+        Example::
+
+            with brain.reward_stdp.restrict_to_posts(target, [action]):
+                brain.reward(amount, target)
+                brain.run(reward_steps, verbose=False)
+        """
+        if not target:
+            raise ValueError("restrict_to_posts() requires an explicit target")
+        if target in self._post_restrictions:
+            raise ValueError(f"Target {target!r} is already restricted")
+        posts = tuple(operator.index(index) for index in post_indices)
+        if any(index < 0 for index in posts):
+            raise ValueError("Postsynaptic indices must be nonnegative")
+        self._post_restrictions[target] = posts
+        self.dopamine.pop(target, None)
+        try:
+            yield
+        finally:
+            self._post_restrictions.pop(target, None)
+            self.dopamine.pop(target, None)
 
     # ── External reinforcement signals ───────────────────────────────
 
@@ -180,14 +219,27 @@ class RewardModulatedSTDP:
         max_weight: torch.Tensor,
         eligibility: torch.Tensor,
         current_time: float,
+        dt: float = 1.0,
     ) -> int:
         """
         Single-step plasticity for a set of synapses identified by `target`:
           1. Event-driven STDP → accumulate into eligibility
-          2. Decay eligibility toward 0
+          2. Decay eligibility over dt milliseconds toward 0
           3. If |dopamine[target]| > eps: weights += eligibility × dopamine
           4. Decay dopamine[target] toward baseline
         """
+        if not self.enabled:
+            return 0
+
+        if target in self._post_restrictions:
+            posts = torch.tensor(
+                self._post_restrictions[target], dtype=syn_post.dtype,
+                device=syn_post.device,
+            )
+            selected = torch.isin(syn_post, posts)
+            eligibility[~selected] = 0.0
+            alive = alive & selected
+
         # 1. STDP into eligibility
         changes = self._stdp.apply_event(
             fired_pre, fired_post,
@@ -200,7 +252,7 @@ class RewardModulatedSTDP:
         )
 
         # 2. Decay eligibility (single vectorized multiply)
-        eligibility *= torch.exp(torch.tensor(-1.0 / self.tau_eligibility, device=eligibility.device))
+        eligibility *= math.exp(-dt / self.tau_eligibility)
 
         # 3. Apply eligibility × dopamine if this target has non-baseline dopamine
         da = self.dopamine.get(target, self.baseline_dopamine)
@@ -236,25 +288,36 @@ class HomeostaticPlasticity:
         check_interval: int = 100,
         theta_plus: float = 0.10,
         theta_leak: float = 0.005,
+        activity_decay: float = 0.995,
     ):
         self.target_rate = target_rate
         self.scaling_rate = scaling_rate
         self.check_interval = check_interval
         self.theta_plus = theta_plus
         self.theta_leak = theta_leak
+        self.activity_decay = activity_decay
+        self.theta_enabled = True
+        self.scaling_enabled = True
         self._step_counter = 0
 
     def apply(self, regions: list[Region], current_time: float) -> None:
         self._step_counter += 1
 
         # Update adaptive thresholds (theta) every step
-        for region in regions:
-            n = region.n_neurons
-            if n > 0:
-                fired = region.fired[:n].to(torch.float32)
-                region.theta[:n] = region.theta[:n] * (1.0 - self.theta_leak) + self.theta_plus * fired
+        if self.theta_enabled:
+            for region in regions:
+                n = region.n_neurons
+                if n > 0:
+                    fired = region.fired[:n].to(torch.float32)
+                    region.theta[:n] = (
+                        region.theta[:n] * (1.0 - self.theta_leak)
+                        + self.theta_plus * fired
+                    )
 
-        if self._step_counter % self.check_interval != 0:
+        if (
+            not self.scaling_enabled
+            or self._step_counter % self.check_interval != 0
+        ):
             return
 
         for region in regions:
@@ -270,15 +333,29 @@ class HomeostaticPlasticity:
             mask = alive_syn & (post_idx < n) & alive_n[post_idx]
 
             activity = region.activity[:n]
-            target = self.target_rate * 0.001
             weights = region.syn_weight[syn]
             min_weight = region.syn_min_weight[syn]
             max_weight = region.syn_max_weight[syn]
-            post_rate = torch.clamp(activity[post_idx], min=0.001)
-            ratio = target / post_rate
+            # `activity` is an unnormalised exponentially decayed spike
+            # count. Multiplying by (1-decay) yields spikes/timestep; convert
+            # that to Hz before comparing it with target_rate.
+            post_rate_hz = torch.clamp(
+                activity[post_idx]
+                * (1.0 - self.activity_decay)
+                * (1000.0 / region.dt),
+                min=0.01,
+            )
+            ratio = self.target_rate / post_rate_hz
             scale = torch.clamp(1.0 + self.scaling_rate * (ratio - 1.0), 0.95, 1.05)
 
-            weights[mask] *= scale[mask]
+            excitatory = weights >= 0.0
+            exc_mask = mask & excitatory
+            inh_mask = mask & ~excitatory
+            weights[exc_mask] *= scale[exc_mask]
+            # Underactive targets need less inhibition; overactive targets
+            # need more. Dividing negative weights by the excitatory scale
+            # gives that complementary homeostatic response.
+            weights[inh_mask] /= scale[inh_mask]
             weights[mask] = torch.clamp(
                 weights[mask],
                 min_weight[mask],
@@ -296,7 +373,7 @@ class Metaplasticity:
         for region in regions:
             n = region.n_neurons
             ns = region.n_synapses
-            if n == 0 or ns == 0:
+            if not region.plasticity_enabled or n == 0 or ns == 0:
                 continue
 
             syn = slice(0, ns)

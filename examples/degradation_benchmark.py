@@ -41,6 +41,7 @@ from examples.mnist_benchmark import (
     reset_brain_state,
     normalize_feedforward_weights,
     evaluate,
+    excitatory_cortex_indices,
 )
 from src.device import DEVICE
 from src.persistence import save_brain, load_brain

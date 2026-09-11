@@ -102,7 +102,7 @@ def build_brain_growth(seed: int, enable_growth: bool) -> Brain:
     proj.syn_A_plus[:ns][~exc_post] = 0.0
     proj.syn_A_minus[:ns][~exc_post] = 0.0
 
-    brain.reward_stdp.apply_target = lambda *args, **kwargs: 0
+    brain.disable_reward_modulated_plasticity()
     brain.reset_traces()
     brain.memory.capture_trace = lambda *args, **kwargs: None
     brain.memory.consolidate = lambda *args, **kwargs: 0

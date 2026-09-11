@@ -19,6 +19,8 @@ from .neuron import FiringPattern, NeuronType, PATTERN_PARAMS
 from .synapse import NeurotransmitterType
 
 if TYPE_CHECKING:
+    from .brain import Projection
+    from .memory import MemorySystem
     from .region import Region
 
 
@@ -55,7 +57,12 @@ class GrowthController:
         self._rng = torch.Generator(device=DEVICE)
         self.history: list[GrowthStats] = []
 
-    def step(self, regions: list[Region]) -> GrowthStats | None:
+    def step(
+        self,
+        regions: list[Region],
+        projections: list[Projection] | None = None,
+        memory: MemorySystem | None = None,
+    ) -> GrowthStats | None:
         self._step_counter += 1
         if self._step_counter % self.growth_interval != 0:
             return None
@@ -63,7 +70,7 @@ class GrowthController:
         stats = GrowthStats()
         for region in regions:
             stats.synapses_pruned += self._prune_synapses(region)
-            stats.neurons_died += self._apoptosis(region)
+            stats.neurons_died += self._apoptosis(region, projections, memory)
             stats.synapses_created += self._synaptogenesis(region)
             stats.neurons_born += self._neurogenesis(region)
 
@@ -87,7 +94,12 @@ class GrowthController:
             region.syn_alive[:ns][mask] = False
         return count
 
-    def _apoptosis(self, region: Region) -> int:
+    def _apoptosis(
+        self,
+        region: Region,
+        projections: list[Projection] | None = None,
+        memory: MemorySystem | None = None,
+    ) -> int:
         n = region.n_neurons
         ns = region.n_synapses
         if n == 0:
@@ -113,6 +125,34 @@ class GrowthController:
             mask = pre_dead | post_dead
             if torch.any(mask):
                 region.syn_alive[:ns][mask] = False
+
+        # Inter-region projections share the same neuron indices and must be
+        # invalidated before an apoptotic slot can be reused by neurogenesis.
+        for proj in projections or []:
+            pns = proj.n_synapses
+            if pns == 0:
+                continue
+            connected = torch.zeros(pns, dtype=torch.bool, device=DEVICE)
+            if proj.source_name == region.name:
+                connected |= torch.isin(proj.syn_pre[:pns], dead)
+            if proj.target_name == region.name:
+                connected |= torch.isin(proj.syn_post[:pns], dead)
+            proj.syn_alive[:pns][connected] = False
+
+        # Memory traces store indices, so remove dead entries before those
+        # indices can identify newly born neurons.
+        if memory is not None:
+            retained = []
+            for trace in memory.traces:
+                if trace.region_name != region.name:
+                    retained.append(trace)
+                    continue
+                keep = ~torch.isin(trace.neuron_indices, dead)
+                trace.neuron_indices = trace.neuron_indices[keep]
+                trace.activity_snapshot = trace.activity_snapshot[keep]
+                if len(trace.neuron_indices) >= 3:
+                    retained.append(trace)
+            memory.traces = retained
 
         return len(dead)
 

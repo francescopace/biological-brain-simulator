@@ -8,12 +8,12 @@ backpropagation.
 
 Architecture:
     input (25 sensory neurons, one per grid cell)
-        ↓ density 0.5
-    place_cells (100 memory neurons with theta-gamma coupling)
         ↓ density 1.0 (R-STDP)
     motor (4 chattering neurons: up/down/left/right)
 
-    input ─────────────→ motor  (direct readout, R-STDP)
+The baseline deliberately disables replay, oscillations and synaptic
+homeostatic scaling. Those mechanisms should be reintroduced only as
+separate ablations after direct state-action learning is established.
 
 Unlike the Iris benchmark, this task is not supervised. The agent
 chooses an action from motor spikes, executes it in the environment,
@@ -27,6 +27,7 @@ import copy
 import sys
 import time
 from collections import deque
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -46,7 +47,6 @@ from src.region import RegionType
 
 GRID_SIZE = 5
 N_INPUT = GRID_SIZE * GRID_SIZE
-N_PLACE_CELLS = 100
 N_MOTOR = 4
 
 ACTION_NAMES = ("up", "down", "left", "right")
@@ -73,33 +73,29 @@ INTER_STEP_REST = 25
 MAX_STEPS_PER_EPISODE = 20
 EPISODES = 500
 EVAL_EPISODES = 100
+CHECKPOINT_INTERVAL = 50
+CHECKPOINT_EVAL_EPISODES = 40
 
 EPSILON_START = 0.50
 EPSILON_END = 0.10
 EPSILON_DECAY_EPISODES = 300
 
-PLACE_FIELD_SIGMA = 0.6
 STEP_REWARD = 0.080
 STEP_PUNISH = 0.030
 WALL_PUNISH = 0.015
 GOAL_REWARD = 0.400
+REWARD_BASELINE_ALPHA = 0.05
 
 LATERAL_INHIBITION = 5.0
 ENCODER_MAX_CURRENT = 55.0
 ENCODER_NOISE = 0.05
 
-PROJECTION_DENSITY_INPUT_PLACE = 0.50
-PROJECTION_DENSITY_PLACE_MOTOR = 0.50
 PROJECTION_DENSITY_INPUT_MOTOR = 1.00
-PROJECTION_WEIGHT_BOOST_IP = 7.0
 READOUT_INIT_WEIGHT = 0.05
 
 STDP_SCALE = 1.0
 TAU_ELIGIBILITY = 200.0
 DOPAMINE_DECAY = 0.5
-
-REST_INTERVAL = 50
-REST_STEPS = 5000
 
 SEED = 42
 
@@ -145,20 +141,17 @@ class GridWorld:
 def build_brain(seed: int = SEED) -> Brain:
     brain = Brain(dt=1.0, seed=seed)
 
-    brain.add_region(
+    input_region = brain.add_region(
         "input",
         RegionType.SENSORY,
-        n_neurons=N_INPUT,
+        n_neurons=0,
         connectivity=0.0,
         max_neurons=N_INPUT,
     )
-    brain.add_region(
-        "place_cells",
-        RegionType.MEMORY,
-        n_neurons=N_PLACE_CELLS,
-        connectivity=0.05,
-        max_neurons=N_PLACE_CELLS,
-    )
+    # Each one-hot state must have a pathway to every motor neuron.
+    # Long-range projections originate only from excitatory neurons.
+    for _ in range(N_INPUT):
+        input_region.add_neuron(NeuronType.EXCITATORY, FiringPattern.REGULAR_SPIKING)
     brain.add_region(
         "motor",
         RegionType.MOTOR,
@@ -172,25 +165,15 @@ def build_brain(seed: int = SEED) -> Brain:
         motor.add_neuron(NeuronType.EXCITATORY, FiringPattern.CHATTERING)
     motor.add_lateral_inhibition(weight=LATERAL_INHIBITION, delay_ms=1.0)
 
-    brain.connect_regions("input", "place_cells", density=PROJECTION_DENSITY_INPUT_PLACE)
-    brain.connect_regions("place_cells", "motor", density=PROJECTION_DENSITY_PLACE_MOTOR)
     brain.connect_regions("input", "motor", density=PROJECTION_DENSITY_INPUT_MOTOR)
 
     for proj in brain.projections:
         ns = proj.n_synapses
-        if proj.source_name == "input" and proj.target_name == "place_cells":
-            proj.syn_weight[:ns] *= PROJECTION_WEIGHT_BOOST_IP
-        elif proj.target_name == "motor":
+        if proj.target_name == "motor":
             proj.syn_weight[:ns] = READOUT_INIT_WEIGHT
 
     # Keep plasticity focused on state -> action pathways.
     brain.freeze_plasticity()
-    brain.enable_projection_plasticity(
-        "place_cells",
-        "motor",
-        A_plus=0.01 * STDP_SCALE,
-        A_minus=0.012 * STDP_SCALE,
-    )
     brain.enable_projection_plasticity(
         "input",
         "motor",
@@ -203,14 +186,11 @@ def build_brain(seed: int = SEED) -> Brain:
     brain.reward_stdp.tau_eligibility = TAU_ELIGIBILITY
     brain.reward_stdp.dopamine_decay = DOPAMINE_DECAY
 
-    # Make replay visible and deterministic enough for benchmarking.
-    brain.memory.trace_capacity = 200
-    brain.memory.trace_threshold = 0.08
-    brain.memory.replay_strength = 1.25
-    brain.memory.consolidation_interval = REST_STEPS
-
-    # Keep the substrate stable while we test reward learning + replay.
+    # Establish the minimal reward-learning baseline first.
     brain.freeze_structural_plasticity()
+    brain.freeze_homeostatic_scaling()
+    brain.disable_memory()
+    brain.disable_oscillations()
 
     return brain
 
@@ -226,14 +206,11 @@ def reset_between_steps(brain: Brain, n_steps: int = INTER_STEP_REST) -> None:
 def position_encode(
     pos: tuple[int, int],
     size: int = GRID_SIZE,
-    sigma: float = PLACE_FIELD_SIGMA,
 ) -> np.ndarray:
     row, col = pos
-    coords = np.indices((size, size)).reshape(2, -1).T.astype(np.float64)
-    diff = coords - np.array([row, col], dtype=np.float64)
-    dist2 = np.sum(diff * diff, axis=1)
-    act = np.exp(-0.5 * dist2 / (sigma * sigma))
-    return act.astype(np.float64)
+    encoded = np.zeros(size * size, dtype=np.float64)
+    encoded[row * size + col] = 1.0
+    return encoded
 
 
 def present_state(
@@ -252,21 +229,6 @@ def present_state(
     counts = (motor.total_spikes[:N_MOTOR] - before).cpu().numpy()
     mean_voltage = (voltage_sum / n_steps).cpu().numpy()
     return counts, mean_voltage
-
-
-def decode_action_scores(brain: Brain, x: np.ndarray) -> np.ndarray:
-    scores = torch.zeros(N_MOTOR, dtype=torch.float32, device=DEVICE)
-    x_t = torch.as_tensor(x, dtype=torch.float32, device=DEVICE)
-    for proj in brain.projections:
-        if proj.source_name != "input" or proj.target_name != "motor":
-            continue
-        ns = proj.n_synapses
-        if ns == 0:
-            continue
-        pre_idx = proj.syn_pre[:ns].to(torch.int64)
-        post_idx = proj.syn_post[:ns].to(torch.int64)
-        scores.index_add_(0, post_idx, x_t[pre_idx] * proj.syn_weight[:ns])
-    return scores.cpu().numpy()
 
 
 def mark_executed_action(brain: Brain, x: np.ndarray, action: int) -> None:
@@ -303,21 +265,14 @@ def epsilon_for_episode(episode_idx: int) -> float:
 def choose_action(
     counts: np.ndarray,
     mean_voltage: np.ndarray,
-    decoder_scores: np.ndarray,
     epsilon: float,
     rng: np.random.Generator,
-    guided_actions: np.ndarray | None = None,
 ) -> tuple[int, str]:
     if rng.random() < epsilon:
-        if guided_actions is not None and len(guided_actions) > 0:
-            idx = int(rng.integers(0, len(guided_actions)))
-            return int(guided_actions[idx]), "guided"
         return int(rng.integers(0, N_MOTOR)), "explore"
-    if decoder_scores.max() > 0:
-        return int(np.argmax(decoder_scores)), "decoder"
-    if counts.max() <= 0:
-        return int(np.argmax(mean_voltage)), "voltage"
-    return int(np.argmax(counts)), "policy"
+    if counts.max() > 0:
+        return int(np.argmax(counts)), "policy"
+    return int(np.argmax(mean_voltage)), "voltage"
 
 
 def apply_reinforcement(
@@ -325,29 +280,72 @@ def apply_reinforcement(
     targets: list[str],
     amount: float,
     positive: bool,
-) -> None:
+    action: int,
+) -> dict[str, float]:
     if amount <= 0.0:
-        return
-    for target in targets:
-        if positive:
-            brain.reward(amount, target=target)
-        else:
-            brain.punish(amount, target=target)
-    quiet_steps(brain, POST_REWARD_STEPS)
+        return {
+            "eligibility_mean": 0.0,
+            "eligibility_positive_fraction": 0.0,
+            "mean_abs_weight_change": 0.0,
+            "saturated_fraction": 0.0,
+        }
 
+    selected = []
+    eligibility_parts = []
+    for proj in brain.projections:
+        target = Brain.projection_target(proj.source_name, proj.target_name)
+        if target not in targets:
+            continue
+        ns = proj.n_synapses
+        mask = (proj.syn_post[:ns] == action) & proj.syn_alive[:ns]
+        selected.append((proj, mask, proj.syn_weight[:ns][mask].clone()))
+        if torch.any(mask):
+            eligibility_parts.append(proj.syn_eligibility[:ns][mask].clone())
 
-def best_actions_for_position(env: GridWorld, pos: tuple[int, int]) -> np.ndarray:
-    current = env.manhattan_distance(pos)
-    actions = []
-    best = current
-    for action in range(N_MOTOR):
-        _, _, _, _, new_dist = env.step(pos, action)
-        if new_dist < best:
-            best = new_dist
-            actions = [action]
-        elif new_dist == best and new_dist < current:
-            actions.append(action)
-    return np.asarray(actions, dtype=np.int32)
+    eligibility = (
+        torch.cat(eligibility_parts)
+        if eligibility_parts else torch.empty(0, device=DEVICE)
+    )
+    # New spikes may arrive while dopamine is active. Keep credit restricted
+    # throughout the pulse, including those newly accumulated traces.
+    with ExitStack() as credit:
+        for target in targets:
+            credit.enter_context(
+                brain.reward_stdp.restrict_to_posts(target, [action])
+            )
+            if positive:
+                brain.reward(amount, target=target)
+            else:
+                brain.punish(amount, target=target)
+        quiet_steps(brain, POST_REWARD_STEPS)
+
+    weight_changes = []
+    saturated = 0
+    n_selected = 0
+    for proj, mask, before in selected:
+        ns = proj.n_synapses
+        after = proj.syn_weight[:ns][mask]
+        weight_changes.append(torch.abs(after - before))
+        mins = proj.syn_min_weight[:ns][mask]
+        maxs = proj.syn_max_weight[:ns][mask]
+        saturated += int(
+            ((after <= mins + 1e-6) | (after >= maxs - 1e-6)).sum().item()
+        )
+        n_selected += len(after)
+
+    changes = (
+        torch.cat(weight_changes)
+        if weight_changes else torch.empty(0, device=DEVICE)
+    )
+    return {
+        "eligibility_mean": float(eligibility.mean().item()) if len(eligibility) else 0.0,
+        "eligibility_positive_fraction": (
+            float((eligibility > 0).to(torch.float32).mean().item())
+            if len(eligibility) else 0.0
+        ),
+        "mean_abs_weight_change": float(changes.mean().item()) if len(changes) else 0.0,
+        "saturated_fraction": saturated / max(n_selected, 1),
+    }
 
 
 # --- Rollouts --------------------------------------------------------------
@@ -359,6 +357,7 @@ def run_episode(
     episode_idx: int,
     learn: bool = True,
     epsilon_override: float | None = None,
+    reward_baseline: np.ndarray | None = None,
 ) -> dict[str, float | int | bool]:
     pos = env.reset(rng)
     epsilon = epsilon_for_episode(episode_idx) if epsilon_override is None else epsilon_override
@@ -366,25 +365,19 @@ def run_episode(
     explore_steps = 0
     silent_steps = 0
     total_counts = np.zeros(N_MOTOR, dtype=np.int32)
+    reinforcement_stats: list[dict[str, float]] = []
 
     for step_idx in range(1, MAX_STEPS_PER_EPISODE + 1):
         x = position_encode(pos)
         counts, mean_voltage = present_state(brain, x)
-        decoder_scores = decode_action_scores(brain, x)
         total_counts += counts
-        guided_actions = best_actions_for_position(env, pos) if learn else None
         action, source = choose_action(
             counts,
             mean_voltage,
-            decoder_scores,
             epsilon,
             rng,
-            guided_actions=guided_actions,
         )
-        if learn and len(guided_actions) > 0 and action not in guided_actions:
-            action = int(guided_actions[int(rng.integers(0, len(guided_actions)))])
-            source = "teacher"
-        if source in {"explore", "guided"}:
+        if source == "explore":
             explore_steps += 1
         elif source == "voltage":
             silent_steps += 1
@@ -396,19 +389,34 @@ def run_episode(
 
         if learn:
             targets = keep_only_action_eligibility(brain, action)
+            signed_reward = 0.0
             if reached_goal:
-                apply_reinforcement(brain, targets, GOAL_REWARD, positive=True)
+                signed_reward = GOAL_REWARD
             elif new_dist < prev_dist:
-                apply_reinforcement(brain, targets, STEP_REWARD, positive=True)
+                signed_reward = STEP_REWARD
             elif not moved:
-                apply_reinforcement(brain, targets, WALL_PUNISH, positive=False)
+                signed_reward = -WALL_PUNISH
             elif new_dist > prev_dist:
-                apply_reinforcement(brain, targets, STEP_PUNISH, positive=False)
+                signed_reward = -STEP_PUNISH
+
+            if reward_baseline is not None:
+                state_idx = pos[0] * GRID_SIZE + pos[1]
+                advantage = signed_reward - reward_baseline[state_idx]
+                reward_baseline[state_idx] += REWARD_BASELINE_ALPHA * advantage
+            else:
+                advantage = signed_reward
+            reinforcement_stats.append(apply_reinforcement(
+                brain,
+                targets,
+                abs(float(advantage)),
+                positive=advantage >= 0.0,
+                action=action,
+            ))
 
         pos = nxt
         if reached_goal:
             reset_between_steps(brain)
-            return {
+            result = {
                 "success": True,
                 "steps": step_idx,
                 "final_distance": 0,
@@ -416,10 +424,11 @@ def run_episode(
                 "silent_steps": silent_steps,
                 "motor_spikes": int(total_counts.sum()),
             }
+            return _attach_reinforcement_summary(result, reinforcement_stats)
 
         reset_between_steps(brain)
 
-    return {
+    result = {
         "success": False,
         "steps": MAX_STEPS_PER_EPISODE,
         "final_distance": env.manhattan_distance(pos),
@@ -427,6 +436,21 @@ def run_episode(
         "silent_steps": silent_steps,
         "motor_spikes": int(total_counts.sum()),
     }
+    return _attach_reinforcement_summary(result, reinforcement_stats)
+
+
+def _attach_reinforcement_summary(
+    result: dict[str, float | int | bool],
+    stats: list[dict[str, float]],
+) -> dict[str, float | int | bool]:
+    for key in (
+        "eligibility_mean",
+        "eligibility_positive_fraction",
+        "mean_abs_weight_change",
+        "saturated_fraction",
+    ):
+        result[key] = float(np.mean([item[key] for item in stats])) if stats else 0.0
+    return result
 
 
 def evaluate_policy(
@@ -437,6 +461,8 @@ def evaluate_policy(
 ) -> dict[str, float]:
     eval_brain = copy.deepcopy(brain)
     eval_brain.reset_traces()
+    eval_brain.freeze_adaptive_thresholds()
+    eval_brain.encoder.noise_level = 0.0
 
     successes = 0
     steps = []
@@ -500,17 +526,26 @@ def random_policy_baseline(
     }
 
 
-def rest_and_measure(
-    brain: Brain,
-    env: GridWorld,
-    rng: np.random.Generator,
-    n_eval_episodes: int = 40,
-) -> tuple[dict[str, float], dict[str, float]]:
-    before = evaluate_policy(brain, env, rng, n_episodes=n_eval_episodes)
-    quiet_steps(brain, REST_STEPS)
-    brain.reset_traces()
-    after = evaluate_policy(brain, env, rng, n_episodes=n_eval_episodes)
-    return before, after
+def policy_action_margin(brain: Brain, env: GridWorld) -> dict[str, float]:
+    """Measure how decisively the spiking policy separates its top actions."""
+    eval_brain = copy.deepcopy(brain)
+    eval_brain.reset_traces()
+    eval_brain.freeze_adaptive_thresholds()
+    eval_brain.encoder.noise_level = 0.0
+    margins = []
+    for row in range(env.size):
+        for col in range(env.size):
+            if (row, col) == env.goal:
+                continue
+            counts, voltage = present_state(eval_brain, position_encode((row, col)))
+            scores = counts.astype(np.float64) if counts.max() > 0 else voltage
+            ordered = np.sort(scores)
+            margins.append(float(ordered[-1] - ordered[-2]))
+            reset_between_steps(eval_brain)
+    return {
+        "mean": float(np.mean(margins)),
+        "minimum": float(np.min(margins)),
+    }
 
 
 # --- Main ------------------------------------------------------------------
@@ -518,7 +553,7 @@ def rest_and_measure(
 def main() -> None:
     print("=" * 68)
     print("  GRID NAVIGATION BENCHMARK - Spiking Brain with R-STDP")
-    print("  (Operant conditioning with place cells, replay, and oscillations)")
+    print("  (Minimal teacher-free state-action baseline)")
     print("=" * 68)
 
     env = GridWorld()
@@ -556,7 +591,8 @@ def main() -> None:
     rolling_steps: deque[int] = deque(maxlen=20)
     rolling_success: deque[int] = deque(maxlen=20)
     rolling_silence: deque[float] = deque(maxlen=20)
-    rest_deltas: list[tuple[int, float, float]] = []
+    reward_baseline = np.zeros(N_INPUT, dtype=np.float64)
+    checkpoint_history: list[dict[str, float]] = []
 
     best_score = -np.inf
     best_episode = 0
@@ -564,7 +600,14 @@ def main() -> None:
     t0 = time.time()
 
     for episode in range(1, EPISODES + 1):
-        metrics = run_episode(brain, env, rng, episode_idx=episode, learn=True)
+        metrics = run_episode(
+            brain,
+            env,
+            rng,
+            episode_idx=episode,
+            learn=True,
+            reward_baseline=reward_baseline,
+        )
         rolling_steps.append(int(metrics["steps"]))
         rolling_success.append(int(metrics["success"]))
         rolling_silence.append(float(metrics["silent_steps"]) / MAX_STEPS_PER_EPISODE)
@@ -583,27 +626,35 @@ def main() -> None:
             f"roll_success={rolling_success_rate:.1%}  "
             f"roll_steps={rolling_mean_steps:5.2f}  "
             f"roll_silent={rolling_silent_rate:.1%}  "
+            f"elig+={float(metrics['eligibility_positive_fraction']):.1%}  "
+            f"|dw|={float(metrics['mean_abs_weight_change']):.5f}  "
+            f"sat={float(metrics['saturated_fraction']):.1%}  "
             f"t={elapsed:5.1f}s"
         )
 
-        score = rolling_success_rate * 100.0 - rolling_mean_steps
-        if score > best_score and len(rolling_steps) >= 20:
-            best_score = score
-            best_episode = episode
-            best_brain = copy.deepcopy(brain)
-
-        if episode % REST_INTERVAL == 0:
-            before, after = rest_and_measure(
+        if episode % CHECKPOINT_INTERVAL == 0:
+            checkpoint = evaluate_policy(
                 brain,
                 env,
-                np.random.default_rng(SEED + 1000 + episode),
+                np.random.default_rng(SEED + 2000),
+                n_episodes=CHECKPOINT_EVAL_EPISODES,
             )
-            rest_deltas.append((episode, before["success_rate"], after["success_rate"]))
+            margin = policy_action_margin(brain, env)
+            checkpoint["episode"] = float(episode)
+            checkpoint["mean_action_margin"] = margin["mean"]
+            checkpoint["minimum_action_margin"] = margin["minimum"]
+            checkpoint_history.append(checkpoint)
+            score = checkpoint["success_rate"] * 100.0 - checkpoint["mean_steps"]
+            if score > best_score:
+                best_score = score
+                best_episode = episode
+                best_brain = copy.deepcopy(brain)
             print(
-                "    Rest consolidation: "
-                f"success {before['success_rate']:.1%} -> {after['success_rate']:.1%}, "
-                f"mean_steps {before['mean_steps']:.2f} -> {after['mean_steps']:.2f}, "
-                f"mean_final_distance {before['mean_final_distance']:.2f} -> {after['mean_final_distance']:.2f}"
+                "    Deterministic checkpoint: "
+                f"success={checkpoint['success_rate']:.1%}  "
+                f"mean_steps={checkpoint['mean_steps']:.2f}  "
+                f"margin_mean={margin['mean']:.3f}  "
+                f"margin_min={margin['minimum']:.3f}"
             )
 
     if best_brain is not None:
@@ -633,16 +684,15 @@ def main() -> None:
         f"mean_final_distance={baseline['mean_final_distance']:.2f}"
     )
 
-    if rest_deltas:
-        avg_before = float(np.mean([b for _, b, _ in rest_deltas]))
-        avg_after = float(np.mean([a for _, _, a in rest_deltas]))
-        print("\n  Consolidation checkpoints:")
-        for episode, before_success, after_success in rest_deltas:
+    if checkpoint_history:
+        print("\n  Deterministic checkpoint history:")
+        for checkpoint in checkpoint_history:
             print(
-                f"    after ep {episode:3d}: "
-                f"success {before_success:.1%} -> {after_success:.1%}"
+                f"    ep {int(checkpoint['episode']):3d}: "
+                f"success={checkpoint['success_rate']:.1%}  "
+                f"mean_steps={checkpoint['mean_steps']:.2f}  "
+                f"margin={checkpoint['mean_action_margin']:.3f}"
             )
-        print(f"    average success: {avg_before:.1%} -> {avg_after:.1%}")
 
     print("\n" + "-" * 68)
     print("  Final brain state")

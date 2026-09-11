@@ -17,6 +17,15 @@ def active_region():
 
 
 class TestTraceCapture:
+    def test_disabled_memory_is_a_no_op(self, active_region):
+        ms = MemorySystem(trace_threshold=0.15, consolidation_interval=1)
+        ms.enabled = False
+
+        assert ms.capture_trace(active_region, 1.0) is None
+        assert ms.consolidate({"mem": active_region}, 2.0) == 0
+        assert ms.pattern_completion(active_region, torch.tensor([0, 1])) == 0
+        assert ms.traces == []
+
     def test_capture_creates_trace(self, active_region):
         ms = MemorySystem(trace_threshold=0.15)
         trace = ms.capture_trace(active_region, current_time=100.0)
@@ -38,6 +47,52 @@ class TestTraceCapture:
         for i in range(5):
             ms.capture_trace(active_region, float(i))
         assert len(ms.traces) <= 3
+
+    def test_consolidated_memory_admits_and_completes_new_pattern(self, active_region):
+        ms = MemorySystem(trace_capacity=3, consolidation_interval=1)
+        previous = []
+        for time, pattern in enumerate(([0, 1, 2], [3, 4, 5], [6, 7, 8])):
+            active_region.activity.zero_()
+            active_region.activity[pattern] = 0.3
+            previous.append(ms.capture_trace(active_region, float(time)))
+        ms.consolidate({"mem": active_region}, 3.0)
+        assert all(trace.strength > 1.0 for trace in ms.traces)
+
+        active_region.activity.zero_()
+        active_region.activity[[7, 8, 9]] = 0.3
+        newest = ms.capture_trace(active_region, 4.0)
+
+        assert len(ms.traces) == 3
+        assert all(trace is not previous[0] for trace in ms.traces)
+        assert any(trace is newest for trace in ms.traces)
+        active_region.current.zero_()
+        assert ms.pattern_completion(active_region, torch.tensor([7, 9])) == 1
+        assert active_region.current[8] == 2.0
+        assert ms.consolidate({"mem": active_region}, 5.0) == 3
+        assert newest.replay_count == 1
+
+    def test_repeated_pattern_keeps_replay_history_without_duplicates(self, active_region):
+        ms = MemorySystem(trace_capacity=3, consolidation_interval=1)
+        original = ms.capture_trace(active_region, 1.0)
+        ms.consolidate({"mem": active_region}, 2.0)
+
+        other = Region("other", RegionType.MEMORY, max_neurons=10)
+        other.populate(5, connectivity=0.0)
+        other.activity[:3] = 0.3
+        ms.capture_trace(other, 3.0)
+        active_region.activity[:5] = 0.5
+        for time in range(4, 10):
+            assert ms.capture_trace(active_region, float(time)) is original
+
+        assert len(ms.traces) == 2
+        assert original.replay_count == 1
+        assert original.strength == pytest.approx(1.1)
+        assert torch.all(original.activity_snapshot == 0.5)
+
+    def test_zero_capacity_does_not_return_an_unstored_trace(self, active_region):
+        ms = MemorySystem(trace_capacity=0)
+        assert ms.capture_trace(active_region, 1.0) is None
+        assert ms.traces == []
 
     def test_empty_region_no_trace(self):
         r = Region("empty", RegionType.MEMORY, max_neurons=10)

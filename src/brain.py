@@ -45,6 +45,7 @@ class Projection:
     def __init__(self, source_name: str, target_name: str):
         self.source_name = source_name
         self.target_name = target_name
+        self.plasticity_enabled = True
         self.n_synapses: int = 0
         self._syn_capacity: int = 0
         self._alloc(256)
@@ -112,7 +113,7 @@ class Brain:
         self.growth = GrowthController()
         self.memory = MemorySystem()
         self.encoder = StimulusEncoder(strategy=EncodingStrategy.RATE)
-        self.oscillators = OscillatorBank()
+        self.oscillators = OscillatorBank(seed=self._derived_seed(103))
         self.metaplasticity_enabled = True
 
         self.stats_history: list[BrainStats] = []
@@ -146,6 +147,8 @@ class Brain:
         max_neurons: int = 1000,
         seed: int | None = None,
     ) -> Region:
+        if name in self.regions:
+            raise ValueError(f"Region {name!r} already exists")
         region = Region(name, region_type, max_neurons, dt=self.dt)
         self._region_seed_counter += 1
         self._seed_generator(
@@ -179,7 +182,10 @@ class Brain:
         tgt_n = tgt.n_neurons
 
         # Only excitatory neurons project long-range
-        exc_mask = src.neuron_type[:src_n] == NeuronType.EXCITATORY.value
+        exc_mask = (
+            (src.neuron_type[:src_n] == NeuronType.EXCITATORY.value)
+            & src.neuron_alive[:src_n]
+        )
         exc_idx = torch.where(exc_mask)[0]
 
         if len(exc_idx) == 0 or tgt_n == 0:
@@ -317,11 +323,51 @@ class Brain:
         self.growth.growth_interval = DISABLED_GROWTH_INTERVAL
         self.metaplasticity_enabled = False
 
+    def freeze_homeostatic_scaling(self) -> None:
+        """Keep adaptive theta active while freezing synaptic scaling."""
+        self.homeostasis.scaling_enabled = False
+
+    def enable_homeostatic_scaling(self) -> None:
+        self.homeostasis.scaling_enabled = True
+
+    def freeze_adaptive_thresholds(self) -> None:
+        self.homeostasis.theta_enabled = False
+
+    def enable_adaptive_thresholds(self) -> None:
+        self.homeostasis.theta_enabled = True
+
+    def disable_memory(self) -> None:
+        self.memory.enabled = False
+
+    def enable_memory(self) -> None:
+        self.memory.enabled = True
+
+    def disable_oscillations(self) -> None:
+        self.oscillators.enabled = False
+
+    def enable_oscillations(self) -> None:
+        self.oscillators.enabled = True
+
+    def disable_reward_modulated_plasticity(self) -> None:
+        self.reward_stdp.enabled = False
+        self.reset_traces()
+
+    def enable_reward_modulated_plasticity(self) -> None:
+        self.reward_stdp.enabled = True
+
     def freeze_plasticity(self) -> None:
+        """Freeze STDP/R-STDP until a pathway is explicitly re-enabled.
+
+        Pending eligibility and dopamine are discarded. Homeostatic scaling,
+        neuronal thresholds and structural growth have independent controls.
+        """
         for region in self.regions.values():
+            region.plasticity_enabled = False
             self._set_plasticity(region, 0.0, 0.0)
         for proj in self.projections:
+            proj.plasticity_enabled = False
             self._set_plasticity(proj, 0.0, 0.0)
+        self.reset_traces()
 
     def enable_projection_plasticity(
         self,
@@ -331,6 +377,9 @@ class Brain:
         A_minus: float = 0.012,
     ) -> Projection:
         proj = self.get_projection(source, target)
+        proj.plasticity_enabled = True
+        proj.syn_eligibility[:proj.n_synapses] = 0.0
+        self.reward_stdp.dopamine.pop(self.projection_target(source, target), None)
         self._set_plasticity(proj, A_plus, A_minus)
         return proj
 
@@ -397,6 +446,10 @@ class Brain:
         #    eligibility trace then waits for dopamine targeted at this region.
         for name, region in self.regions.items():
             ns = region.n_synapses
+            if not region.plasticity_enabled:
+                region.syn_eligibility[:ns] = 0.0
+                self.reward_stdp.dopamine.pop(self.region_target(name), None)
+                continue
             if ns == 0:
                 continue
             n = region.n_neurons
@@ -416,11 +469,18 @@ class Brain:
                 max_weight=region.syn_max_weight[:ns],
                 eligibility=region.syn_eligibility[:ns],
                 current_time=self.time,
+                dt=self.dt,
             )
 
         # 6. Event-driven R-STDP on inter-region projections.
         for proj in self.projections:
             ns = proj.n_synapses
+            if not proj.plasticity_enabled:
+                proj.syn_eligibility[:ns] = 0.0
+                self.reward_stdp.dopamine.pop(
+                    self.projection_target(proj.source_name, proj.target_name), None,
+                )
+                continue
             if ns == 0:
                 continue
             source = self.regions[proj.source_name]
@@ -441,6 +501,7 @@ class Brain:
                 max_weight=proj.syn_max_weight[:ns],
                 eligibility=proj.syn_eligibility[:ns],
                 current_time=self.time,
+                dt=self.dt,
             )
 
         # 7. Homeostatic plasticity
@@ -451,7 +512,11 @@ class Brain:
             self.metaplasticity.update_thresholds(list(self.regions.values()), self.time)
 
         # 9. Growth / pruning
-        self.growth.step(list(self.regions.values()))
+        self.growth.step(
+            list(self.regions.values()),
+            projections=self.projections,
+            memory=self.memory,
+        )
 
         # 10. Memory consolidation
         self.memory.consolidate(self.regions, self.time)

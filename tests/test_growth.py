@@ -3,7 +3,9 @@
 import torch
 import pytest
 
+from src.brain import Brain
 from src.growth import GrowthController, GrowthStats
+from src.memory import MemoryTrace
 from src.region import Region, RegionType
 from src.synapse import NeurotransmitterType
 
@@ -77,6 +79,47 @@ class TestApoptosis:
         gc.step([r])
         assert r.syn_alive[0].item() is False
 
+    def test_apoptosis_cleans_projections_and_memory(self):
+        brain = Brain(seed=42)
+        source = brain.add_region(
+            "source", RegionType.SENSORY,
+            n_neurons=0, connectivity=0.0, max_neurons=4,
+        )
+        for _ in range(4):
+            source.add_neuron()
+        brain.add_region(
+            "target", RegionType.MOTOR,
+            n_neurons=2, connectivity=0.0, max_neurons=2,
+        )
+        brain.connect_regions("source", "target", density=1.0)
+        brain.memory.traces = [
+            MemoryTrace(
+                neuron_indices=torch.arange(4),
+                activity_snapshot=torch.ones(4),
+                region_name="source",
+            )
+        ]
+        source.neuron_age[0] = 20_000
+        source.activity[0] = 0.0
+        source.total_spikes[0] = 0
+
+        gc = GrowthController(
+            growth_interval=1,
+            apoptosis_age=10_000,
+            apoptosis_threshold=0.001,
+            neurogenesis_threshold=10.0,
+        )
+        gc.step(
+            list(brain.regions.values()),
+            projections=brain.projections,
+            memory=brain.memory,
+        )
+
+        proj = brain.get_projection("source", "target")
+        from_dead = proj.syn_pre[:proj.n_synapses] == 0
+        assert not torch.any(proj.syn_alive[:proj.n_synapses][from_dead])
+        assert brain.memory.traces[0].neuron_indices.tolist() == [1, 2, 3]
+
 
 class TestSynaptogenesis:
     def test_coactive_neurons_get_connected(self):
@@ -128,6 +171,29 @@ class TestNeurogenesis:
         gc = GrowthController(growth_interval=1, neurogenesis_threshold=0.3)
         gc.step([r])
         assert r.n_neurons == 5
+
+    def test_neurogenesis_replaces_apoptotic_slot_at_capacity(self):
+        r = Region("test", RegionType.SENSORY, max_neurons=5)
+        r.populate(5, connectivity=0.0)
+        r.activity[:5] = 0.5
+        r.activity[0] = 0.0
+        r.neuron_age[0] = 20_000
+        r.total_spikes[0] = 0
+
+        gc = GrowthController(
+            growth_interval=1,
+            apoptosis_age=10_000,
+            apoptosis_threshold=0.001,
+            neurogenesis_threshold=0.3,
+            max_new_neurons_per_cycle=1,
+        )
+        gc._rng.manual_seed(42)
+        stats = gc.step([r])
+
+        assert stats.neurons_died == 1
+        assert stats.neurons_born == 1
+        assert r.n_neurons == 5
+        assert r.n_alive_neurons == 5
 
 
 class TestGrowthInterval:

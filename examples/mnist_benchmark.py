@@ -5,7 +5,7 @@ Full Step 3 benchmark following the Diehl & Cook 2015 architecture:
 
 - true MNIST loaded from OpenML, all 10 digit classes
 - 784 input neurons (one per pixel, rate coded)
-- 1600 excitatory + 1600 inhibitory cortex neurons with WTA microcircuit
+- 400 excitatory + 400 inhibitory cortex neurons with WTA microcircuit
 - unsupervised STDP on input->cortex feedforward synapses
 - adaptive excitability thresholds + per-neuron weight normalization
 - L1 intensity equalization for balanced cross-class drive
@@ -16,6 +16,7 @@ Target: 85-90% accuracy (Diehl & Cook 2015 achieved 95% with 6400 exc neurons).
 
 from __future__ import annotations
 
+import copy
 import sys
 import time
 from pathlib import Path
@@ -44,7 +45,7 @@ from src.synapse import NeurotransmitterType
 # --- Dataset scope ----------------------------------------------------------
 
 CLASSES = (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)
-TRAIN_PER_CLASS = 6000
+TRAIN_PER_CLASS = 5000
 READOUT_PER_CLASS = 500
 TEST_PER_CLASS = 50
 DOWNSAMPLE = 1
@@ -58,7 +59,7 @@ N_CORTEX_EXC = 400
 N_CORTEX_INH = 400
 CORTEX_CONNECTIVITY = 0.0
 EXC_TO_INH_WEIGHT = 8.0
-INH_LATERAL_WEIGHT = 12.0
+INH_LATERAL_WEIGHT = 10.0
 INPUT_TO_CORTEX_DENSITY = 0.15
 INPUT_WEIGHT_BOOST = 4.0
 
@@ -137,11 +138,13 @@ def build_brain(seed: int = SEED) -> Brain:
     proj.syn_A_minus[:ns][~exc_post] = 0.0
 
     # Disable unrelated mechanisms so the prototype isolates STDP + readout.
-    brain.reward_stdp.apply_target = lambda *args, **kwargs: 0
+    brain.disable_reward_modulated_plasticity()
     brain.reset_traces()
     brain.freeze_structural_plasticity()
-    brain.memory.capture_trace = lambda *args, **kwargs: None
-    brain.memory.consolidate = lambda *args, **kwargs: 0
+    # Keep the WTA microcircuit fixed; adaptive theta remains active.
+    brain.freeze_homeostatic_scaling()
+    brain.disable_memory()
+    brain.disable_oscillations()
 
     # Keep benchmark-level theta settings explicit so sweeps can override them.
     brain.homeostasis.theta_plus = THETA_PLUS
@@ -200,7 +203,7 @@ def excitatory_cortex_indices(brain: Brain) -> torch.Tensor:
 
 # --- Dataset helpers --------------------------------------------------------
 
-def downsample_images(X: np.ndarray, factor: int = DOWNSAMPLE) -> np.ndarray:
+def _pooled_unit_images(X: np.ndarray, factor: int) -> np.ndarray:
     n = X.shape[0]
     side = int(np.sqrt(X.shape[1]))
     imgs = X.reshape(n, side, side)
@@ -208,11 +211,25 @@ def downsample_images(X: np.ndarray, factor: int = DOWNSAMPLE) -> np.ndarray:
     pooled = imgs.reshape(n, new_side, factor, new_side, factor).mean(axis=(2, 4))
     flat = pooled.reshape(n, new_side * new_side)
     max_per_image = np.maximum(flat.max(axis=1, keepdims=True), 1e-6)
-    flat = flat / max_per_image
+    return flat / max_per_image
+
+
+def l1_equalization_target(X: np.ndarray, factor: int = DOWNSAMPLE) -> float:
+    flat = _pooled_unit_images(X, factor)
+    return float(np.median(flat.sum(axis=1)))
+
+
+def downsample_images(
+    X: np.ndarray,
+    factor: int = DOWNSAMPLE,
+    target_l1: float | None = None,
+) -> np.ndarray:
+    flat = _pooled_unit_images(X, factor)
     # Equalize total stimulus across images so sparse digits (e.g. "1")
     # get proportionally stronger drive than dense ones (e.g. "0").
     l1 = flat.sum(axis=1, keepdims=True)
-    target_l1 = np.median(l1)
+    if target_l1 is None:
+        target_l1 = float(np.median(l1))
     return np.clip(flat * (target_l1 / np.maximum(l1, 1e-6)), 0.0, 1.0)
 
 
@@ -237,23 +254,36 @@ def load_reduced_mnist(
     X = mnist.data.astype(np.float64) / 255.0
     y = mnist.target.astype(np.int64)
 
-    X = downsample_images(X)
     rng = np.random.default_rng(seed)
 
     train_idx = []
     test_idx = []
+    canonical_train = np.arange(0, 60_000, dtype=np.int64)
+    canonical_test = np.arange(60_000, len(y), dtype=np.int64)
     for cls in classes:
-        idx = np.flatnonzero(y == cls)
-        rng.shuffle(idx)
-        train_idx.extend(idx[:train_per_class])
-        test_idx.extend(idx[train_per_class:train_per_class + test_per_class])
+        cls_train = canonical_train[y[canonical_train] == cls]
+        cls_test = canonical_test[y[canonical_test] == cls]
+        rng.shuffle(cls_train)
+        rng.shuffle(cls_test)
+        if len(cls_train) < train_per_class or len(cls_test) < test_per_class:
+            raise ValueError(
+                f"Class {cls} has only {len(cls_train)} canonical train and "
+                f"{len(cls_test)} canonical test samples"
+            )
+        train_idx.extend(cls_train[:train_per_class])
+        test_idx.extend(cls_test[:test_per_class])
 
     train_idx = np.asarray(train_idx, dtype=np.int64)
     test_idx = np.asarray(test_idx, dtype=np.int64)
     rng.shuffle(train_idx)
     rng.shuffle(test_idx)
 
-    return X[train_idx], y[train_idx], X[test_idx], y[test_idx]
+    X_train_raw = X[train_idx]
+    X_test_raw = X[test_idx]
+    target_l1 = l1_equalization_target(X_train_raw)
+    X_train = downsample_images(X_train_raw, target_l1=target_l1)
+    X_test = downsample_images(X_test_raw, target_l1=target_l1)
+    return X_train, y[train_idx], X_test, y[test_idx]
 
 
 def _balanced_subset(
@@ -276,7 +306,9 @@ def _balanced_subset(
 
 # --- Simulation helpers -----------------------------------------------------
 
-def reset_brain_state(brain: Brain, rest_steps: int = REST_STEPS) -> None:
+def reset_brain_state(brain: Brain, rest_steps: int | None = None) -> None:
+    if rest_steps is None:
+        rest_steps = REST_STEPS
     quiet_steps(brain, rest_steps)
     for region in brain.regions.values():
         n = region.n_neurons
@@ -454,6 +486,19 @@ def predict_sample(
     return int(classes[int(np.argmax(scores))]), scores
 
 
+def _inference_brain(brain: Brain) -> Brain:
+    """Snapshot a fixed network for readout fitting and held-out evaluation."""
+    snapshot = copy.deepcopy(brain)
+    snapshot.freeze_structural_plasticity()
+    snapshot.freeze_plasticity()
+    snapshot.freeze_homeostatic_scaling()
+    snapshot.freeze_adaptive_thresholds()
+    snapshot.disable_reward_modulated_plasticity()
+    snapshot.disable_memory()
+    snapshot.encoder.noise_level = 0.0
+    return snapshot
+
+
 def evaluate(
     brain: Brain,
     X: np.ndarray,
@@ -463,9 +508,12 @@ def evaluate(
     classes: tuple[int, ...] | None = None,
 ) -> tuple[float, np.ndarray]:
     classes = CLASSES if classes is None else classes
+    eval_brain = _inference_brain(brain)
     preds = np.full(len(X), -1, dtype=np.int64)
     for i, x in enumerate(X):
-        preds[i], _ = predict_sample(brain, x, spike_templates, voltage_templates, classes)
+        preds[i], _ = predict_sample(
+            eval_brain, x, spike_templates, voltage_templates, classes,
+        )
     return float(np.mean(preds == y)), preds
 
 
@@ -531,8 +579,13 @@ def build_readout(
     classes: tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     classes = CLASSES if classes is None else classes
-    exc_idx, neuron_labels = assign_neuron_labels(brain, X_readout, y_readout, classes)
-    spike_templates, voltage_templates = build_response_templates(brain, X_readout, y_readout, classes)
+    readout_brain = _inference_brain(brain)
+    exc_idx, neuron_labels = assign_neuron_labels(
+        readout_brain, X_readout, y_readout, classes,
+    )
+    spike_templates, voltage_templates = build_response_templates(
+        readout_brain, X_readout, y_readout, classes,
+    )
     return exc_idx, neuron_labels, spike_templates, voltage_templates
 
 

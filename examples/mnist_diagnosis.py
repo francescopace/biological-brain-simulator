@@ -49,7 +49,7 @@ class ProtocolConfig:
     stdp_scale: float = 0.2
     stdp_a_plus: float = 0.01
     stdp_a_minus: float = 0.0105
-    inh_lateral_weight: float = 12.0
+    inh_lateral_weight: float = 10.0
     exc_to_inh_weight: float = 8.0
     theta_plus: float = 0.10
     theta_leak: float = 0.005
@@ -278,7 +278,7 @@ def run_competition_sweep() -> dict[str, object]:
     print("COMPETITION SWEEP")
     print("=" * 72)
     results = []
-    for inh_weight in (6.0, 8.0, 10.0, 12.0):
+    for inh_weight in (6.0, 8.0, 10.0):
         config = replace(FAST_BASE, inh_lateral_weight=inh_weight)
         label = f"inh_lateral={inh_weight:.1f}"
         print(f"\n-- {label} --")

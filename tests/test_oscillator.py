@@ -47,6 +47,24 @@ class TestOscillator:
 
 
 class TestOscillatorBank:
+    def test_disabled_bank_does_not_advance_or_inject_current(self):
+        bank = OscillatorBank(seed=42)
+        bank.add_region("visual", RegionType.SENSORY)
+        phase = bank.oscillators["visual"][0].phase
+        bank.enabled = False
+
+        assert bank.step(1.0) == {}
+        assert bank.oscillators["visual"][0].phase == phase
+
+    def test_seed_reproduces_initial_phases(self):
+        first = OscillatorBank(seed=42)
+        second = OscillatorBank(seed=42)
+        first.add_region("memory", RegionType.MEMORY)
+        second.add_region("memory", RegionType.MEMORY)
+        assert [o.phase for o in first.oscillators["memory"]] == [
+            o.phase for o in second.oscillators["memory"]
+        ]
+
     def test_add_region_creates_oscillators(self):
         bank = OscillatorBank()
         bank.add_region("visual", RegionType.SENSORY)

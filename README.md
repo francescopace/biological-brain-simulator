@@ -1,10 +1,9 @@
 # Biological Brain Simulator
 
-An open-source, research-oriented simulator for studying biologically inspired learning in spiking neural systems. 
+An open-source, research-oriented simulator for studying biologically inspired learning in spiking neural systems.
 The project combines spiking neurons, synaptic plasticity, structural growth, memory / replay, oscillations, and full-state persistence in a single experimental framework.
 
-The goal is not to claim a faithful whole-brain model. 
-The goal is to provide a practical sandbox for testing whether local learning rules and biologically motivated dynamics can support non-trivial behavior on controlled AI tasks.
+The simulator is an experimental sandbox for testing whether local learning rules and biologically motivated dynamics can support nontrivial behavior on controlled AI tasks. It does not claim to model a whole brain faithfully.
 
 ## Modeling scope
 
@@ -25,6 +24,8 @@ The goal is to provide a practical sandbox for testing whether local learning ru
 | **Morphology** | Multi-compartment neurons (dendrites/soma/axon) with distance-based synaptic attenuation |
 | **Persistence** | Full save/restore of the entire brain state to disk |
 
+Morphology templates assign synapses to dendritic compartments and apply a static attenuation factor based on distance from the soma. Compartments do not maintain independent voltage states; Izhikevich membrane dynamics are integrated at the soma.
+
 ## Research positioning
 
 | Mainstream ML pipeline | This simulator |
@@ -37,13 +38,13 @@ The goal is to provide a practical sandbox for testing whether local learning ru
 
 ## Status
 
-This project is best understood as an experimental research codebase rather than a polished general-purpose framework. The current implementation is useful for exploring biologically inspired learning mechanisms, running controlled benchmarks, and testing architectural ideas, but the benchmark scripts remain the canonical reference for exact experimental settings.
+This is an experimental research codebase, not a polished general-purpose framework. It supports controlled benchmarks and experiments with biologically inspired learning mechanisms. The benchmark scripts are the canonical reference for exact experimental settings.
 
-The strongest current evidence in the repo is: supervised R-STDP on Iris, reward-modulated control on grid navigation, and unsupervised STDP on a scaled MNIST setup. The main research gap is not whether the simulator can learn at all, but how far these mechanisms can be pushed while remaining stable, interpretable, and biologically motivated.
+The repository contains supervised R-STDP, reward-modulated navigation, and unsupervised MNIST protocols. Historical results are documented, but the benchmarks must be rerun after the protocol and dynamics corrections described in `BENCHMARKS.md` before they are treated as current validated evidence.
 
 ## Quickstart
 
-**Requirements:** Python >= 3.10, plus PyTorch, matplotlib, networkx, scikit-learn (all pinned in `requirements.txt`).
+**Requirements:** Python >= 3.10, plus PyTorch, matplotlib, networkx, and scikit-learn as listed in `requirements.txt`.
 
 ```bash
 pip install -r requirements.txt
@@ -53,7 +54,7 @@ python examples/association_demo.py
 python examples/growth_demo.py
 python examples/iris_benchmark.py      # classification benchmark
 python examples/grid_nav_benchmark.py  # grid navigation benchmark
-python examples/mnist_benchmark.py     # MNIST benchmark (10-class, 784+1600+1600)
+python examples/mnist_benchmark.py     # MNIST benchmark (10-class, 784+400+400)
 python examples/mnist_diagnosis.py     # short MNIST diagnosis sweeps
 ```
 
@@ -134,12 +135,15 @@ for step in range(5000):
 
 ### Convenience helpers
 
-The core simulator exposes a few helpers that are useful when building benchmarks or structured training loops:
+The core simulator provides helpers for benchmarks and structured training loops:
 
 - `brain.reset_traces()` clears all synaptic eligibility traces and per-target dopamine
 - `brain.freeze_structural_plasticity()` disables growth and metaplasticity for stable experiments
-- `brain.freeze_plasticity()` disables STDP everywhere
+- `brain.freeze_homeostatic_scaling()` freezes synaptic scaling while leaving adaptive thresholds active
+- `brain.freeze_adaptive_thresholds()` freezes adaptive thresholds independently
+- `brain.freeze_plasticity()` freezes STDP/R-STDP on existing regions and projections, clears pending eligibility/dopamine, and keeps metaplasticity from re-enabling them; synaptic scaling and growth have separate controls
 - `brain.enable_projection_plasticity("input", "output")` re-enables STDP on one projection
+- `brain.disable_memory()`, `brain.disable_oscillations()`, and `brain.disable_reward_modulated_plasticity()` isolate experimental subsystems without monkey-patching methods
 - `brain.get_projection("input", "output")` fetches an inter-region projection safely
 - `brain.regions["output"].add_lateral_inhibition(weight=5.0)` creates all-to-all lateral inhibition
 
@@ -152,33 +156,45 @@ brain.freeze_structural_plasticity()
 brain.regions["output"].add_lateral_inhibition(weight=5.0)
 ```
 
-## Experimental Results
+To reinforce only one output, restrict credit for the entire dopamine pulse:
 
-The repository currently includes three validated reference benchmarks:
+```python
+target = Brain.projection_target("input", "output")
+with brain.reward_stdp.restrict_to_posts(target, [chosen_output]):
+    brain.reward(0.1, target)
+    for _ in range(10):
+        brain.step()
+```
 
-| Benchmark | Script | Main question | Latest validated result |
+The restriction applies to both existing eligibility and new spikes. Dopamine for that target is cleared on entry and exit; overlapping restrictions on the same target are rejected. Save checkpoints after leaving the context. Saves preserve plasticity flags and restore the previous checkpoint if a handled error or interruption prevents replacement. They do not guarantee atomic replacement across process crashes or power loss.
+
+## Experimental results
+
+The repository includes three reference benchmark protocols. Results from the corrected protocols are pending revalidation:
+
+| Benchmark | Script | Main question | Current status |
 |---|---|---|---|
-| Iris classification | `examples/iris_benchmark.py` | Can reward-modulated local plasticity solve a standard supervised classification task? | **86.7%** test accuracy, **90.0%** best checkpoint |
-| Grid navigation | `examples/grid_nav_benchmark.py` | Can the simulator learn a usable control policy with reward-modulated spiking dynamics? | **100.0%** success, **4.38** mean steps-to-goal |
-| MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | **66.0%** test accuracy (400 exc, full MNIST 6000/class, 200ms, 15M timesteps) after promoting `INH_LATERAL_WEIGHT=12.0`. Ongoing diagnosis suggests competition was a real bottleneck, but the next remaining gap is now in plasticity / feature learning — see BENCHMARKS.md |
+| Iris classification | `examples/iris_benchmark.py` | Can reward-modulated local plasticity solve a standard supervised classification task? | Held-out selection and separate spike/fallback metrics; revalidation pending |
+| Grid navigation | `examples/grid_nav_benchmark.py` | Can the simulator learn a usable control policy with reward-modulated spiking dynamics? | Minimal teacher-free one-hot state/action baseline with deterministic checkpoints; revalidation pending |
+| MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | Canonical MNIST split, train-only preprocessing, fixed WTA and adaptive theta; revalidation pending |
 
 `BENCHMARKS.md` contains the detailed benchmark notes, including research setup, caveats, runtime observations, and interpretation. Use the benchmark scripts themselves as the source of truth for exact hyperparameters.
 
-## Computational Performance
+## Computational performance
 
 The simulator is implemented as a vectorized research codebase rather than a neuron-by-neuron object model. All neuron and synapse state lives in dense PyTorch tensors (structure-of-arrays layout), so a single `Region.step()` call can advance thousands of neurons in parallel.
 
 Key techniques:
 
-- **PyTorch tensors** on CPU — extensive profiling showed CPU outperforms MPS (Apple GPU) at all tested scales (up to 3200 neurons / 2.9M synapses). GPU kernel launch overhead dominates small conditional ops; `torch.compile` fails due to dynamic shapes; masked full-tensor approaches waste compute on the ~95-99% of inactive synapses. See [BENCHMARKS.md](BENCHMARKS.md) for details. Override with `BRAIN_DEVICE=mps` for very large dense networks where GPU occupancy may eventually win.
+- **PyTorch tensors** on CPU: profiling through 3200 neurons and 2.9M synapses showed CPU outperforming MPS. GPU kernel launch overhead dominates the tested conditional operations, `torch.compile` falls back because of dynamic shapes, and masked full-tensor approaches process the roughly 95-99% of inactive synapses. See [BENCHMARKS.md](BENCHMARKS.md) for measurements. Use `BRAIN_DEVICE=mps` to profile other network sizes or densities.
 - **Vectorized Izhikevich integration** with configurable sub-stepping (`dt / 0.5`)
-- **Ring buffer** for spike delays — `index_add_` deposits postsynaptic currents into future slots; each timestep reads and clears the current slot
-- **Event-driven STDP** — nearest-neighbor pairing updates only synapses whose pre or post neuron fired this step, not the entire weight matrix every timestep. Sync-free implementation avoids GPU stalls.
-- **Sparse scatter/gather propagation** — synapses are stored as COO-style parallel arrays; spike delivery filters on `fired[syn_pre]` so only active synapses are touched (O(active) not O(all)). This is the key SNN advantage: with 1-5% neuron activity per step, scatter/gather touches ~30-150k elements vs 2.9M for any dense approach.
-- **Vectorized stimulus encoding** — rate/temporal/population coding computed in a single tensor operation instead of per-neuron Python loops
-- **Vectorized synaptogenesis** — co-activity scoring via `torch.outer` instead of nested Python loops
+- **Ring buffer** for spike delays: `index_add_` deposits postsynaptic currents into future slots; each timestep reads and clears the current slot
+- **Event-driven STDP**: nearest-neighbor pairing updates only synapses whose pre or post neuron fired this step, rather than the entire weight matrix. The implementation avoids synchronization on each timestep.
+- **Sparse scatter/gather propagation**: synapses are stored as COO-style parallel arrays, and spike delivery filters on `fired[syn_pre]`. At 1-5% neuron activity per step, the tested network touches roughly 30-150k active elements instead of all 2.9M synapses.
+- **Vectorized stimulus encoding**: rate, temporal, and population coding run in a single tensor operation instead of per-neuron Python loops
+- **Vectorized synaptogenesis**: co-activity scoring uses `torch.outer` instead of nested Python loops
 - **Pre-allocated neuron arrays** up to `max_neurons`; synapse arrays grow via capacity-doubling when needed
-- **Dead flags** (`syn_alive`, `neuron_alive`) for pruning and apoptosis — no costly array compaction
+- **Dead flags** (`syn_alive`, `neuron_alive`) for pruning and apoptosis without array compaction
 
 Run-specific timing numbers live in [BENCHMARKS.md](BENCHMARKS.md) alongside the corresponding benchmark results.
 

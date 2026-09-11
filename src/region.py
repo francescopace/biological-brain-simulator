@@ -94,6 +94,7 @@ class Region:
         self.region_type = region_type
         self.max_neurons = max_neurons
         self.dt = dt
+        self.plasticity_enabled = True
         self._rng = torch.Generator(device=DEVICE)
 
         N = max_neurons
@@ -230,18 +231,48 @@ class Region:
         ntype: NeuronType = NeuronType.EXCITATORY,
         pattern: FiringPattern = FiringPattern.REGULAR_SPIKING,
     ) -> int:
-        """Add a single neuron. Returns its index, or -1 if at capacity."""
-        if self.n_neurons >= self.max_neurons:
-            return -1
+        """Add a neuron, reusing an apoptotic slot when necessary."""
         a, b, c, d = PATTERN_PARAMS[pattern]
-        self._add_neurons_bulk(
-            torch.tensor([int(ntype.value)], dtype=torch.int8, device=DEVICE),
-            torch.tensor([a], dtype=torch.float32, device=DEVICE),
-            torch.tensor([b], dtype=torch.float32, device=DEVICE),
-            torch.tensor([c], dtype=torch.float32, device=DEVICE),
-            torch.tensor([d], dtype=torch.float32, device=DEVICE),
-        )
-        return self.n_neurons - 1
+        dead = torch.where(~self.neuron_alive[:self.n_neurons])[0]
+        if dead.numel() > 0:
+            idx = int(dead[0].item())
+            self.v[idx] = -65.0
+            self.u[idx] = b * -65.0
+            self.a[idx] = a
+            self.b[idx] = b
+            self.c[idx] = c
+            self.d[idx] = d
+            self.neuron_type[idx] = int(ntype.value)
+            self.neuron_alive[idx] = True
+            self.activity[idx] = 0.0
+            self.neuron_age[idx] = 0
+            self.total_spikes[idx] = 0
+            self.last_spike_time[idx] = -float("inf")
+            self.current[idx] = 0.0
+            self.fired[idx] = False
+            self.theta[idx] = 0.0
+            self.spike_buffer[:, idx] = 0.0
+        else:
+            if self.n_neurons >= self.max_neurons:
+                return -1
+            self._add_neurons_bulk(
+                torch.tensor([int(ntype.value)], dtype=torch.int8, device=DEVICE),
+                torch.tensor([a], dtype=torch.float32, device=DEVICE),
+                torch.tensor([b], dtype=torch.float32, device=DEVICE),
+                torch.tensor([c], dtype=torch.float32, device=DEVICE),
+                torch.tensor([d], dtype=torch.float32, device=DEVICE),
+            )
+            idx = self.n_neurons - 1
+
+        if self.morphology_manager is not None:
+            morph_mod = _get_morphology_module()
+            template = (
+                morph_mod.MorphologyTemplate.PYRAMIDAL
+                if ntype == NeuronType.EXCITATORY
+                else morph_mod.MorphologyTemplate.INTERNEURON
+            )
+            self.morphology_manager.assign_morphology(idx, template)
+        return idx
 
     def _create_random_connections(self, connectivity: float) -> None:
         """Create random synaptic connections within the region."""
@@ -309,6 +340,10 @@ class Region:
 
         self.syn_pre[s:e] = pre_idx.to(torch.int32)
         self.syn_post[s:e] = post_idx.to(torch.int32)
+        min_weights = torch.where(inh, -10.0, 0.0)
+        max_weights = torch.where(inh, 0.0, 10.0)
+        w = torch.clamp(w, min_weights, max_weights)
+
         self.syn_weight[s:e] = w
         self.syn_delay[s:e] = delay_steps
         self.syn_modulation[s:e] = mods
@@ -318,15 +353,18 @@ class Region:
         self.syn_recent[s:e] = 0.0
         self.syn_total_tx[s:e] = 0
         self.syn_alive[s:e] = True
-        self.syn_max_weight[s:e] = torch.where(inh, 0.0, 10.0)
-        self.syn_min_weight[s:e] = torch.where(inh, -10.0, 0.0)
-        self.syn_A_plus[s:e] = 0.01
-        self.syn_A_minus[s:e] = 0.012
+        self.syn_max_weight[s:e] = max_weights
+        self.syn_min_weight[s:e] = min_weights
+        self.syn_A_plus[s:e] = 0.01 if self.plasticity_enabled else 0.0
+        self.syn_A_minus[s:e] = 0.012 if self.plasticity_enabled else 0.0
 
         # Compute morphological attenuation for new synapses
         if self.morphology_manager is not None:
-            # morphology_manager needs to be updated to support torch
-            pass
+            self.syn_attenuation[s:e] = self.morphology_manager.compute_synapse_attenuation(
+                count,
+                self.syn_post[s:e],
+                self._rng,
+            )
 
         self.n_synapses = e
 

@@ -20,7 +20,8 @@ Training (supervised R-STDP with delayed teacher):
     2. After TEACHER_DELAY (13 ms), inject teacher current into
        motor[y]. Input fires first (causal) → STDP builds positive
        eligibility on input→motor[y].
-    3. Zero eligibility on synapses to motor[j≠y] (selective credit).
+    3. Restrict eligibility and new STDP events to motor[y] for the
+       entire reward pulse (selective credit).
     4. Reward → dopamine × eligibility consolidates input→motor[y].
     5. Reset between samples.
 
@@ -31,6 +32,7 @@ Compared against a sklearn LogisticRegression baseline.
 import copy
 import sys
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -171,16 +173,23 @@ def build_brain(seed: int = SEED) -> Brain:
     # Stable substrate for this benchmark — disable structural growth so we
     # isolate R-STDP learning. (Re-enable in a follow-up to test if growth helps.)
     brain.freeze_structural_plasticity()
+    brain.freeze_homeostatic_scaling()
 
     return brain
 
 
 # ── Stimulus / readout helpers ──────────────────────────────────────
 
-def normalize_features(X: np.ndarray) -> np.ndarray:
-    """Scale each feature column to [0, 1]."""
-    lo = X.min(axis=0)
-    hi = X.max(axis=0)
+def normalize_features(
+    X: np.ndarray,
+    lo: np.ndarray | None = None,
+    hi: np.ndarray | None = None,
+) -> np.ndarray:
+    """Scale features using bounds fitted on the training set."""
+    if lo is None:
+        lo = X.min(axis=0)
+    if hi is None:
+        hi = X.max(axis=0)
     return (X - lo) / (hi - lo + 1e-9)
 
 
@@ -215,15 +224,21 @@ def reset_between_samples(brain: Brain, n_steps: int = REST_STEPS) -> None:
     brain.reset_traces()
 
 
-def present(brain: Brain, x: np.ndarray, n_steps: int = TEST_PRESENT_STEPS) -> np.ndarray:
-    """Present a sample and return per-motor-neuron spike counts."""
+def present(
+    brain: Brain,
+    x: np.ndarray,
+    n_steps: int = TEST_PRESENT_STEPS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Present a sample and return spike counts plus mean motor voltage."""
     motor = brain.regions["motor"]
     before = motor.total_spikes[:N_MOTOR].clone()
+    voltage_sum = torch.zeros(N_MOTOR, dtype=torch.float32, device=DEVICE)
     for _ in range(n_steps):
         brain.stimulate("input", x)
         brain.step()
+        voltage_sum += motor.v[:N_MOTOR]
     counts = motor.total_spikes[:N_MOTOR] - before
-    return counts.cpu().numpy()
+    return counts.cpu().numpy(), (voltage_sum / n_steps).cpu().numpy()
 
 
 def _readout_proj(brain: Brain) -> 'Projection':
@@ -234,11 +249,19 @@ def _readout_proj(brain: Brain) -> 'Projection':
 _READOUT_TARGET = Brain.projection_target("input", "motor")
 
 
-def _keep_only_motor_eligibility(proj, motor_idx: int) -> None:
-    """Keep eligibility only on synapses projecting to one motor neuron."""
-    ns = proj.n_synapses
-    keep = proj.syn_post[:ns] == motor_idx
-    proj.syn_eligibility[:ns][~keep] = 0.0
+def _reinforce_motor(
+    brain: Brain,
+    motor_idx: int,
+    amount: float,
+    positive: bool,
+) -> None:
+    """Restrict the full dopamine pulse to the selected class readout."""
+    with brain.reward_stdp.restrict_to_posts(_READOUT_TARGET, [motor_idx]):
+        if positive:
+            brain.reward(amount, target=_READOUT_TARGET)
+        else:
+            brain.punish(amount, target=_READOUT_TARGET)
+        quiet_steps(brain, 10)
 
 
 def train_one_sample(
@@ -255,10 +278,11 @@ def train_one_sample(
     A delayed teacher pulse drives motor[y] after input has fired, so STDP
     sees causal pre→post timing → positive eligibility on input→motor[y].
 
-    Selective eligibility zeroing ensures only motor[y] synapses are
-    reinforced by the reward signal.
+    A postsynaptic mask remains active throughout each reward/punishment
+    pulse, so only the selected motor's synapses receive credit.
 
-    Returns the teacher-biased prediction (real metric is unbiased test acc).
+    Returns the pre-teacher prediction. This is a response diagnostic, not
+    a training accuracy estimate.
     """
     motor = brain.regions["motor"]
     before = motor.total_spikes[:N_MOTOR].clone()
@@ -272,15 +296,11 @@ def train_one_sample(
         if step + 1 == TEACHER_DELAY:
             natural_counts = motor.total_spikes[:N_MOTOR] - before
 
-    counts = motor.total_spikes[:N_MOTOR] - before
     pred = int(torch.argmax(natural_counts).item()) if natural_counts.max().item() > 0 else -1
 
     # Selective credit: only reinforce input→motor[y] synapses
     im = _readout_proj(brain)
-    _keep_only_motor_eligibility(im, y)
-
-    brain.reward(reward_amount, target=_READOUT_TARGET)
-    quiet_steps(brain, 10)
+    _reinforce_motor(brain, y, reward_amount, positive=True)
 
     # Actively weaken the strongest wrong readout so classes separate faster.
     wrong_pred = pred if pred >= 0 and pred != y else -1
@@ -289,9 +309,7 @@ def train_one_sample(
         for _ in range(TRAIN_PRESENT_STEPS):
             brain.stimulate("input", x)
             brain.step()
-        _keep_only_motor_eligibility(im, wrong_pred)
-        brain.punish(punish_amount, target=_READOUT_TARGET)
-        quiet_steps(brain, 10)
+        _reinforce_motor(brain, wrong_pred, punish_amount, positive=False)
 
     reset_between_samples(brain)
     return pred
@@ -301,25 +319,51 @@ def test_one_sample(
     brain: Brain,
     x: np.ndarray,
     test_repeats: int = TEST_REPEATS,
-) -> tuple[int, np.ndarray]:
-    """Predict one sample by summing spike counts across repeated presentations."""
+) -> tuple[int, int, np.ndarray]:
+    """Return spike-only and voltage-fallback predictions."""
     total_counts = np.zeros(N_MOTOR, dtype=int)
+    total_voltage = np.zeros(N_MOTOR, dtype=np.float64)
     for _ in range(test_repeats):
-        total_counts += present(brain, x)
+        counts, voltage = present(brain, x)
+        total_counts += counts
+        total_voltage += voltage
         reset_between_samples(brain)
-    pred = int(np.argmax(total_counts)) if total_counts.max() > 0 else -1
-    return pred, total_counts
+    spike_pred = int(np.argmax(total_counts)) if total_counts.max() > 0 else -1
+    fallback_pred = spike_pred if spike_pred >= 0 else int(np.argmax(total_voltage))
+    return spike_pred, fallback_pred, total_counts
 
 
-def evaluate(brain: Brain, X: np.ndarray, y: np.ndarray) -> tuple[float, np.ndarray, np.ndarray]:
-    preds = np.empty(len(X), dtype=int)
+@dataclass
+class IrisEvaluation:
+    spike_accuracy: float
+    fallback_accuracy: float
+    spike_predictions: np.ndarray
+    fallback_predictions: np.ndarray
+    counts: np.ndarray
+
+
+def evaluate(brain: Brain, X: np.ndarray, y: np.ndarray) -> IrisEvaluation:
+    # Evaluation advances membrane, homeostatic and RNG state. Keep it
+    # side-effect free so validation cannot influence later training.
+    eval_brain = copy.deepcopy(brain)
+    eval_brain.reset_traces()
+    eval_brain.freeze_adaptive_thresholds()
+    eval_brain.encoder.noise_level = 0.0
+    spike_preds = np.empty(len(X), dtype=int)
+    fallback_preds = np.empty(len(X), dtype=int)
     all_counts = np.empty((len(X), N_MOTOR), dtype=int)
     for i in range(len(X)):
-        pred, counts = test_one_sample(brain, X[i])
-        preds[i] = pred
+        spike_pred, fallback_pred, counts = test_one_sample(eval_brain, X[i])
+        spike_preds[i] = spike_pred
+        fallback_preds[i] = fallback_pred
         all_counts[i] = counts
-    acc = float(np.mean(preds == y))
-    return acc, preds, all_counts
+    return IrisEvaluation(
+        spike_accuracy=float(np.mean(spike_preds == y)),
+        fallback_accuracy=float(np.mean(fallback_preds == y)),
+        spike_predictions=spike_preds,
+        fallback_predictions=fallback_preds,
+        counts=all_counts,
+    )
 # ── Main ─────────────────────────────────────────────────────────────
 
 def main():
@@ -330,22 +374,32 @@ def main():
 
     # ── Data ─────────────────────────────────────────────────────────
     iris = load_iris()
-    X_raw = normalize_features(iris.data)
-    X = place_field_encode(X_raw)
-    y = iris.target
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=SEED, stratify=y,
+    X_train_val_raw, X_test_raw, y_train_val, y_test = train_test_split(
+        iris.data, iris.target,
+        test_size=0.2, random_state=SEED, stratify=iris.target,
     )
-    print(f"\n  Dataset: {len(X)} samples, {X.shape[1]} place-field bins "
+    X_train_raw, X_val_raw, y_train, y_val = train_test_split(
+        X_train_val_raw, y_train_val,
+        test_size=0.2, random_state=SEED + 1, stratify=y_train_val,
+    )
+    lo = X_train_raw.min(axis=0)
+    hi = X_train_raw.max(axis=0)
+    X_train = place_field_encode(normalize_features(X_train_raw, lo, hi))
+    X_val = place_field_encode(normalize_features(X_val_raw, lo, hi))
+    X_test = place_field_encode(normalize_features(X_test_raw, lo, hi))
+    print(f"\n  Dataset: {len(iris.data)} samples, {X_train.shape[1]} place-field bins "
           f"(4 features × {N_BINS_PER_FEATURE} bins), 3 classes")
-    print(f"  Split: {len(X_train)} train / {len(X_test)} test")
+    print(
+        f"  Split: {len(X_train)} train / {len(X_val)} validation / "
+        f"{len(X_test)} test"
+    )
     print(f"  Classes: {iris.target_names.tolist()}")
 
     # ── Sklearn baseline (so we have something to compare against) ──
     baseline = LogisticRegression(max_iter=1000, random_state=SEED)
     baseline.fit(X_train, y_train)
-    base_test_acc = baseline.score(X_test, y_test)
-    print(f"\n  Sklearn LogisticRegression baseline test accuracy: {base_test_acc:.1%}")
+    base_val_acc = baseline.score(X_val, y_val)
+    print(f"\n  Sklearn LogisticRegression validation accuracy: {base_val_acc:.1%}")
 
     # ── Brain ────────────────────────────────────────────────────────
     print("\n" + "─" * 64)
@@ -355,8 +409,11 @@ def main():
     print(brain.summary())
 
     # Untrained baseline
-    untrained_acc, _, _ = evaluate(brain, X_test, y_test)
-    print(f"\n  Untrained brain test accuracy: {untrained_acc:.1%} (chance ≈ 33%)")
+    untrained = evaluate(brain, X_val, y_val)
+    print(
+        f"\n  Untrained brain validation accuracy: "
+        f"{untrained.spike_accuracy:.1%} (chance ≈ 33%)"
+    )
 
     # ── Training ─────────────────────────────────────────────────────
     print("\n" + "─" * 64)
@@ -365,13 +422,14 @@ def main():
     rng = np.random.default_rng(SEED)
     t0 = time.time()
 
-    best_test_acc = -1.0
+    best_val_acc = -1.0
     best_epoch = 0
     best_brain = None
 
     for epoch in range(EPOCHS):
         perm = rng.permutation(len(X_train))
-        train_correct = 0
+        pre_teacher_correct = 0
+        pre_teacher_responses = 0
         reward_scale = 1.0 if epoch < REWARD_DECAY_EPOCH else 0.5
         current_reward = REWARD_AMOUNT * reward_scale
         for i in perm:
@@ -383,17 +441,24 @@ def main():
                 punish_amount=PUNISH_AMOUNT,
             )
             if pred == y_train[i]:
-                train_correct += 1
-        train_acc = train_correct / len(X_train)
-        test_acc, _, _ = evaluate(brain, X_test, y_test)
-        if test_acc > best_test_acc:
-            best_test_acc = test_acc
+                pre_teacher_correct += 1
+            if pred >= 0:
+                pre_teacher_responses += 1
+        pre_teacher_acc = pre_teacher_correct / len(X_train)
+        pre_teacher_response_rate = pre_teacher_responses / len(X_train)
+        validation = evaluate(brain, X_val, y_val)
+        val_acc = validation.spike_accuracy
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
             best_epoch = epoch + 1
             best_brain = copy.deepcopy(brain)
         elapsed = time.time() - t0
         print(
             f"  Epoch {epoch + 1:2d}/{EPOCHS}: "
-            f"train={train_acc:.1%}  test={test_acc:.1%}  "
+            f"pre_teacher_acc={pre_teacher_acc:.1%}  "
+            f"pre_teacher_response={pre_teacher_response_rate:.1%}  "
+            f"val_spike={val_acc:.1%}  "
+            f"val_fallback={validation.fallback_accuracy:.1%}  "
             f"t={elapsed:5.1f}s  "
             f"synapses={brain._snapshot().total_synapses}"
         )
@@ -406,12 +471,17 @@ def main():
     print("\n" + "─" * 64)
     print("  Final Results")
     print("─" * 64)
-    final_acc, preds, counts = evaluate(brain, X_test, y_test)
+    final = evaluate(brain, X_test, y_test)
+    final_acc = final.spike_accuracy
+    preds = final.spike_predictions
+    counts = final.counts
+    base_test_acc = baseline.score(X_test, y_test)
 
     no_response = int(np.sum(preds < 0))
-    print(f"\n  Brain test accuracy:          {final_acc:.1%}")
+    print(f"\n  Brain spike-only accuracy:    {final_acc:.1%}")
+    print(f"  With voltage fallback:        {final.fallback_accuracy:.1%}")
     print(f"  Sklearn baseline:             {base_test_acc:.1%}")
-    print(f"  Best checkpoint epoch:        {best_epoch} ({best_test_acc:.1%})")
+    print(f"  Best checkpoint epoch:        {best_epoch} ({best_val_acc:.1%} validation)")
     print(f"  Samples with no motor spikes: {no_response}/{len(y_test)}")
 
     cm = confusion_matrix(y_test, preds, labels=range(3))

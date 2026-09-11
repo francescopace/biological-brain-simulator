@@ -105,7 +105,7 @@ def build_brain_with_memory(seed: int = SEED) -> Brain:
     proj.syn_A_minus[:ns][~exc_post] = 0.0
 
     # Keep R-STDP disabled but enable memory system
-    brain.reward_stdp.apply_target = lambda *args, **kwargs: 0
+    brain.disable_reward_modulated_plasticity()
     brain.reset_traces()
     brain.freeze_structural_plasticity()
     # Memory system stays active (not monkey-patched)

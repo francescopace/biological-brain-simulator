@@ -7,7 +7,7 @@ injects current directly into the region's current array.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -30,6 +30,14 @@ class MemoryTrace:
 
 
 class MemorySystem:
+    """Replay memory with bounded, oldest-first replacement of experiences.
+
+    Replay strength affects sampling, not admission: a novel pattern can replace
+    the oldest stored trace even when every existing trace has been consolidated.
+    Consecutive captures of the same active neurons within a region refresh its
+    latest snapshot without allocating duplicate traces or erasing replay history.
+    """
+
     def __init__(
         self,
         trace_capacity: int = 100,
@@ -41,6 +49,7 @@ class MemorySystem:
         self.consolidation_interval = consolidation_interval
         self.replay_strength = replay_strength
         self.trace_threshold = trace_threshold
+        self.enabled = True
 
         self.traces: list[MemoryTrace] = []
         self._step_counter = 0
@@ -51,6 +60,8 @@ class MemorySystem:
         region: Region,
         current_time: float,
     ) -> MemoryTrace | None:
+        if not self.enabled or self.trace_capacity <= 0:
+            return None
         n = region.n_neurons
         if n == 0:
             return None
@@ -63,6 +74,13 @@ class MemorySystem:
         if len(indices) < 3:
             return None
 
+        for previous in reversed(self.traces):
+            if previous.region_name == region.name:
+                if torch.equal(previous.neuron_indices, indices):
+                    previous.activity_snapshot = region.activity[indices].clone()
+                    return previous
+                break
+
         trace = MemoryTrace(
             neuron_indices=indices.clone(),
             activity_snapshot=region.activity[indices].clone(),
@@ -70,14 +88,21 @@ class MemorySystem:
             creation_time=current_time,
         )
 
+        # Evict only pre-existing traces so a newly observed pattern is always
+        # admitted. Equal creation times are resolved by insertion order.
+        while len(self.traces) >= self.trace_capacity:
+            oldest = min(
+                range(len(self.traces)),
+                key=lambda i: self.traces[i].creation_time,
+            )
+            self.traces.pop(oldest)
         self.traces.append(trace)
-        if len(self.traces) > self.trace_capacity:
-            self.traces.sort(key=lambda t: t.strength, reverse=True)
-            self.traces = self.traces[:self.trace_capacity]
 
         return trace
 
     def consolidate(self, regions: dict[str, Region], current_time: float) -> int:
+        if not self.enabled:
+            return 0
         self._step_counter += 1
         if self._step_counter % self.consolidation_interval != 0:
             return 0
@@ -122,6 +147,8 @@ class MemorySystem:
         partial_indices: torch.Tensor,
         boost_current: float = 2.0,
     ) -> int:
+        if not self.enabled:
+            return 0
         partial_set = set(partial_indices.tolist())
         best_trace = None
         best_overlap = 0

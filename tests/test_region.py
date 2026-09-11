@@ -46,6 +46,15 @@ class TestPopulation:
         idx = r.add_neuron()
         assert idx == -1
 
+    def test_add_neuron_reuses_dead_slot_at_capacity(self):
+        r = Region("test", RegionType.SENSORY, max_neurons=2)
+        r.populate(2, connectivity=0.0)
+        r.neuron_alive[0] = False
+        idx = r.add_neuron(NeuronType.INHIBITORY, FiringPattern.FAST_SPIKING)
+        assert idx == 0
+        assert r.n_neurons == 2
+        assert r.n_alive_neurons == 2
+
     def test_izhikevich_params_match_pattern(self):
         r = Region("test", RegionType.SENSORY, max_neurons=10)
         r.add_neuron(NeuronType.EXCITATORY, FiringPattern.FAST_SPIKING)
@@ -74,6 +83,15 @@ class TestSynapses:
         r.populate(5, connectivity=0.0)
         r.add_one_synapse(0, 1, weight=2.0, nt=NeurotransmitterType.GABA)
         assert r.syn_weight[0].item() < 0
+
+    def test_initial_weight_is_clamped_to_declared_bounds(self):
+        r = Region("test", RegionType.SENSORY, max_neurons=2)
+        r.populate(2, connectivity=0.0)
+        r.add_one_synapse(0, 1, weight=12.0, nt=NeurotransmitterType.GABA)
+
+        assert r.syn_weight[0].item() == pytest.approx(-10.0)
+        assert r.syn_min_weight[0].item() == pytest.approx(-10.0)
+        assert r.syn_max_weight[0].item() == pytest.approx(0.0)
 
     def test_synapse_capacity_doubling(self):
         r = Region("test", RegionType.SENSORY, max_neurons=100)
@@ -104,6 +122,13 @@ class TestSynapses:
         r.add_one_synapse(0, 2, weight=1.0, delay_ms=999.0)  # very large
         assert r.syn_delay[0].item() >= 1
         assert r.syn_delay[1].item() <= MAX_DELAY_STEPS - 1
+
+    def test_new_synapse_gets_morphological_attenuation(self):
+        r = Region("test", RegionType.SENSORY, max_neurons=10)
+        r.populate(3, connectivity=0.0)
+        r.enable_morphology()
+        r.add_one_synapse(0, 1, weight=1.0)
+        assert 0.0 < r.syn_attenuation[0].item() < 1.0
 
 
 class TestStep:

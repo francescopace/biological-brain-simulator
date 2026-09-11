@@ -101,10 +101,13 @@ class OscillatorBank:
         self,
         base_amplitude: float = 0.5,
         gamma_theta_coupling: float = 5.0,
+        seed: int | None = None,
     ):
         self.base_amplitude = base_amplitude
         self.gamma_theta_coupling = gamma_theta_coupling
         self.oscillators: dict[str, list[Oscillator]] = {}
+        self._rng = random.Random(seed)
+        self.enabled = True
 
     def add_region(self, region_name: str, region_type: RegionType) -> None:
         """Create oscillators for a region based on its type."""
@@ -119,7 +122,7 @@ class OscillatorBank:
             osc = Oscillator(
                 frequency=freq,
                 amplitude=amp,
-                phase=random.uniform(0, 2 * math.pi),
+                phase=self._rng.uniform(0, 2 * math.pi),
                 band=band,
             )
             oscs.append(osc)
@@ -139,6 +142,8 @@ class OscillatorBank:
         """
         Advance all oscillators and return per-region background current.
         """
+        if not self.enabled:
+            return {}
         currents = {}
         for name, oscs in self.oscillators.items():
             total = 0.0
