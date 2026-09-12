@@ -47,6 +47,7 @@ htmlcov/
 .ruff_cache/
 
 # Brain simulation artifacts
+/results/
 brain_state.json
 brain_checkpoint/
 *.npz

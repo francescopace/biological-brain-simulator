@@ -473,7 +473,47 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .ven
 OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_readout_tuning evaluate --output results/paper-readout-repeat
 ```
 
-Each stage refuses to overwrite an existing result. The source pilot must be available locally. This remains an exploratory analysis of a repeatedly inspected validation set, one small readout set and three fixed networks. The improvement should be checked on new evaluation images before adoption. No canonical test run, production change or Iris modification was made.
+Each stage refuses to overwrite an existing result. The source pilot must be available locally. This remains an exploratory analysis of a repeatedly inspected validation set, one small readout set and three fixed networks. The following fresh-image evaluation checks this improvement without refitting. No canonical test run, production change or Iris modification was made.
+
+### Frozen-decoder evaluation on fresh MNIST images
+
+The frozen combined STDP decoder reached **69.27% mean accuracy on 1,000 new images**, compared with 70.38% on the preceding 800-row validation set. On the same new images, its old fixed decoder scored 61.10%: the paired gain from decoder tuning is **8.17 percentage points**, positive in all three seeds. Their combined accuracies were 66.90%, 70.50% and 70.40%, with respective fixed-decoder gains of 6.60, 8.80 and 9.10 points. These are fresh validation measurements, not canonical MNIST test scores.
+
+| Frozen decoder | Initial network | Normalization + theta, no STDP | Normalization + theta + STDP |
+| --- | ---: | ---: | ---: |
+| Fixed equal weights, alpha 1 | 56.53% | 54.30% | 61.10% |
+| Equal weights, previously selected alpha | 64.07% | 61.80% | 67.33% |
+| Spike-only, previously selected alpha | 30.90% | 29.53% | 45.27% |
+| Voltage-only, previously selected alpha | 68.63% | 66.37% | 68.80% |
+| Previously selected joint weight and alpha | 68.23% | 66.37% | **69.27%** |
+| Original class-average spikes | 27.00% | 29.20% | 51.23% |
+
+Each entry averages the same three fixed seeds on the same 1,000 images; this is not a set of 3,000 independent images. The planned conditional image-bootstrap 95% interval is 66.90–71.63% for the combined STDP accuracy and +6.67 to +9.77 points for its gain over the fixed decoder. The earlier 70.38% falls within the new accuracy interval, while the decoder gain remains positive on the new cohort.
+
+The combined STDP decoder exceeds its no-STDP control by 2.90 points on average (conditional interval +1.67 to +4.10), but loses 0.30 points for seed 201. Its gain over initialization is only 1.03 points (−0.03 to +2.10), and adding spikes to the tuned voltage-only decoder gives 0.47 points (−0.37 to +1.27). The latter two intervals include zero. This supports the decoder improvement without establishing a consistent benefit from the combined readout over voltage alone or from STDP over initialization on that combined metric. The separate class-average spike readout retains its larger STDP effect: 51.23% versus 29.20% without STDP, a gain of 22.03 points.
+
+`examples.mnist_paper_fresh_evaluation` evaluates the existing three reference seeds and their initial, no-STDP and STDP checkpoints on 1,000 new images, 100 per digit. Networks, adaptive thresholds, neuron assignments, scaler statistics, feature weights and linear decoder coefficients remain frozen. No network training, decoder fitting or parameter selection is performed. The five exported ridge decoders and the original class-average assignment are all fixed before the new responses are extracted.
+
+The cohort is sampled from the canonical training partition with selection seed 20260913. It excludes the source lineage's 3,800 used or reserved IDs and the historic seed-42 run's 50,000 training IDs, for a union of 50,593 exclusions. The historical split is reconstructed from its archived Git revision `e26adf97`, completed-run log and empty working-tree patch; the loader's syntax tree still matches the current implementation. Reconstruction includes the interleaved test-array shuffles, which affect the random generator state for later classes. The canonical test partition is not evaluated.
+
+Selection also excludes exact pixel duplicates of those excluded rows and duplicate images within the new cohort. Every selected ID is disjoint from the exclusions and the new set remains class-balanced. These checks cover the recorded source lineage and reconstructed historical run, not undocumented historical experiments. `plan.json` and the image snapshot are saved before scoring, with the exclusions, selected rows, source hashes, decoder identities and planned comparisons.
+
+Evaluation retains the previous independent-image protocol: 350 ms presentation, 150 ms rest, transient reset per image, frozen weights and theta, and Poisson seeds keyed by network seed, canonical row ID and retry. Before processing new images, each worker reproduces the old 800-row predictions for all six decoders and exactly replays five old readout responses. Workers then extract the same 1,000 new rows in batches of 100. The summarizer replays predictions from the saved new responses and checks source, decoder, cache and checkpoint hashes.
+
+The primary measurements are the STDP network's jointly selected decoder accuracy and its paired gain over the fixed equal-weight, alpha-1 decoder. Planned secondary comparisons measure STDP versus the initial and no-STDP networks, and joint versus voltage-only decoding. Bootstrap intervals resample image IDs within digit 5,000 times while keeping the three seeds paired. They describe image-sampling uncertainty conditional on these fixed networks, decoders and 100 readout labels; they do not measure variation across new training runs. Secondary intervals are not adjusted for multiple comparisons.
+
+All three workers completed successfully in 378.9–380.5 seconds each, about 6.3 minutes, while running concurrently with one CPU thread per worker. These are timings under concurrent load, not isolated speed comparisons. All 43,200 previous predictions and all 45 selected old response replays matched exactly. The aggregate replayed all 54,000 new predictions, and an independent NumPy calculation reproduced them from the exported coefficients and saved responses. Source, decoder and checkpoint hashes remained unchanged.
+
+The artifacts are in `results/20260913-paper-fresh-evaluation`, including the complete `summary.json`. The 17 new tests cover historical split reconstruction, row exclusion, pixel deduplication, balanced sampling, frozen decoder identity and replay, fitting-free evaluation, aggregation and paired bootstrap behavior. The full CPU suite passed **872 tests with two accelerator probes skipped**, recorded in `results/20260913-paper-fresh-evaluation-tests.xml`.
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_fresh_evaluation plan --output results/paper-fresh-repeat
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_fresh_evaluation run --output results/paper-fresh-repeat --seed 201
+# Repeat the run command for seeds 202 and 203, then summarize.
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_fresh_evaluation summarize --output results/paper-fresh-repeat
+```
+
+The commands require the source pilot, exported decoder artifacts, archived historical-run evidence and its Git revision locally. Repeating the fixed plan reproduces the same cohort; it does not create another independent fresh evaluation. Results and checkpoints remain local under the ignored `/results/` directory. Iris, production defaults and the reference's timestep/integrator are unchanged, so this experiment does not resolve the numerical-equivalence questions identified above.
 
 ## Completed pre-correction full MNIST run
 
