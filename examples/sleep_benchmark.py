@@ -7,20 +7,21 @@ a silent phase) improves retention compared to no-replay.
 Protocol:
   1. Train SNN on MNIST (300/class) for 1 epoch
   2. Evaluate → accuracy_before_sleep
-  3. Run a silent "sleep" phase: no input, but memory consolidation
-     replays stored traces and STDP is active
-  4. Evaluate → accuracy_after_sleep
-  5. Compare: does replay improve or maintain accuracy?
-  6. Control: run same duration of silence WITHOUT replay → accuracy_no_replay
+  3. From identical copies, run all four replay on/off × STDP on/off arms
+  4. Keep scaling, adaptive theta and topology frozen during every sleep arm
+  5. Re-evaluate with the unchanged pre-sleep decoder and report weight changes
 
-A positive result: post-replay accuracy >= pre-sleep accuracy, and
-significantly better than the no-replay control.
+STDP is manual, feedforward-only and explicit in each arm. Replay uses the
+stored trace bank without capturing new traces during sleep. Single-seed
+accuracy differences are descriptive; this experiment is not a significance test.
 """
 
 from __future__ import annotations
 
 import sys
 import time
+import copy
+import json
 from pathlib import Path
 
 import numpy as np
@@ -41,12 +42,13 @@ from examples.mnist_benchmark import (
     reset_brain_state,
     normalize_feedforward_weights,
     evaluate,
+    apply_feedforward_stdp,
 )
 from src.brain import Brain
 from src.device import DEVICE
 from src.neuron import NeuronType, FiringPattern
 from src.region import RegionType
-from src.persistence import save_brain, load_brain
+from src.persistence import save_brain
 
 TRAIN_PER_CLASS = 300
 TEST_PER_CLASS = 50
@@ -138,17 +140,99 @@ def eval_snn(brain, X_readout, y_readout, X_test, y_test):
     return acc
 
 
-def sleep_phase(brain, n_steps, enable_replay=True):
-    """Run silent steps. If enable_replay, memory consolidation is active."""
-    if not enable_replay:
-        original_consolidate = brain.memory.consolidate
-        brain.memory.consolidate = lambda *args, **kwargs: 0
+def _weight_targets(brain):
+    return {
+        **{f"region:{name}": region for name, region in brain.regions.items()},
+        **{f"proj:{p.source_name}->{p.target_name}": p for p in brain.projections},
+    }
 
-    for _ in range(n_steps):
-        brain.step()
 
-    if not enable_replay:
-        brain.memory.consolidate = original_consolidate
+def sleep_phase(brain, n_steps, enable_replay=True, *, enable_stdp=True):
+    """Controlled sleep; return actual weight changes, not inferred learning.
+
+    Both plastic and frozen arms disable R-STDP, scaling, theta adaptation and
+    growth. Only the plastic arms call feedforward STDP. Automatic capture is
+    off; explicit replay draws from pre-sleep traces at the configured cadence.
+    Pending eligibility/dopamine are discarded at entry. Caller control flags
+    are restored even if a step fails.
+    """
+    if n_steps < 0:
+        raise ValueError("Sleep duration must be nonnegative")
+    projection = brain.get_projection("input", "cortex")
+    if enable_stdp and not projection.plasticity_enabled:
+        raise ValueError("Sleep STDP requires an enabled feedforward pathway")
+    targets = _weight_targets(brain)
+    before = {key: t.syn_weight[:t.n_synapses].clone() for key, t in targets.items()}
+    flags = (
+        brain.homeostasis.scaling_enabled, brain.homeostasis.theta_enabled,
+        brain.metaplasticity_enabled, brain.growth.growth_interval,
+        brain.memory.enabled, brain.reward_stdp.enabled,
+    )
+    replayed = 0
+    stdp_steps = 0
+    brain.freeze_homeostatic_scaling()
+    brain.freeze_adaptive_thresholds()
+    brain.freeze_structural_plasticity()
+    brain.disable_reward_modulated_plasticity()
+    brain.disable_memory()
+    try:
+        for _ in range(n_steps):
+            brain.step()
+            if enable_stdp:
+                apply_feedforward_stdp(brain)
+                stdp_steps += 1
+            if enable_replay:
+                brain.memory.enabled = True
+                try:
+                    replayed += brain.memory.consolidate(brain.regions, brain.time)
+                finally:
+                    brain.memory.enabled = False
+    finally:
+        (
+            brain.homeostasis.scaling_enabled, brain.homeostasis.theta_enabled,
+            brain.metaplasticity_enabled, brain.growth.growth_interval,
+            brain.memory.enabled, brain.reward_stdp.enabled,
+        ) = flags
+
+    changes = {}
+    for key, target in targets.items():
+        weights = target.syn_weight[:target.n_synapses]
+        delta = weights - before[key]
+        changes[key] = {
+            "synapses": target.n_synapses,
+            "changed": int(torch.count_nonzero(delta)),
+            "mean_abs_delta": float(delta.abs().mean()) if delta.numel() else 0.0,
+            "max_abs_delta": float(delta.abs().max()) if delta.numel() else 0.0,
+            "net_delta": float(delta.sum()),
+        }
+        allowed = enable_stdp and key == "proj:input->cortex"
+        if not allowed and changes[key]["changed"]:
+            raise AssertionError(f"Unexpected weight update in {key}")
+    return {
+        "replay": enable_replay, "stdp": enable_stdp,
+        "scaling": False, "adaptive_theta": False,
+        "steps": n_steps, "stdp_steps": stdp_steps,
+        "replayed_traces": replayed, "weight_changes": changes,
+    }
+
+
+def compare_sleep_conditions(brain, X_readout, y_readout, X_test, y_test, n_steps):
+    """Use one decoder and identical pre-sleep copies for the four arms."""
+    _, _, spike_t, voltage_t = build_readout(brain, X_readout, y_readout, CLASSES)
+    before, _ = evaluate(brain, X_test, y_test, spike_t, voltage_t, CLASSES)
+    results = {"accuracy_before": before, "decoder": "fixed_pre_sleep", "conditions": []}
+    print(f"    Accuracy before sleep: {before:.1%}")
+    for replay, stdp in ((True, True), (False, True), (True, False), (False, False)):
+        print(f"  Sleep: replay={replay} STDP={stdp} ({n_steps} steps)...", flush=True)
+        candidate = copy.deepcopy(brain)
+        start = time.time()
+        stats = sleep_phase(candidate, n_steps, replay, enable_stdp=stdp)
+        accuracy, _ = evaluate(candidate, X_test, y_test, spike_t, voltage_t, CLASSES)
+        stats.update(accuracy=accuracy, elapsed_s=time.time() - start)
+        results["conditions"].append(stats)
+        changed = sum(item["changed"] for item in stats["weight_changes"].values())
+        print(f"    Accuracy={accuracy:.1%}, changed weights={changed}, replayed traces={stats['replayed_traces']}")
+    return results
 
 
 # --- Main -------------------------------------------------------------------
@@ -174,53 +258,30 @@ def main():
     print("\n  Training SNN...")
     t0 = time.time()
     brain = build_brain_with_memory(seed=SEED)
-    norm_target = train_snn(brain, X_train, y_train)
+    train_snn(brain, X_train, y_train)
     print(f"    done in {time.time() - t0:.0f}s")
     print(f"    Memory traces captured: {len(brain.memory.traces)}")
 
-    # --- Evaluate before sleep ---
-    print("  Evaluating before sleep...")
-    acc_before = eval_snn(brain, X_readout, y_readout, X_test, y_test)
-    print(f"    Accuracy before sleep: {acc_before:.1%}")
-
-    # Save for control experiment
-    save_path = Path("/tmp/sleep_brain")
-    save_brain(brain, save_path)
-
-    # --- Sleep WITH replay ---
-    print(f"\n  Sleep phase WITH replay ({SLEEP_STEPS} steps)...")
-    t1 = time.time()
-    sleep_phase(brain, SLEEP_STEPS, enable_replay=True)
-    print(f"    done in {time.time() - t1:.1f}s")
-
-    acc_with_replay = eval_snn(brain, X_readout, y_readout, X_test, y_test)
-    print(f"    Accuracy after sleep+replay: {acc_with_replay:.1%}")
-
-    # --- Sleep WITHOUT replay (control) ---
-    print(f"\n  Sleep phase WITHOUT replay ({SLEEP_STEPS} steps, control)...")
-    brain_ctrl = load_brain(save_path)
-    t2 = time.time()
-    sleep_phase(brain_ctrl, SLEEP_STEPS, enable_replay=False)
-    print(f"    done in {time.time() - t2:.1f}s")
-
-    acc_no_replay = eval_snn(brain_ctrl, X_readout, y_readout, X_test, y_test)
-    print(f"    Accuracy after sleep (no replay): {acc_no_replay:.1%}")
+    # Preserve this protocol's checkpoint separately from historical runs.
+    run_dir = Path("results") / f"sleep_{time.time_ns()}"
+    save_brain(brain, run_dir / "checkpoint")
+    results = compare_sleep_conditions(
+        brain, X_readout, y_readout, X_test, y_test, SLEEP_STEPS,
+    )
+    (run_dir / "summary.json").write_text(json.dumps(results, indent=2) + "\n")
 
     # --- Summary ---
     print("\n" + "=" * 68)
     print("  Summary")
     print("=" * 68)
-    print(f"  Before sleep:          {acc_before:.1%}")
-    print(f"  After sleep+replay:    {acc_with_replay:.1%}  (delta: {acc_with_replay - acc_before:+.1%})")
-    print(f"  After sleep (control): {acc_no_replay:.1%}  (delta: {acc_no_replay - acc_before:+.1%})")
-    replay_benefit = acc_with_replay - acc_no_replay
-    print(f"\n  Replay benefit: {replay_benefit:+.1%}")
-    if replay_benefit > 0.01:
-        print("  -> Replay consolidation improves retention.")
-    elif replay_benefit > -0.01:
-        print("  -> No significant replay effect detected.")
-    else:
-        print("  -> Replay appears to hurt (possible interference).")
+    print(f"  Before sleep: {results['accuracy_before']:.1%}")
+    for item in results["conditions"]:
+        print(f"  Replay={item['replay']} STDP={item['stdp']}: {item['accuracy']:.1%}")
+    active, control, replay_frozen, silent_frozen = results["conditions"]
+    print(f"  Replay difference with STDP: {active['accuracy'] - control['accuracy']:+.1%}")
+    print(f"  Replay difference with frozen weights: {replay_frozen['accuracy'] - silent_frozen['accuracy']:+.1%}")
+    print("  Single seed; these differences do not establish statistical significance.")
+    print(f"  Saved checkpoint and summary: {run_dir}")
     print("=" * 68)
 
 

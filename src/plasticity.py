@@ -20,6 +20,8 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from .synaptic_events import SynapseEventIndex
+
 if TYPE_CHECKING:
     from .region import Region
 
@@ -61,6 +63,7 @@ class STDP:
         max_weight: torch.Tensor,
         current_time: float,
         eligibility: torch.Tensor | None = None,
+        event_indices: tuple[SynapseEventIndex, SynapseEventIndex] | None = None,
     ) -> int:
         """
         Apply nearest-neighbor STDP (sync-free for GPU performance).
@@ -69,14 +72,25 @@ class STDP:
         (no torch.any() guards). Operations on empty index sets are near-zero cost.
         """
         window = self.stdp_window
-        pre_i64 = syn_pre.to(torch.int64)
-        post_i64 = syn_post.to(torch.int64)
+        indexed = (
+            event_indices is not None
+            and all(index.enabled for index in event_indices)
+            and syn_pre.device.type == "cpu"
+            and syn_pre.numel() >= SynapseEventIndex.min_synapses
+        )
+        if not indexed:
+            pre_i64 = syn_pre.to(torch.int64)
+            post_i64 = syn_post.to(torch.int64)
 
         # ── LTP arm: post fired this step ────────────────────────────
-        post_fired_syn = fired_post[post_i64] & alive
-        idx_ltp = torch.where(post_fired_syn)[0]
+        if indexed:
+            idx_ltp = event_indices[1].select(fired_post, syn_post, alive)
+        else:
+            post_fired_syn = fired_post[post_i64] & alive
+            idx_ltp = torch.where(post_fired_syn)[0]
         if idx_ltp.numel() > 0:
-            dt = current_time - pre_last_spike_arr[pre_i64[idx_ltp]]
+            pre = syn_pre[idx_ltp].to(torch.int64) if indexed else pre_i64[idx_ltp]
+            dt = current_time - pre_last_spike_arr[pre]
             within = (dt >= 0.0) & (dt < window)
             sel = idx_ltp[within]
             if sel.numel() > 0:
@@ -89,10 +103,14 @@ class STDP:
                     )
 
         # ── LTD arm: pre fired this step ─────────────────────────────
-        pre_fired_syn = fired_pre[pre_i64] & alive
-        idx_ltd = torch.where(pre_fired_syn)[0]
+        if indexed:
+            idx_ltd = event_indices[0].select(fired_pre, syn_pre, alive)
+        else:
+            pre_fired_syn = fired_pre[pre_i64] & alive
+            idx_ltd = torch.where(pre_fired_syn)[0]
         if idx_ltd.numel() > 0:
-            dt = current_time - post_last_spike_arr[post_i64[idx_ltd]]
+            post = syn_post[idx_ltd].to(torch.int64) if indexed else post_i64[idx_ltd]
+            dt = current_time - post_last_spike_arr[post]
             within = (dt >= 0.0) & (dt < window)
             sel = idx_ltd[within]
             if sel.numel() > 0:
@@ -220,6 +238,7 @@ class RewardModulatedSTDP:
         eligibility: torch.Tensor,
         current_time: float,
         dt: float = 1.0,
+        event_indices: tuple[SynapseEventIndex, SynapseEventIndex] | None = None,
     ) -> int:
         """
         Single-step plasticity for a set of synapses identified by `target`:
@@ -249,6 +268,7 @@ class RewardModulatedSTDP:
             weights, min_weight, max_weight,
             current_time,
             eligibility=eligibility,
+            event_indices=event_indices,
         )
 
         # 2. Decay eligibility (single vectorized multiply)

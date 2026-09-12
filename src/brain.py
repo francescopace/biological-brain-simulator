@@ -15,8 +15,10 @@ from pathlib import Path
 
 import torch
 
+from . import synapse as synaptic_state
 from .device import DEVICE
 from .growth import GrowthController, GrowthStats
+from .integration import DEFAULT_MAX_STEP, validate_integration
 from .memory import MemorySystem
 from .neuron import NeuronType
 from .oscillator import OscillatorBank
@@ -32,6 +34,7 @@ from .region import (
 )
 from .stimulus import EncodingStrategy, StimulusEncoder
 from .synapse import NT_PROPERTIES, NeurotransmitterType
+from .synaptic_events import SynapseEventIndex
 
 
 DISABLED_GROWTH_INTERVAL = 10**9
@@ -46,6 +49,8 @@ class Projection:
         self.source_name = source_name
         self.target_name = target_name
         self.plasticity_enabled = True
+        self._pre_events = SynapseEventIndex()
+        self._post_events = SynapseEventIndex()
         self.n_synapses: int = 0
         self._syn_capacity: int = 0
         self._alloc(256)
@@ -97,8 +102,12 @@ class Brain:
             brain.step()
     """
 
-    def __init__(self, dt: float = 1.0, seed: int | None = None):
+    def __init__(self, dt: float = 1.0, seed: int | None = None, *,
+                 integration_method: str = "heun", integration_max_step: float = DEFAULT_MAX_STEP):
+        validate_integration(dt, integration_method, integration_max_step)
         self.dt = dt
+        self.integration_method = integration_method
+        self.integration_max_step = integration_max_step
         self.seed = seed
         self.time: float = 0.0
         self.step_count: int = 0
@@ -149,7 +158,9 @@ class Brain:
     ) -> Region:
         if name in self.regions:
             raise ValueError(f"Region {name!r} already exists")
-        region = Region(name, region_type, max_neurons, dt=self.dt)
+        region = Region(name, region_type, max_neurons, dt=self.dt,
+                        integration_method=self.integration_method,
+                        integration_max_step=self.integration_max_step)
         self._region_seed_counter += 1
         self._seed_generator(
             region._rng,
@@ -173,13 +184,29 @@ class Brain:
         density: float = 0.05,
         bidirectional: bool = False,
         nt: NeurotransmitterType = NeurotransmitterType.GLUTAMATE,
+        *,
+        target_neuron_type: NeuronType | None = None,
     ) -> int:
+        """Connect excitatory source cells to the selected target population.
+
+        With no target filter, preserve the historical all-target generation.
+        An explicit filter selects living cells of that type in each direction
+        (including the reverse direction when bidirectional is requested).
+        """
+        if target_neuron_type is not None:
+            target_neuron_type = NeuronType(target_neuron_type)
         src = self.regions[source]
         tgt = self.regions[target]
         proj = Projection(source, target)
 
         src_n = src.n_neurons
         tgt_n = tgt.n_neurons
+        target_indices = torch.arange(tgt_n, device=DEVICE)
+        if target_neuron_type is not None:
+            target_indices = target_indices[
+                (tgt.neuron_type[:tgt_n] == target_neuron_type.value)
+                & tgt.neuron_alive[:tgt_n]
+            ]
 
         # Only excitatory neurons project long-range
         exc_mask = (
@@ -188,21 +215,24 @@ class Brain:
         )
         exc_idx = torch.where(exc_mask)[0]
 
-        if len(exc_idx) == 0 or tgt_n == 0:
+        if len(exc_idx) == 0 or len(target_indices) == 0:
             self.projections.append(proj)
             if bidirectional:
-                return self.connect_regions(target, source, density, False, nt)
+                return self.connect_regions(target, source, density, False, nt,
+                                            target_neuron_type=target_neuron_type)
             return 0
 
         # Vectorized connection generation
-        conn = torch.rand((len(exc_idx), tgt_n), device=DEVICE, generator=self._rng) < density
-        pre_local, post_idx = torch.where(conn)
+        conn = torch.rand((len(exc_idx), len(target_indices)), device=DEVICE, generator=self._rng) < density
+        pre_local, post_local = torch.where(conn)
+        post_idx = target_indices[post_local]
         pre_idx = exc_idx[pre_local]
 
         if len(pre_idx) == 0:
             self.projections.append(proj)
             if bidirectional:
-                return self.connect_regions(target, source, density, False, nt)
+                return self.connect_regions(target, source, density, False, nt,
+                                            target_neuron_type=target_neuron_type)
             return 0
 
         count = len(pre_idx)
@@ -238,7 +268,8 @@ class Brain:
         created = count
 
         if bidirectional:
-            created += self.connect_regions(target, source, density, False, nt)
+            created += self.connect_regions(target, source, density, False, nt,
+                                            target_neuron_type=target_neuron_type)
 
         return created
 
@@ -394,11 +425,7 @@ class Brain:
             ns = proj.n_synapses
             if ns == 0:
                 continue
-            s = slice(0, ns)
-            proj.syn_resource[s] = torch.clamp(proj.syn_resource[s] + _RECOVERY_RATE, max=1.0)
-            proj.syn_facilitation[s] *= 0.98
-            proj.syn_age[s] += 1
-            proj.syn_recent[s] *= _TRANSMISSION_DECAY
+            synaptic_state.advance_synapse_state(proj, ns, _RECOVERY_RATE, _TRANSMISSION_DECAY)
 
         # 2. Inject oscillatory background currents
         osc_currents = self.oscillators.step(self.dt)
@@ -422,8 +449,7 @@ class Brain:
             source = self.regions[proj.source_name]
             target = self.regions[proj.target_name]
 
-            pre_fired = source.fired[proj.syn_pre[:ns]] & proj.syn_alive[:ns]
-            active = torch.where(pre_fired)[0]
+            active = proj._pre_events.select(source.fired, proj.syn_pre[:ns], proj.syn_alive[:ns])
 
             if len(active) > 0:
                 res = proj.syn_resource[active]
@@ -470,6 +496,7 @@ class Brain:
                 eligibility=region.syn_eligibility[:ns],
                 current_time=self.time,
                 dt=self.dt,
+                event_indices=(region._pre_events, region._post_events),
             )
 
         # 6. Event-driven R-STDP on inter-region projections.
@@ -502,6 +529,7 @@ class Brain:
                 eligibility=proj.syn_eligibility[:ns],
                 current_time=self.time,
                 dt=self.dt,
+                event_indices=(proj._pre_events, proj._post_events),
             )
 
         # 7. Homeostatic plasticity
@@ -522,9 +550,10 @@ class Brain:
         self.memory.consolidate(self.regions, self.time)
 
         # 11. Auto-capture memory traces
-        for region in self.regions.values():
-            if region.mean_activity > 0.1:
-                self.memory.capture_trace(region, self.time)
+        if self.memory.enabled:
+            for region in self.regions.values():
+                if region.mean_activity > 0.1:
+                    self.memory.capture_trace(region, self.time)
 
         # 12. Stats
         if self.step_count % self._stats_interval == 0:

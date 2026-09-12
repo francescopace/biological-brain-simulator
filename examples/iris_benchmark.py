@@ -1,19 +1,19 @@
 """
 Iris classification benchmark for the synthetic brain.
 
-This is a *real* benchmark: the brain learns to classify Iris flowers
-using spike-timing dependent plasticity modulated by dopamine (R-STDP),
-not gradient descent.
+The benchmark trains a readout with spike-timing dependent plasticity modulated
+by dopamine (R-STDP), selects an epoch on validation data, and compares its
+spike-only predictions with a labelled logistic-regression baseline.
 
 Architecture:
-    input (80 sensory neurons, 20 per feature, place-field encoded)
-        ↓ density 0.5           ↓ density 0.9 (readout, R-STDP)
+    input (80 excitatory sensory neurons, 20 place-field bins per feature)
+        ↓ density 0.5           ↓ density 1.0 (readout, R-STDP)
     cortex (80 association)     motor (3 chattering, one per class)
         ↓ density 0.8 (frozen)   ↑ lateral inhibition (GABA)
               → motor ──────────
 
 The input→motor shortcut is the readout learned by R-STDP.
-Cortex→motor provides non-specific drive (weights frozen).
+Cortex→motor weights are zero and frozen; this pathway provides no drive.
 
 Training (supervised R-STDP with delayed teacher):
     1. Present sample (place-field encoded, 30 ms).
@@ -25,11 +25,18 @@ Training (supervised R-STDP with delayed teacher):
     4. Reward → dopamine × eligibility consolidates input→motor[y].
     5. Reset between samples.
 
-Testing: present without teacher (80 ms), predict by motor spike argmax.
-Compared against a sklearn LogisticRegression baseline.
+Evaluation starts each sample from the same transient state on a frozen copy,
+without teacher, noise or oscillations. Each 80ms response is computed once and
+reused in the six-repeat vote. Voltage fallback is reported separately from
+spike-only accuracy. --validation-only leaves test-set scoring disabled;
+--output NEW_DIR records results and immutable per-epoch checkpoints, without
+providing CLI resume support.
 """
 
+import argparse
 import copy
+import hashlib
+import os
 import sys
 import time
 from dataclasses import dataclass
@@ -41,8 +48,11 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from examples._utils import confusion_matrix, quiet_steps
+from examples._utils import can_reuse_independent_inference, inference_brain, reset_independent_state
+from examples.training_checkpoint import array_digest, atomic_json, save_training_checkpoint
 
 try:
+    import sklearn
     from sklearn.datasets import load_iris
     from sklearn.linear_model import LogisticRegression
     from sklearn.model_selection import train_test_split
@@ -65,7 +75,7 @@ PLACE_FIELD_SIGMA = 0.08  # narrower fields improve separability of nearby class
 N_CORTEX = 80
 N_MOTOR = 3               # one per class
 TEST_PRESENT_STEPS = 80   # ms of stimulus per sample (test mode: longer for better readout)
-TEST_REPEATS = 6          # repeat each test sample to average out spiking noise
+TEST_REPEATS = 6          # preserve the six-vote sum; identical frozen responses are reused
 TRAIN_PRESENT_STEPS = 30  # ms during training (shorter: matches cortex burst window)
 TEACHER_DELAY = 13        # ms before teacher kicks in (lets cortex fire first → causal STDP)
 TEACHER_CURRENT = 15.0    # moderate teacher drive on correct motor neuron
@@ -101,12 +111,16 @@ def build_brain(seed: int = SEED) -> Brain:
     brain = Brain(dt=1.0, seed=seed)
 
     # Input: pure feedforward, no internal connectivity
-    brain.add_region(
+    sensory = brain.add_region(
         "input",
         RegionType.SENSORY,
-        n_neurons=N_INPUT, connectivity=0.0,
+        n_neurons=0, connectivity=0.0,
         max_neurons=N_INPUT,
     )
+    # connect_regions uses excitatory sources only: every encoded bin needs
+    # an output pathway, not the generic region's random 80/20 type split.
+    for _ in range(N_INPUT):
+        sensory.add_neuron(NeuronType.EXCITATORY, FiringPattern.REGULAR_SPIKING)
 
     # Cortex: sparsely recurrent association area
     brain.add_region(
@@ -148,6 +162,8 @@ def build_brain(seed: int = SEED) -> Brain:
         elif proj.source_name == "input" and proj.target_name == "motor":
             # Start the readout nearly blank so learning isn't fighting random bias.
             proj.syn_weight[:ns] = READOUT_INIT_WEIGHT
+        proj.syn_weight[:ns] = torch.clamp(proj.syn_weight[:ns],
+                                           proj.syn_min_weight[:ns], proj.syn_max_weight[:ns])
 
     # Stronger sensory drive, lower noise for stable per-class patterns
     brain.encoder.max_current = ENCODER_MAX_CURRENT
@@ -218,23 +234,27 @@ def place_field_encode(
     return out
 
 
-def reset_between_samples(brain: Brain, n_steps: int = REST_STEPS) -> None:
+def reset_between_samples(brain: Brain, n_steps: int | None = None) -> None:
     """Run quietly so spike buffers drain, then hard-reset traces & dopamine."""
-    quiet_steps(brain, n_steps)
+    quiet_steps(brain, REST_STEPS if n_steps is None else n_steps)
     brain.reset_traces()
 
 
 def present(
     brain: Brain,
     x: np.ndarray,
-    n_steps: int = TEST_PRESENT_STEPS,
+    n_steps: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Present a sample and return spike counts plus mean motor voltage."""
+    n_steps = TEST_PRESENT_STEPS if n_steps is None else n_steps
+    if n_steps < 1:
+        raise ValueError("Presentation steps must be positive")
+    stimulus = torch.as_tensor(x, dtype=torch.float32, device=DEVICE)
     motor = brain.regions["motor"]
     before = motor.total_spikes[:N_MOTOR].clone()
     voltage_sum = torch.zeros(N_MOTOR, dtype=torch.float32, device=DEVICE)
     for _ in range(n_steps):
-        brain.stimulate("input", x)
+        brain.stimulate("input", stimulus)
         brain.step()
         voltage_sum += motor.v[:N_MOTOR]
     counts = motor.total_spikes[:N_MOTOR] - before
@@ -286,10 +306,11 @@ def train_one_sample(
     """
     motor = brain.regions["motor"]
     before = motor.total_spikes[:N_MOTOR].clone()
+    stimulus = torch.as_tensor(x, dtype=torch.float32, device=DEVICE)
 
     natural_counts = torch.zeros(N_MOTOR, dtype=torch.int32, device=DEVICE)
     for step in range(TRAIN_PRESENT_STEPS):
-        brain.stimulate("input", x)
+        brain.stimulate("input", stimulus)
         if step >= TEACHER_DELAY:
             brain.inject_current("motor", [y], TEACHER_CURRENT)
         brain.step()
@@ -307,7 +328,7 @@ def train_one_sample(
     if wrong_pred >= 0:
         im.syn_eligibility[:im.n_synapses] = 0.0
         for _ in range(TRAIN_PRESENT_STEPS):
-            brain.stimulate("input", x)
+            brain.stimulate("input", stimulus)
             brain.step()
         _reinforce_motor(brain, wrong_pred, punish_amount, positive=False)
 
@@ -318,16 +339,25 @@ def train_one_sample(
 def test_one_sample(
     brain: Brain,
     x: np.ndarray,
-    test_repeats: int = TEST_REPEATS,
+    test_repeats: int | None = None,
+    *, independent: bool = False, reuse_identical: bool = False,
 ) -> tuple[int, int, np.ndarray]:
     """Return spike-only and voltage-fallback predictions."""
+    test_repeats = TEST_REPEATS if test_repeats is None else test_repeats
+    if test_repeats < 1:
+        raise ValueError("Test repeats must be positive")
+    reuse = independent and reuse_identical and can_reuse_independent_inference(brain)
     total_counts = np.zeros(N_MOTOR, dtype=int)
     total_voltage = np.zeros(N_MOTOR, dtype=np.float64)
-    for _ in range(test_repeats):
-        counts, voltage = present(brain, x)
+    for repeat in range(test_repeats):
+        if not reuse or repeat == 0:
+            if independent:
+                reset_independent_state(brain)
+            counts, voltage = present(brain, x)
         total_counts += counts
         total_voltage += voltage
-        reset_between_samples(brain)
+        if not independent:
+            reset_between_samples(brain)
     spike_pred = int(np.argmax(total_counts)) if total_counts.max() > 0 else -1
     fallback_pred = spike_pred if spike_pred >= 0 else int(np.argmax(total_voltage))
     return spike_pred, fallback_pred, total_counts
@@ -342,18 +372,26 @@ class IrisEvaluation:
     counts: np.ndarray
 
 
-def evaluate(brain: Brain, X: np.ndarray, y: np.ndarray) -> IrisEvaluation:
+def evaluate(brain: Brain, X: np.ndarray, y: np.ndarray, *,
+             independent: bool = True, fast: bool = True) -> IrisEvaluation:
     # Evaluation advances membrane, homeostatic and RNG state. Keep it
     # side-effect free so validation cannot influence later training.
-    eval_brain = copy.deepcopy(brain)
-    eval_brain.reset_traces()
-    eval_brain.freeze_adaptive_thresholds()
-    eval_brain.encoder.noise_level = 0.0
+    if len(X) != len(y) or len(y) == 0:
+        raise ValueError("Evaluation needs matching, nonempty samples and labels")
+    if independent:
+        eval_brain = inference_brain(brain)
+    else:
+        # Retain the former sequential protocol for explicit diagnostics only.
+        eval_brain = copy.deepcopy(brain)
+        eval_brain.reset_traces()
+        eval_brain.freeze_adaptive_thresholds()
+        eval_brain.encoder.noise_level = 0.0
     spike_preds = np.empty(len(X), dtype=int)
     fallback_preds = np.empty(len(X), dtype=int)
     all_counts = np.empty((len(X), N_MOTOR), dtype=int)
     for i in range(len(X)):
-        spike_pred, fallback_pred, counts = test_one_sample(eval_brain, X[i])
+        spike_pred, fallback_pred, counts = test_one_sample(
+            eval_brain, X[i], independent=independent, reuse_identical=fast)
         spike_preds[i] = spike_pred
         fallback_preds[i] = fallback_pred
         all_counts[i] = counts
@@ -366,7 +404,40 @@ def evaluate(brain: Brain, X: np.ndarray, y: np.ndarray) -> IrisEvaluation:
     )
 # ── Main ─────────────────────────────────────────────────────────────
 
-def main():
+def evaluation_payload(result: IrisEvaluation) -> dict:
+    return {"spike_accuracy": result.spike_accuracy, "fallback_accuracy": result.fallback_accuracy,
+            "spike_predictions": result.spike_predictions.tolist(),
+            "fallback_predictions": result.fallback_predictions.tolist(), "counts": result.counts.tolist(),
+            "silent_samples": int(np.sum(result.spike_predictions < 0))}
+
+
+def main(*, output: Path | None = None, validation_only: bool = False):
+    root = Path(__file__).resolve().parent.parent
+    sources = [Path(__file__), root / "examples/_utils.py", root / "examples/training_checkpoint.py",
+               *sorted((root / "src").glob("*.py"))]
+    hashes = {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}
+    config = {name: value for name, value in globals().items()
+              if name.isupper() and not name.startswith("_") and isinstance(value, (int, float, str, bool))}
+    payload = {"complete": False, "pid": os.getpid(), "started_at": time.time(),
+               "source_sha256": hashes, "config": config, "validation_only": validation_only,
+               "torch": torch.__version__, "numpy": np.__version__, "sklearn": sklearn.__version__,
+               "inference": "independent, frozen, deterministic; identical repeats reused",
+               "epochs": []}
+    if output is not None:
+        output = Path(output)
+        output.mkdir(parents=True, exist_ok=False)
+        atomic_json(output / "summary.json", payload)
+
+    def publish():
+        if output is not None:
+            atomic_json(output / "summary.json", payload)
+
+    def checkpoint(label, model, progress):
+        if output is not None:
+            save_training_checkpoint(model, output / "checkpoints" / label,
+                                      {"protocol": {"config": config, "source_sha256": hashes,
+                                                    "dataset": payload["dataset"]}, **progress})
+
     print("=" * 64)
     print("  IRIS BENCHMARK — Spiking Brain with R-STDP")
     print("  (No backpropagation: just spikes, STDP, and dopamine)")
@@ -374,19 +445,27 @@ def main():
 
     # ── Data ─────────────────────────────────────────────────────────
     iris = load_iris()
-    X_train_val_raw, X_test_raw, y_train_val, y_test = train_test_split(
-        iris.data, iris.target,
+    train_val_ids, test_ids = train_test_split(
+        np.arange(len(iris.data)),
         test_size=0.2, random_state=SEED, stratify=iris.target,
     )
-    X_train_raw, X_val_raw, y_train, y_val = train_test_split(
-        X_train_val_raw, y_train_val,
-        test_size=0.2, random_state=SEED + 1, stratify=y_train_val,
+    train_ids, val_ids = train_test_split(
+        train_val_ids,
+        test_size=0.2, random_state=SEED + 1, stratify=iris.target[train_val_ids],
     )
+    X_train_raw, X_val_raw, X_test_raw = (iris.data[ids] for ids in (train_ids, val_ids, test_ids))
+    y_train, y_val, y_test = (iris.target[ids] for ids in (train_ids, val_ids, test_ids))
     lo = X_train_raw.min(axis=0)
     hi = X_train_raw.max(axis=0)
     X_train = place_field_encode(normalize_features(X_train_raw, lo, hi))
     X_val = place_field_encode(normalize_features(X_val_raw, lo, hi))
     X_test = place_field_encode(normalize_features(X_test_raw, lo, hi))
+    payload["dataset"] = {"train_ids": train_ids.tolist(), "validation_ids": val_ids.tolist(),
+                          "test_ids": test_ids.tolist(), "normalization_lo": lo.tolist(),
+                          "normalization_hi": hi.tolist(), "train_sha256": array_digest(X_train, y_train),
+                          "validation_sha256": array_digest(X_val, y_val),
+                          "test_sha256": array_digest(X_test, y_test)}
+    publish()
     print(f"\n  Dataset: {len(iris.data)} samples, {X_train.shape[1]} place-field bins "
           f"(4 features × {N_BINS_PER_FEATURE} bins), 3 classes")
     print(
@@ -407,9 +486,13 @@ def main():
     print("─" * 64)
     brain = build_brain(seed=SEED)
     print(brain.summary())
+    checkpoint("initial", brain, {"completed_epochs": 0})
 
     # Untrained baseline
     untrained = evaluate(brain, X_val, y_val)
+    payload["initial_validation"] = evaluation_payload(untrained)
+    payload["baseline_validation_accuracy"] = float(base_val_acc)
+    publish()
     print(
         f"\n  Untrained brain validation accuracy: "
         f"{untrained.spike_accuracy:.1%} (chance ≈ 33%)"
@@ -453,6 +536,14 @@ def main():
             best_epoch = epoch + 1
             best_brain = copy.deepcopy(brain)
         elapsed = time.time() - t0
+        payload["epochs"].append({"epoch": epoch + 1, "pre_teacher_accuracy": pre_teacher_acc,
+                                  "pre_teacher_response_rate": pre_teacher_response_rate,
+                                  "validation": evaluation_payload(validation), "elapsed_s": elapsed})
+        payload.update(best_epoch=best_epoch, best_validation_accuracy=best_val_acc)
+        checkpoint(f"epoch_{epoch + 1:03d}", brain,
+                   {"completed_epochs": epoch + 1, "shuffle_rng_state": rng.bit_generator.state,
+                    "best_epoch": best_epoch, "epochs": payload["epochs"]})
+        publish()
         print(
             f"  Epoch {epoch + 1:2d}/{EPOCHS}: "
             f"pre_teacher_acc={pre_teacher_acc:.1%}  "
@@ -471,20 +562,27 @@ def main():
     print("\n" + "─" * 64)
     print("  Final Results")
     print("─" * 64)
-    final = evaluate(brain, X_test, y_test)
+    final_X, final_y = (X_val, y_val) if validation_only else (X_test, y_test)
+    final = evaluate(brain, final_X, final_y)
     final_acc = final.spike_accuracy
     preds = final.spike_predictions
     counts = final.counts
-    base_test_acc = baseline.score(X_test, y_test)
+    base_test_acc = baseline.score(final_X, final_y)
+    payload["final_partition"] = "validation" if validation_only else "test"
+    payload["final"] = evaluation_payload(final)
+    payload["baseline_final_accuracy"] = float(base_test_acc)
+    checkpoint("selected", brain, {"completed_epochs": best_epoch, "selected_by": "validation"})
+    if validation_only:
+        print("\n  Validation-only run: no test-set scoring. These are selection-set results.")
 
     no_response = int(np.sum(preds < 0))
     print(f"\n  Brain spike-only accuracy:    {final_acc:.1%}")
     print(f"  With voltage fallback:        {final.fallback_accuracy:.1%}")
     print(f"  Sklearn baseline:             {base_test_acc:.1%}")
     print(f"  Best checkpoint epoch:        {best_epoch} ({best_val_acc:.1%} validation)")
-    print(f"  Samples with no motor spikes: {no_response}/{len(y_test)}")
+    print(f"  Samples with no motor spikes: {no_response}/{len(final_y)}")
 
-    cm = confusion_matrix(y_test, preds, labels=range(3))
+    cm = confusion_matrix(final_y, preds, labels=range(3))
     print(f"\n  Confusion matrix (rows=true, cols=predicted):")
     header = "             " + "  ".join(f"{n:>10s}" for n in iris.target_names)
     print(header)
@@ -496,7 +594,7 @@ def main():
     print(f"\n  Mean motor spike counts per true class:")
     print(f"             motor[0]   motor[1]   motor[2]")
     for c in range(3):
-        mask = y_test == c
+        mask = final_y == c
         if mask.any():
             mean = counts[mask].mean(axis=0)
             print(f"    {iris.target_names[c]:>8s}: "
@@ -522,7 +620,16 @@ def main():
         print(f"  ✗ At/below chance ({final_acc:.1%} vs chance {chance:.1%}).")
         print(f"    No meaningful learning detected this run.")
     print("=" * 64)
+    if hashes != {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}:
+        raise RuntimeError("Benchmark sources changed during the run")
+    payload.update(complete=True, finished_at=time.time(), source_unchanged=True)
+    publish()
+    return payload
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, help="New result/checkpoint directory; no CLI resume support")
+    parser.add_argument("--validation-only", action="store_true", help="Do not score the test split")
+    args = parser.parse_args()
+    main(output=args.output, validation_only=args.validation_only)

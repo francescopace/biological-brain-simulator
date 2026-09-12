@@ -16,7 +16,8 @@ Target: 85-90% accuracy (Diehl & Cook 2015 achieved 95% with 6400 exc neurons).
 
 from __future__ import annotations
 
-import copy
+from dataclasses import dataclass
+import math
 import sys
 import time
 from pathlib import Path
@@ -27,6 +28,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from examples._utils import confusion_matrix, quiet_steps
+from examples._utils import can_reuse_independent_inference, inference_brain, reset_independent_state
+from examples.mnist_trace_stdp import PostTraceSTDP, validate_learning_rule
 from src.device import DEVICE
 
 try:
@@ -36,7 +39,7 @@ except ImportError:
     print("  pip install scikit-learn")
     raise SystemExit(1)
 
-from src.brain import Brain
+from src.brain import Brain, DISABLED_GROWTH_INTERVAL
 from src.neuron import FiringPattern, NeuronType
 from src.region import Region, RegionType
 from src.synapse import NeurotransmitterType
@@ -84,12 +87,35 @@ THETA_LEAK = 0.005
 
 SEED = 42
 
+# Historical diagnosis may opt out locally; standard image classification
+# always starts each presentation from the same electrical/STP state.
+INDEPENDENT_INFERENCE = True
+# Disable only for equivalence checks against the unoptimized independent policy.
+FAST_INDEPENDENT_INFERENCE = True
+
 
 # --- Brain construction -----------------------------------------------------
 
 
-def build_brain(seed: int = SEED) -> Brain:
-    brain = Brain(dt=1.0, seed=seed)
+def validate_input_projection(density: float, weight_boost: float) -> None:
+    if not math.isfinite(density) or not 0.0 <= density <= 1.0:
+        raise ValueError("Input density must be finite and between zero and one")
+    if not math.isfinite(weight_boost) or weight_boost < 0.0:
+        raise ValueError("Input weight boost must be finite and nonnegative")
+
+
+def build_brain(seed: int = SEED, *, integration_method: str = "heun",
+                integration_max_step: float = 0.1, feedforward_exc_only: bool = True,
+                exc_to_inh_weight: float | None = None, stdp_scale: float | None = None,
+                input_density: float | None = None, input_weight_boost: float | None = None) -> Brain:
+    plasticity_scale = STDP_SCALE if stdp_scale is None else stdp_scale
+    if not math.isfinite(plasticity_scale) or plasticity_scale < 0:
+        raise ValueError("STDP scale must be finite and nonnegative")
+    density = INPUT_TO_CORTEX_DENSITY if input_density is None else input_density
+    weight_boost = INPUT_WEIGHT_BOOST if input_weight_boost is None else input_weight_boost
+    validate_input_projection(density, weight_boost)
+    brain = Brain(dt=1.0, seed=seed, integration_method=integration_method,
+                  integration_max_step=integration_max_step)
 
     # Input region: all sensory neurons are excitatory so every pixel can project.
     input_region = brain.add_region(
@@ -113,18 +139,21 @@ def build_brain(seed: int = SEED) -> Brain:
         cortex.add_neuron(NeuronType.EXCITATORY, FiringPattern.REGULAR_SPIKING)
     for _ in range(N_CORTEX_INH):
         cortex.add_neuron(NeuronType.INHIBITORY, FiringPattern.FAST_SPIKING)
-    wire_cortex_microcircuit(cortex)
+    wire_cortex_microcircuit(cortex, exc_to_inh_weight=exc_to_inh_weight)
 
-    brain.connect_regions("input", "cortex", density=INPUT_TO_CORTEX_DENSITY)
+    brain.connect_regions(
+        "input", "cortex", density=density,
+        target_neuron_type=NeuronType.EXCITATORY if feedforward_exc_only else None,
+    )
     brain.freeze_plasticity()
     proj = brain.enable_projection_plasticity(
         "input",
         "cortex",
-        A_plus=STDP_A_PLUS * STDP_SCALE,
-        A_minus=STDP_A_MINUS * STDP_SCALE,
+        A_plus=STDP_A_PLUS * plasticity_scale,
+        A_minus=STDP_A_MINUS * plasticity_scale,
     )
     ns = proj.n_synapses
-    proj.syn_weight[:ns] *= INPUT_WEIGHT_BOOST
+    proj.syn_weight[:ns] *= weight_boost
     proj.syn_weight[:ns] = torch.clamp(
         proj.syn_weight[:ns],
         proj.syn_min_weight[:ns],
@@ -155,13 +184,17 @@ def build_brain(seed: int = SEED) -> Brain:
     return brain
 
 
-def wire_cortex_microcircuit(cortex: Region) -> None:
-    """Wire 1:1 matched exc-inh pairs (Diehl & Cook 2015 WTA).
+def wire_cortex_microcircuit(cortex: Region, *, exc_to_inh_weight: float | None = None) -> None:
+    """Wire matched exc-inh pairs and lateral inhibition of competing exc cells.
 
     Each exc[i] drives exactly inh[i]; each inh[i] suppresses every
-    exc[j != i].  This creates much sharper winner-take-all competition
-    than random sparse connectivity.
+    exc[j != i]. The coupling must activate the inhibitory partner for this
+    topology to implement competition; topology alone does not guarantee it.
+    An explicit coupling above 10 raises only the matched edges' weight bound.
     """
+    coupling = EXC_TO_INH_WEIGHT if exc_to_inh_weight is None else exc_to_inh_weight
+    if not math.isfinite(coupling) or coupling < 0:
+        raise ValueError("Excitatory-to-inhibitory coupling must be finite and nonnegative")
     n = cortex.n_neurons
     if n == 0:
         return
@@ -173,14 +206,20 @@ def wire_cortex_microcircuit(cortex: Region) -> None:
     if n_matched == 0:
         return
 
-    # 1:1 exc[i] -> inh[i] with strong, fast connections.
+    # 1:1 exc[i] -> inh[i]. Preserve the requested pulse amplitude instead of
+    # silently clipping an experimental coupling to the generic glutamate cap.
+    matched_start = cortex.n_synapses
     cortex.add_synapses(
         exc_idx[:n_matched].to(torch.int32),
         inh_idx[:n_matched].to(torch.int32),
-        torch.full((n_matched,), EXC_TO_INH_WEIGHT, dtype=torch.float32, device=DEVICE),
+        torch.full((n_matched,), coupling, dtype=torch.float32, device=DEVICE),
         torch.full((n_matched,), 1.0, dtype=torch.float32, device=DEVICE),
         torch.full((n_matched,), NeurotransmitterType.GLUTAMATE.value, dtype=torch.int32, device=DEVICE),
     )
+    if coupling > 10.0:
+        matched = slice(matched_start, matched_start + n_matched)
+        cortex.syn_max_weight[matched] = coupling
+        cortex.syn_weight[matched] = coupling
 
     # Each inh[i] -> every exc[j != i] (all-to-all minus self-pair).
     ii, jj = torch.meshgrid(torch.arange(n_matched, device=DEVICE), torch.arange(n_matched, device=DEVICE), indexing="ij")
@@ -317,12 +356,22 @@ def reset_brain_state(brain: Brain, rest_steps: int | None = None) -> None:
     brain.reset_traces()
 
 
+def reset_inference_state(brain: Brain) -> None:
+    """Reset transient state on an inference copy, preserving learned theta.
+
+    Weights, topology, neuron parameters, time and cumulative counters are not
+    reset. Inference copies disable oscillations so absolute time cannot leak
+    sample position into the stimulus. Training uses reset_brain_state instead.
+    """
+    reset_independent_state(brain)
+
+
 def apply_feedforward_stdp(brain: Brain) -> int:
     proj = brain.get_projection("input", "cortex")
     source = brain.regions["input"]
     target = brain.regions["cortex"]
     ns = proj.n_synapses
-    if ns == 0:
+    if ns == 0 or not proj.plasticity_enabled:
         return 0
     return brain.stdp.apply_event(
         fired_pre=source.fired[:source.n_neurons],
@@ -338,6 +387,7 @@ def apply_feedforward_stdp(brain: Brain) -> int:
         min_weight=proj.syn_min_weight[:ns],
         max_weight=proj.syn_max_weight[:ns],
         current_time=brain.time,
+        event_indices=(proj._pre_events, proj._post_events),
     )
 
 
@@ -346,26 +396,85 @@ def present_sample(
     x: np.ndarray,
     n_steps: int,
     learn: bool = False,
-) -> tuple[np.ndarray, np.ndarray]:
+    *,
+    collect_responses: bool = True,
+    learning_rule: str = "pair",
+    trace_tau: float = 20.0,
+    trace_target: float = 0.2,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    validate_learning_rule(learning_rule, trace_tau, trace_target)
+    trace_rule = (PostTraceSTDP(brain, tau=trace_tau, target=trace_target)
+                  if learn and learning_rule == "post_trace" else None)
+    # The encoder still draws fresh noise at every step. Only the deterministic
+    # conversion is moved outside the loop, including during training.
+    stimulus = torch.as_tensor(x, dtype=torch.float32, device=DEVICE)
     cortex = brain.regions["cortex"]
-    exc_idx = excitatory_cortex_indices(brain)
-    before = cortex.total_spikes[exc_idx].clone()
-    voltage_sum = torch.zeros(len(exc_idx), dtype=torch.float32, device=cortex.v.device)
+    if collect_responses:
+        exc_idx = excitatory_cortex_indices(brain)
+        before = cortex.total_spikes[exc_idx].clone()
+        voltage_sum = torch.zeros(len(exc_idx), dtype=torch.float32, device=cortex.v.device)
 
     for _ in range(n_steps):
-        brain.stimulate("input", x)
+        brain.stimulate("input", stimulus)
         brain.step()
-        voltage_sum += cortex.v[exc_idx]
+        if collect_responses:
+            voltage_sum += cortex.v[exc_idx]
         if learn:
-            apply_feedforward_stdp(brain)
+            if trace_rule is None:
+                apply_feedforward_stdp(brain)
+            else:
+                trace_rule.step()
 
+    if not collect_responses:
+        return None
     counts = cortex.total_spikes[exc_idx] - before
     mean_voltage = voltage_sum / max(n_steps, 1)
     return counts.cpu().numpy(), mean_voltage.cpu().numpy()
 
 
-def normalize_feedforward_weights(brain: Brain, target_sum: float) -> None:
-    """Normalize incoming feedforward weight sum per excitatory cortex neuron."""
+def present_inference_sample(brain: Brain, x: np.ndarray, n_steps: int):
+    """Present an independent image/repeat on an already frozen snapshot."""
+    if INDEPENDENT_INFERENCE:
+        reset_inference_state(brain)
+    return present_sample(brain, x, n_steps, learn=False)
+
+
+def can_reuse_inference(brain: Brain) -> bool:
+    """Allow shortcuts only for independent, deterministic, frozen networks.
+
+    Low-level callers can also pass training networks: these must keep their
+    presentation/rest schedule even when the standard inference fast path is on.
+    """
+    return (FAST_INDEPENDENT_INFERENCE and INDEPENDENT_INFERENCE
+            and can_reuse_independent_inference(brain))
+
+
+@dataclass(frozen=True)
+class ReadoutResponses:
+    """Reusable features in input sample order, before fitting a decoder."""
+
+    exc_indices: np.ndarray
+    spikes: np.ndarray
+    voltages: np.ndarray
+
+
+def collect_readout_responses(brain: Brain, X: np.ndarray) -> ReadoutResponses:
+    exc_idx = excitatory_cortex_indices(brain).cpu().numpy()
+    # Preserve integer spike counts for the original top-k tie ordering.
+    spikes = np.empty((len(X), len(exc_idx)), dtype=np.int32)
+    voltages = np.empty((len(X), len(exc_idx)), dtype=np.float32)
+    reuse = can_reuse_inference(brain)
+    for i, x in enumerate(X):
+        spikes[i], voltages[i] = present_inference_sample(brain, x, ASSIGN_PRESENT_STEPS)
+        # Every transient will be reset before the next independent image.
+        # Keep the historical rest schedule for all other protocols.
+        if not reuse:
+            reset_brain_state(brain)
+    return ReadoutResponses(exc_idx, spikes, voltages)
+
+
+def normalize_feedforward_weights(brain: Brain, target_sum: float | list[float] | torch.Tensor) -> None:
+    """Normalize incoming weights to one scalar or a target per cortex neuron."""
     proj = brain.get_projection("input", "cortex")
     ns = proj.n_synapses
     weights = proj.syn_weight[:ns]
@@ -373,6 +482,11 @@ def normalize_feedforward_weights(brain: Brain, target_sum: float) -> None:
     alive = proj.syn_alive[:ns]
     cortex = brain.regions["cortex"]
     types = cortex.neuron_type[:cortex.n_neurons]
+    targets = torch.as_tensor(target_sum, dtype=torch.float32, device=weights.device)
+    if targets.ndim > 1 or (targets.ndim == 1 and len(targets) != cortex.n_neurons):
+        raise ValueError("Normalization targets must be scalar or one per cortex neuron")
+    if not bool(torch.isfinite(targets).all()) or bool((targets < 0).any()):
+        raise ValueError("Normalization targets must be finite and nonnegative")
 
     exc_mask = (types[post] == NeuronType.EXCITATORY.value) & alive
     if not torch.any(exc_mask):
@@ -384,13 +498,20 @@ def normalize_feedforward_weights(brain: Brain, target_sum: float) -> None:
     post_sums = sums[post]
     scalable = exc_mask & (post_sums > 1e-9)
     if torch.any(scalable):
-        weights[scalable] *= (target_sum / post_sums[scalable]).to(torch.float32)
+        if isinstance(target_sum, (int, float)):
+            # Keep scalar/Tensor division: replacing it with Tensor/Tensor
+            # changes rounding and can alter a subsequent spike trajectory.
+            selected_targets = target_sum
+        else:
+            selected_targets = targets if targets.ndim == 0 else targets[post[scalable]]
+        weights[scalable] *= (selected_targets / post_sums[scalable]).to(torch.float32)
 
     weights = torch.clamp(weights, proj.syn_min_weight[:ns], proj.syn_max_weight[:ns])
     proj.syn_weight[:ns] = weights
 
 
-def compute_norm_target(brain: Brain) -> float:
+def compute_norm_target(brain: Brain, *, per_neuron: bool = False) -> float | torch.Tensor:
+    """Fit normalization budgets from weights, without using image labels."""
     exc_idx = excitatory_cortex_indices(brain)
     proj = brain.get_projection("input", "cortex")
     ns = proj.n_synapses
@@ -398,6 +519,8 @@ def compute_norm_target(brain: Brain) -> float:
     alive = proj.syn_alive[:ns]
     weight_sums = torch.zeros(brain.regions["cortex"].n_neurons, dtype=torch.float32, device=DEVICE)
     weight_sums.index_add_(0, post[alive], proj.syn_weight[:ns][alive].to(torch.float32))
+    if per_neuron:
+        return weight_sums
     return float(weight_sums[exc_idx].mean().item())
 
 
@@ -408,23 +531,25 @@ def assign_neuron_labels(
     classes: tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     classes = CLASSES if classes is None else classes
-    exc_idx = excitatory_cortex_indices(brain)
-    per_class = np.zeros((len(classes), len(exc_idx)), dtype=np.float32)
+    responses = collect_readout_responses(brain, X)
+    return _labels_from_responses(responses, y, classes)
+
+
+def _labels_from_responses(responses, y, classes):
+    per_class = np.zeros((len(classes), len(responses.exc_indices)), dtype=np.float32)
 
     class_to_row = {cls: i for i, cls in enumerate(classes)}
-    for x, label in zip(X, y):
-        counts, _ = present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False)
+    for counts, label in zip(responses.spikes, y):
         active = np.flatnonzero(counts > 0)
         if len(active) > 0:
             top_k = min(ASSIGN_TOP_K, len(active))
             top_local = active[np.argsort(counts[active])[-top_k:]]
             per_class[class_to_row[int(label)], top_local] += 1.0
-        reset_brain_state(brain)
 
-    labels = np.full(len(exc_idx), -1, dtype=np.int64)
+    labels = np.full(len(responses.exc_indices), -1, dtype=np.int64)
     active = per_class.max(axis=0) > 0
     labels[active] = np.asarray(classes, dtype=np.int64)[np.argmax(per_class[:, active], axis=0)]
-    return exc_idx.cpu().numpy(), labels
+    return responses.exc_indices, labels
 
 
 def build_response_templates(
@@ -434,15 +559,13 @@ def build_response_templates(
     classes: tuple[int, ...] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
     classes = CLASSES if classes is None else classes
-    spike_responses = []
-    voltage_responses = []
-    for x in X:
-        counts, mean_voltage = present_sample(brain, x, ASSIGN_PRESENT_STEPS, learn=False)
-        spike_responses.append(counts.astype(np.float64))
-        voltage_responses.append(mean_voltage.astype(np.float64))
-        reset_brain_state(brain)
-    spike_arr = np.asarray(spike_responses, dtype=np.float32)
-    voltage_arr = np.asarray(voltage_responses, dtype=np.float32)
+    responses = collect_readout_responses(brain, X)
+    return _templates_from_responses(responses, y, classes)
+
+
+def _templates_from_responses(responses, y, classes):
+    spike_arr = responses.spikes.astype(np.float32)
+    voltage_arr = responses.voltages
 
     spike_templates = np.zeros((len(classes), spike_arr.shape[1]), dtype=np.float32)
     voltage_templates = np.zeros((len(classes), voltage_arr.shape[1]), dtype=np.float32)
@@ -467,14 +590,27 @@ def predict_sample(
     classes: tuple[int, ...] | None = None,
 ) -> tuple[int, np.ndarray]:
     classes = CLASSES if classes is None else classes
+    if TEST_REPEATS < 1:
+        raise ValueError("TEST_REPEATS must be positive")
     counts = np.zeros(spike_templates.shape[1], dtype=np.float32)
     voltage_sum = np.zeros(spike_templates.shape[1], dtype=np.float32)
-    for _ in range(TEST_REPEATS):
-        spike_counts, mean_voltage = present_sample(brain, x, TEST_PRESENT_STEPS, learn=False)
+    reuse = can_reuse_inference(brain)
+    for repeat in range(TEST_REPEATS):
+        if repeat == 0 or not reuse:
+            spike_counts, mean_voltage = present_inference_sample(brain, x, TEST_PRESENT_STEPS)
+        # Keep the original accumulation order, including its float32 rounding.
+        # Only the repeated simulation is redundant, not the score definition.
         counts += spike_counts
         voltage_sum += mean_voltage
-        reset_brain_state(brain)
+        if not reuse:
+            reset_brain_state(brain)
 
+    return classify_response(counts, voltage_sum, spike_templates, voltage_templates, classes)
+
+
+def classify_response(counts, voltage_sum, spike_templates, voltage_templates, classes=None):
+    """Apply the template decoder to already accumulated responses, without simulation."""
+    classes = CLASSES if classes is None else classes
     spike_query = counts / (np.linalg.norm(counts) + 1e-9)
     voltage_query = voltage_sum / (np.linalg.norm(voltage_sum) + 1e-9)
     scores = (
@@ -488,15 +624,7 @@ def predict_sample(
 
 def _inference_brain(brain: Brain) -> Brain:
     """Snapshot a fixed network for readout fitting and held-out evaluation."""
-    snapshot = copy.deepcopy(brain)
-    snapshot.freeze_structural_plasticity()
-    snapshot.freeze_plasticity()
-    snapshot.freeze_homeostatic_scaling()
-    snapshot.freeze_adaptive_thresholds()
-    snapshot.disable_reward_modulated_plasticity()
-    snapshot.disable_memory()
-    snapshot.encoder.noise_level = 0.0
-    return snapshot
+    return inference_brain(brain, independent=INDEPENDENT_INFERENCE)
 
 
 def evaluate(
@@ -552,7 +680,10 @@ def train_unsupervised(
     for epoch in range(epochs):
         order = np.random.default_rng(seed + epoch).permutation(len(X_train))
         for j, idx in enumerate(order, start=1):
-            present_sample(brain, X_train[idx], train_present_steps, learn=True)
+            present_sample(
+                brain, X_train[idx], train_present_steps, learn=True,
+                collect_responses=False,
+            )
             normalize_feedforward_weights(brain, norm_target)
             reset_brain_state(brain)
             if log_every > 0 and (j % log_every == 0 or j == len(order)):
@@ -580,6 +711,13 @@ def build_readout(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     classes = CLASSES if classes is None else classes
     readout_brain = _inference_brain(brain)
+    if can_reuse_inference(readout_brain):
+        responses = collect_readout_responses(readout_brain, X_readout)
+        exc_idx, neuron_labels = _labels_from_responses(responses, y_readout, classes)
+        spike_templates, voltage_templates = _templates_from_responses(
+            responses, y_readout, classes,
+        )
+        return exc_idx, neuron_labels, spike_templates, voltage_templates
     exc_idx, neuron_labels = assign_neuron_labels(
         readout_brain, X_readout, y_readout, classes,
     )
@@ -658,11 +796,12 @@ def main() -> None:
     print(f"\n  Eval time: {eval_time:.1f}s | Total wall time: {total_time:.0f}s")
     print("\n" + "=" * 68)
     if acc >= 0.50:
-        print("  OK: 10-class MNIST benchmark validates unsupervised STDP + readout.")
+        print("  OK: 10-class template accuracy meets the 50% check.")
     elif acc >= 0.30:
         print("  PARTIAL: above chance (10%) but not yet at target (>50%).")
     else:
         print("  FAIL: 10-class benchmark does not yet validate the protocol.")
+    print("  Accuracy alone does not establish an STDP gain; use matched learning controls.")
     print("=" * 68)
 
 

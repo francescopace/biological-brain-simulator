@@ -16,7 +16,9 @@ import enum
 
 import torch
 
+from . import synapse as synaptic_state
 from .device import DEVICE
+from .integration import DEFAULT_MAX_STEP, integrate, validate_integration
 from .neuron import (
     EXCITATORY_RATIO,
     PATTERN_PARAMS,
@@ -24,6 +26,7 @@ from .neuron import (
     NeuronType,
 )
 from .synapse import NT_PROPERTIES, NeurotransmitterType
+from .synaptic_events import SynapseEventIndex
 
 MAX_DELAY_STEPS = 20
 
@@ -89,12 +92,19 @@ class Region:
         region_type: RegionType,
         max_neurons: int = 1000,
         dt: float = 1.0,
+        integration_method: str = "heun",
+        integration_max_step: float = DEFAULT_MAX_STEP,
     ):
+        validate_integration(dt, integration_method, integration_max_step)
         self.name = name
         self.region_type = region_type
         self.max_neurons = max_neurons
         self.dt = dt
+        self.integration_method = integration_method
+        self.integration_max_step = integration_max_step
         self.plasticity_enabled = True
+        self._pre_events = SynapseEventIndex()
+        self._post_events = SynapseEventIndex()
         self._rng = torch.Generator(device=DEVICE)
 
         N = max_neurons
@@ -431,7 +441,7 @@ class Region:
 
     def step(self, time: float, step_count: int) -> torch.Tensor:
         """
-        Advance all neurons by one timestep (vectorized, branchless).
+        Advance all neurons by one external timestep.
         Returns array of indices of neurons that fired.
         """
         n = self.n_neurons
@@ -444,34 +454,23 @@ class Region:
         _step = torch.tensor(step_count, dtype=torch.int64, device=DEVICE)
 
         # 1. Synapse housekeeping (recovery, facilitation decay)
-        s = slice(0, ns)
-        self.syn_resource[s] = torch.clamp(self.syn_resource[s] + _RECOVERY_RATE, max=1.0)
-        self.syn_facilitation[s] *= 0.98
-        self.syn_age[s] += 1
-        self.syn_recent[s] *= _TRANSMISSION_DECAY
+        if ns:
+            synaptic_state.advance_synapse_state(self, ns, _RECOVERY_RATE, _TRANSMISSION_DECAY)
 
         # 2. Read delayed spikes from ring buffer
         slot = _step % MAX_DELAY_STEPS
         self.current[:n] += self.spike_buffer[slot, :n]
         self.spike_buffer[slot, :n] = 0.0
 
-        # 3. Izhikevich dynamics (vectorized Euler with substeps)
-        v = self.v[:n].clone()
-        u = self.u[:n].clone()
+        # 3. Integrate within this network step; synaptic clocks are unchanged.
         I = self.current[:n] - self.theta[:n]
-        a = self.a[:n]
-        b = self.b[:n]
-
-        substeps = max(1, int(dt / 0.5))
-        sub_dt = dt / substeps
-        for _ in range(substeps):
-            dv = (0.04 * v * v + 5.0 * v + 140.0 - u + I) * sub_dt
-            du = a * (b * v - u) * sub_dt
-            v += dv
-            u += du
+        v, u, crossed = integrate(
+            self.v[:n], self.u[:n], I, self.a[:n], self.b[:n], dt,
+            method=self.integration_method, max_step=self.integration_max_step,
+        )
 
         # 4. Spike detection
-        fired = (v >= 30.0) & self.neuron_alive[:n]
+        fired = crossed & self.neuron_alive[:n]
 
         # 5. Reset fired neurons
         c = self.c[:n]
@@ -498,8 +497,13 @@ class Region:
         self.current[:n] = 0.0
 
         # 10. Propagate spikes through internal synapses (sparse gather/scatter)
-        pre_fired = fired[self.syn_pre[:ns]] & self.syn_alive[:ns]
-        active_syns = torch.where(pre_fired)[0]
+        if ns == 0:
+            return fired_idx
+        active_syns = self._pre_events.select(fired, self.syn_pre[:ns], self.syn_alive[:ns])
+        # Select before returning: even a quiet region must validate endpoints.
+        # Housekeeping and delayed delivery have already advanced normally.
+        if active_syns.numel() == 0:
+            return fired_idx
 
         res = self.syn_resource[active_syns]
         fac = self.syn_facilitation[active_syns]

@@ -19,11 +19,31 @@ Unlike the Iris benchmark, this task is not supervised. The agent
 chooses an action from motor spikes, executes it in the environment,
 and then receives reward or punishment depending on whether that move
 reduced the distance to the goal.
+
+Evaluation freezes the network and resets transient state between episodes,
+while retaining neural history within each path. Starts are fixed before any
+rollout so a policy's path length cannot change the next starting position.
+Repeated deterministic starts may reuse complete episode metrics. --output
+NEW_DIR records starts, results and immutable checkpoints; CLI resume is not
+implemented. The final exhaustive check covers all 24 non-goal cells.
+
+Success is reported separately for paths driven entirely by spikes and paths
+that used voltage fallback at least once. --selection-metric can select either
+total or spike-only success (score: 100 * rate - mean steps). The default is
+spike-only success. The calibrated readout uses transmission gain 512 and no
+tonic motor current. The former baseline remains available with gain 1, motor
+baseline current 4 and selection metric success_rate.
+New recorded runs include a source_snapshot directory alongside source hashes.
 """
 
 from __future__ import annotations
 
 import copy
+import argparse
+import hashlib
+import math
+import operator
+import os
 import sys
 import time
 from collections import deque
@@ -36,7 +56,9 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from examples._utils import quiet_steps
+from examples._utils import (quiet_steps, inference_brain, reset_independent_state,
+                             can_reuse_independent_inference)
+from examples.training_checkpoint import atomic_json, save_training_checkpoint
 from src.brain import Brain
 from src.device import DEVICE
 from src.neuron import FiringPattern, NeuronType
@@ -66,7 +88,7 @@ ACTION_DELTAS = np.array(
 STATE_PRESENT_STEPS = 30
 ACTION_MARK_STEPS = 8
 ACTION_MARK_CURRENT = 16.0
-MOTOR_BASELINE_CURRENT = 4.0
+MOTOR_BASELINE_CURRENT = 0.0
 POST_REWARD_STEPS = 10
 INTER_STEP_REST = 25
 
@@ -92,6 +114,8 @@ ENCODER_NOISE = 0.05
 
 PROJECTION_DENSITY_INPUT_MOTOR = 1.00
 READOUT_INIT_WEIGHT = 0.05
+READOUT_TRANSMISSION_GAIN = 512.0
+SELECTION_METRIC = "spike_only_success_rate"
 
 STDP_SCALE = 1.0
 TAU_ELIGIBILITY = 200.0
@@ -138,7 +162,10 @@ class GridWorld:
 
 # --- Brain construction ----------------------------------------------------
 
-def build_brain(seed: int = SEED) -> Brain:
+def build_brain(seed: int = SEED, *, transmission_gain: float | None = None) -> Brain:
+    transmission_gain = READOUT_TRANSMISSION_GAIN if transmission_gain is None else float(transmission_gain)
+    if not math.isfinite(transmission_gain) or transmission_gain < 0:
+        raise ValueError("Transmission gain must be finite and nonnegative")
     brain = Brain(dt=1.0, seed=seed)
 
     input_region = brain.add_region(
@@ -171,6 +198,10 @@ def build_brain(seed: int = SEED) -> Brain:
         ns = proj.n_synapses
         if proj.target_name == "motor":
             proj.syn_weight[:ns] = READOUT_INIT_WEIGHT
+            if transmission_gain != 1.0:
+                # Scale transmitted current, not plasticity amplitudes or
+                # weight bounds. Gain one retains the original substrate.
+                proj.syn_modulation[:ns].mul_(transmission_gain)
 
     # Keep plasticity focused on state -> action pathways.
     brain.freeze_plasticity()
@@ -198,8 +229,8 @@ def build_brain(seed: int = SEED) -> Brain:
 # --- Helpers ---------------------------------------------------------------
 
 
-def reset_between_steps(brain: Brain, n_steps: int = INTER_STEP_REST) -> None:
-    quiet_steps(brain, n_steps)
+def reset_between_steps(brain: Brain, n_steps: int | None = None) -> None:
+    quiet_steps(brain, INTER_STEP_REST if n_steps is None else n_steps)
     brain.reset_traces()
 
 
@@ -216,14 +247,19 @@ def position_encode(
 def present_state(
     brain: Brain,
     x: np.ndarray,
-    n_steps: int = STATE_PRESENT_STEPS,
+    n_steps: int | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
+    n_steps = STATE_PRESENT_STEPS if n_steps is None else n_steps
+    if n_steps < 1:
+        raise ValueError("State presentation steps must be positive")
+    stimulus = torch.as_tensor(x, dtype=torch.float32, device=DEVICE)
+    motor_indices = torch.arange(N_MOTOR, dtype=torch.int64, device=DEVICE)
     motor = brain.regions["motor"]
     before = motor.total_spikes[:N_MOTOR].clone()
     voltage_sum = torch.zeros(N_MOTOR, dtype=torch.float32, device=DEVICE)
     for _ in range(n_steps):
-        brain.stimulate("input", x)
-        brain.inject_current("motor", list(range(N_MOTOR)), MOTOR_BASELINE_CURRENT)
+        brain.stimulate("input", stimulus)
+        brain.inject_current("motor", motor_indices, MOTOR_BASELINE_CURRENT)
         brain.step()
         voltage_sum += motor.v[:N_MOTOR]
     counts = (motor.total_spikes[:N_MOTOR] - before).cpu().numpy()
@@ -234,10 +270,13 @@ def present_state(
 def mark_executed_action(brain: Brain, x: np.ndarray, action: int) -> None:
     # Exploration needs an explicit state-action trace; otherwise a randomly
     # chosen action may leave almost no eligibility on the executed pathway.
+    stimulus = torch.as_tensor(x, dtype=torch.float32, device=DEVICE)
+    motor_indices = torch.arange(N_MOTOR, dtype=torch.int64, device=DEVICE)
+    action_indices = torch.tensor([action], dtype=torch.int64, device=DEVICE)
     for _ in range(ACTION_MARK_STEPS):
-        brain.stimulate("input", x)
-        brain.inject_current("motor", np.arange(N_MOTOR), MOTOR_BASELINE_CURRENT)
-        brain.inject_current("motor", [action], ACTION_MARK_CURRENT)
+        brain.stimulate("input", stimulus)
+        brain.inject_current("motor", motor_indices, MOTOR_BASELINE_CURRENT)
+        brain.inject_current("motor", action_indices, ACTION_MARK_CURRENT)
         brain.step()
 
 
@@ -358,8 +397,9 @@ def run_episode(
     learn: bool = True,
     epsilon_override: float | None = None,
     reward_baseline: np.ndarray | None = None,
+    *, start_pos: tuple[int, int] | None = None,
 ) -> dict[str, float | int | bool]:
-    pos = env.reset(rng)
+    pos = env.reset(rng) if start_pos is None else _validate_start(env, start_pos)
     epsilon = epsilon_for_episode(episode_idx) if epsilon_override is None else epsilon_override
 
     explore_steps = 0
@@ -379,7 +419,7 @@ def run_episode(
         )
         if source == "explore":
             explore_steps += 1
-        elif source == "voltage":
+        if counts.max() == 0:
             silent_steps += 1
 
         if learn:
@@ -453,28 +493,80 @@ def _attach_reinforcement_summary(
     return result
 
 
+def _validate_start(env, position):
+    try:
+        pos = tuple(operator.index(coordinate) for coordinate in position)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Start position must contain two integer coordinates") from error
+    if len(pos) != 2 or pos == env.goal or any(not 0 <= value < env.size for value in pos):
+        raise ValueError("Start position must be inside the grid and outside the goal")
+    return pos
+
+
+def evaluation_starts(env, rng, n_episodes=None, start_positions=None):
+    if n_episodes is None:
+        n_episodes = EVAL_EPISODES if start_positions is None else len(start_positions)
+    n_episodes = operator.index(n_episodes)
+    if n_episodes < 1:
+        raise ValueError("Evaluation episode count must be positive")
+    if start_positions is None:
+        return [env.reset(rng) for _ in range(n_episodes)]
+    if len(start_positions) != n_episodes:
+        raise ValueError("Start positions must match the requested episode count")
+    return [_validate_start(env, position) for position in start_positions]
+
+
 def evaluate_policy(
     brain: Brain,
     env: GridWorld,
     rng: np.random.Generator,
-    n_episodes: int = EVAL_EPISODES,
+    n_episodes: int | None = None,
+    *, start_positions=None, independent: bool = True, fast: bool = True,
 ) -> dict[str, float]:
-    eval_brain = copy.deepcopy(brain)
-    eval_brain.reset_traces()
-    eval_brain.freeze_adaptive_thresholds()
-    eval_brain.encoder.noise_level = 0.0
+    if independent:
+        eval_brain = inference_brain(brain)
+        positions = evaluation_starts(env, rng, n_episodes, start_positions)
+        # Draw every start before the rollout. Its length must not alter the
+        # next initial position, nor should memoization advance the caller RNG.
+        rollout_rng = copy.deepcopy(rng)
+    else:
+        eval_brain = copy.deepcopy(brain)
+        eval_brain.reset_traces()
+        eval_brain.freeze_adaptive_thresholds()
+        eval_brain.encoder.noise_level = 0.0
+        if start_positions is not None:
+            positions = evaluation_starts(env, rng, n_episodes, start_positions)
+        else:
+            n_episodes = EVAL_EPISODES if n_episodes is None else operator.index(n_episodes)
+            if n_episodes < 1:
+                raise ValueError("Evaluation episode count must be positive")
+            positions = [None] * n_episodes
+        rollout_rng = rng
+    n_episodes = len(positions)
+    reuse = independent and fast and can_reuse_independent_inference(eval_brain)
+    cached = {}
 
     successes = 0
+    spike_only_successes = 0
     steps = []
     final_distances = []
     success_flags = []
     silent_steps = 0
     motor_spikes = 0
 
-    for _ in range(n_episodes):
-        metrics = run_episode(eval_brain, env, rng, episode_idx=EPISODES, learn=False, epsilon_override=0.0)
+    for position in positions:
+        if reuse and position in cached:
+            metrics = cached[position]
+        else:
+            if independent:
+                reset_independent_state(eval_brain)
+            metrics = run_episode(eval_brain, env, rollout_rng, episode_idx=EPISODES,
+                                  learn=False, epsilon_override=0.0, start_pos=position)
+            if reuse:
+                cached[position] = metrics
         success = bool(metrics["success"])
         successes += int(success)
+        spike_only_successes += int(success and int(metrics["silent_steps"]) == 0)
         steps.append(int(metrics["steps"]))
         final_distances.append(int(metrics["final_distance"]))
         success_flags.append(success)
@@ -486,10 +578,12 @@ def evaluate_policy(
     success_steps = steps_arr[np.asarray(success_flags, dtype=bool)]
     return {
         "success_rate": successes / n_episodes,
+        "spike_only_success_rate": spike_only_successes / n_episodes,
+        "fallback_assisted_success_rate": (successes - spike_only_successes) / n_episodes,
         "mean_steps": float(np.mean(steps_arr)),
         "mean_success_steps": float(np.mean(success_steps)) if len(success_steps) else float("inf"),
         "mean_final_distance": float(np.mean(dist_arr)),
-        "silent_step_rate": silent_steps / (n_episodes * MAX_STEPS_PER_EPISODE),
+        "silent_step_rate": silent_steps / sum(steps),
         "mean_motor_spikes": motor_spikes / n_episodes,
     }
 
@@ -497,14 +591,16 @@ def evaluate_policy(
 def random_policy_baseline(
     env: GridWorld,
     rng: np.random.Generator,
-    n_episodes: int = EVAL_EPISODES,
+    n_episodes: int | None = None,
+    *, start_positions=None,
 ) -> dict[str, float]:
     successes = 0
     steps = []
     final_distances = []
 
-    for _ in range(n_episodes):
-        pos = env.reset(rng)
+    positions = evaluation_starts(env, rng, n_episodes, start_positions)
+    n_episodes = len(positions)
+    for pos in positions:
         for step_idx in range(1, MAX_STEPS_PER_EPISODE + 1):
             action = int(rng.integers(0, N_MOTOR))
             pos, _, reached_goal, _, _ = env.step(pos, action)
@@ -527,16 +623,14 @@ def random_policy_baseline(
 
 
 def policy_action_margin(brain: Brain, env: GridWorld) -> dict[str, float]:
-    """Measure how decisively the spiking policy separates its top actions."""
-    eval_brain = copy.deepcopy(brain)
-    eval_brain.reset_traces()
-    eval_brain.freeze_adaptive_thresholds()
-    eval_brain.encoder.noise_level = 0.0
+    """Measure action separation when each state starts with empty transients."""
+    eval_brain = inference_brain(brain)
     margins = []
     for row in range(env.size):
         for col in range(env.size):
             if (row, col) == env.goal:
                 continue
+            reset_independent_state(eval_brain)
             counts, voltage = present_state(eval_brain, position_encode((row, col)))
             scores = counts.astype(np.float64) if counts.max() > 0 else voltage
             ordered = np.sort(scores)
@@ -550,14 +644,74 @@ def policy_action_margin(brain: Brain, env: GridWorld) -> dict[str, float]:
 
 # --- Main ------------------------------------------------------------------
 
-def main() -> None:
+def json_safe(value):
+    """Represent unavailable statistics as null, never nonstandard JSON Infinity."""
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    if isinstance(value, dict):
+        return {key: json_safe(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_safe(item) for item in value]
+    return value
+
+
+def main(*, output: Path | None = None):
+    if SELECTION_METRIC not in ("success_rate", "spike_only_success_rate"):
+        raise ValueError("Unknown checkpoint selection metric")
+    if any(operator.index(value) < 1 for value in (
+            EPISODES, CHECKPOINT_INTERVAL, EVAL_EPISODES, CHECKPOINT_EVAL_EPISODES)):
+        raise ValueError("Episode and checkpoint counts must be positive")
+    if not math.isfinite(MOTOR_BASELINE_CURRENT) or MOTOR_BASELINE_CURRENT < 0:
+        raise ValueError("Motor baseline current must be finite and nonnegative")
+    if not math.isfinite(READOUT_TRANSMISSION_GAIN) or READOUT_TRANSMISSION_GAIN < 0:
+        raise ValueError("Transmission gain must be finite and nonnegative")
+    root = Path(__file__).resolve().parent.parent
+    sources = [Path(__file__), root / "examples/_utils.py", root / "examples/training_checkpoint.py",
+               *sorted((root / "src").glob("*.py"))]
+    source_bytes = {str(p.relative_to(root)): p.read_bytes() for p in sources}
+    hashes = {name: hashlib.sha256(content).hexdigest() for name, content in source_bytes.items()}
+    config = {name: value for name, value in globals().items()
+              if name.isupper() and not name.startswith("_") and isinstance(value, (int, float, str, bool))}
+    payload = {"complete": False, "pid": os.getpid(), "started_at": time.time(),
+               "source_sha256": hashes, "config": config, "torch": torch.__version__,
+               "numpy": np.__version__, "episodes": [], "checkpoints": [],
+               "inference": "independent frozen episodes; within-episode neural history retained; duplicate starts reused"}
+    if output is not None:
+        output = Path(output)
+        output.mkdir(parents=True, exist_ok=False)
+        for name, content in source_bytes.items():
+            destination = output / "source_snapshot" / name
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(content)
+
+    def publish():
+        if output is not None:
+            atomic_json(output / "summary.json", json_safe(payload))
+
+    def save_checkpoint(label, model, progress):
+        if output is not None:
+            save_training_checkpoint(model, output / "checkpoints" / label,
+                json_safe({"protocol": {"config": config, "source_sha256": hashes,
+                                        "evaluation": payload["evaluation"]}, **progress}))
+
+    publish()
     print("=" * 68)
     print("  GRID NAVIGATION BENCHMARK - Spiking Brain with R-STDP")
     print("  (Minimal teacher-free state-action baseline)")
+    print(f"  Transmission gain={READOUT_TRANSMISSION_GAIN:g}, motor baseline={MOTOR_BASELINE_CURRENT:g}, "
+          f"selection={SELECTION_METRIC}")
     print("=" * 68)
 
     env = GridWorld()
     rng = np.random.default_rng(SEED)
+    final_starts = evaluation_starts(env, np.random.default_rng(SEED + 5000), EVAL_EPISODES)
+    selection_starts = evaluation_starts(env, np.random.default_rng(SEED + 2000), CHECKPOINT_EVAL_EPISODES)
+    payload["evaluation"] = {"size": env.size, "goal": list(env.goal),
+                             "action_deltas": ACTION_DELTAS.tolist(),
+                             "selection_starts": selection_starts, "final_starts": final_starts}
+    publish()
 
     print("\n" + "-" * 68)
     print("  Building synthetic brain")
@@ -565,8 +719,11 @@ def main() -> None:
     brain = build_brain(seed=SEED)
     print(brain.summary())
 
-    baseline = random_policy_baseline(env, np.random.default_rng(SEED + 1))
-    untrained = evaluate_policy(brain, env, np.random.default_rng(SEED + 2))
+    save_checkpoint("initial", brain, {"completed_episodes": 0})
+    baseline = random_policy_baseline(env, np.random.default_rng(SEED + 1), start_positions=final_starts)
+    untrained = evaluate_policy(brain, env, np.random.default_rng(SEED + 2), start_positions=final_starts)
+    payload.update(random_baseline=baseline, initial_policy=untrained)
+    publish()
 
     print("\n  Random policy baseline:")
     print(
@@ -578,6 +735,7 @@ def main() -> None:
     print("\n  Untrained brain policy:")
     print(
         f"    success={untrained['success_rate']:.1%}  "
+        f"spike_only={untrained['spike_only_success_rate']:.1%}  "
         f"mean_steps={untrained['mean_steps']:.2f}  "
         f"mean_success_steps={untrained['mean_success_steps']:.2f}  "
         f"mean_final_distance={untrained['mean_final_distance']:.2f}  "
@@ -610,7 +768,8 @@ def main() -> None:
         )
         rolling_steps.append(int(metrics["steps"]))
         rolling_success.append(int(metrics["success"]))
-        rolling_silence.append(float(metrics["silent_steps"]) / MAX_STEPS_PER_EPISODE)
+        rolling_silence.append(float(metrics["silent_steps"]) / int(metrics["steps"]))
+        payload["episodes"].append({"episode": episode, **metrics})
 
         elapsed = time.time() - t0
         eps = epsilon_for_episode(episode)
@@ -632,36 +791,49 @@ def main() -> None:
             f"t={elapsed:5.1f}s"
         )
 
-        if episode % CHECKPOINT_INTERVAL == 0:
+        if episode % CHECKPOINT_INTERVAL == 0 or episode == EPISODES:
             checkpoint = evaluate_policy(
                 brain,
                 env,
                 np.random.default_rng(SEED + 2000),
                 n_episodes=CHECKPOINT_EVAL_EPISODES,
+                start_positions=selection_starts,
             )
             margin = policy_action_margin(brain, env)
             checkpoint["episode"] = float(episode)
             checkpoint["mean_action_margin"] = margin["mean"]
             checkpoint["minimum_action_margin"] = margin["minimum"]
             checkpoint_history.append(checkpoint)
-            score = checkpoint["success_rate"] * 100.0 - checkpoint["mean_steps"]
+            score = checkpoint[SELECTION_METRIC] * 100.0 - checkpoint["mean_steps"]
             if score > best_score:
                 best_score = score
                 best_episode = episode
                 best_brain = copy.deepcopy(brain)
+            payload.update(checkpoints=checkpoint_history, best_episode=best_episode, best_score=best_score)
+            save_checkpoint(f"episode_{episode:06d}", brain,
+                {"completed_episodes": episode, "rollout_rng_state": rng.bit_generator.state,
+                 "reward_baseline": reward_baseline.tolist(), "best_episode": best_episode,
+                 "checkpoint_history": checkpoint_history, "rolling_steps": list(rolling_steps),
+                 "rolling_success": list(rolling_success), "rolling_silence": list(rolling_silence)})
             print(
                 "    Deterministic checkpoint: "
                 f"success={checkpoint['success_rate']:.1%}  "
+                f"spike_only={checkpoint['spike_only_success_rate']:.1%}  "
                 f"mean_steps={checkpoint['mean_steps']:.2f}  "
                 f"margin_mean={margin['mean']:.3f}  "
                 f"margin_min={margin['minimum']:.3f}"
             )
+        publish()
 
     if best_brain is not None:
         brain = best_brain
         brain.reset_traces()
 
-    final_eval = evaluate_policy(brain, env, np.random.default_rng(SEED + 5000))
+    final_eval = evaluate_policy(brain, env, np.random.default_rng(SEED + 5000), start_positions=final_starts)
+    all_starts = [(row, col) for row in range(env.size) for col in range(env.size) if (row, col) != env.goal]
+    exhaustive = evaluate_policy(brain, env, np.random.default_rng(SEED + 6000), start_positions=all_starts)
+    payload.update(final_policy=final_eval, exhaustive_policy=exhaustive, exhaustive_starts=all_starts)
+    save_checkpoint("selected", brain, {"completed_episodes": best_episode, "selected_by": "checkpoint_starts"})
 
     print("\n" + "-" * 68)
     print("  Final Results")
@@ -669,6 +841,8 @@ def main() -> None:
     print(
         f"  Best checkpoint episode:   {best_episode}\n"
         f"  Policy success rate:       {final_eval['success_rate']:.1%}\n"
+        f"  Spike-only success rate:   {final_eval['spike_only_success_rate']:.1%}\n"
+        f"  Fallback-assisted success: {final_eval['fallback_assisted_success_rate']:.1%}\n"
         f"  Mean steps (all episodes): {final_eval['mean_steps']:.2f}\n"
         f"  Mean steps (successes):    {final_eval['mean_success_steps']:.2f}\n"
         f"  Mean final distance:       {final_eval['mean_final_distance']:.2f}\n"
@@ -690,6 +864,7 @@ def main() -> None:
             print(
                 f"    ep {int(checkpoint['episode']):3d}: "
                 f"success={checkpoint['success_rate']:.1%}  "
+                f"spike_only={checkpoint['spike_only_success_rate']:.1%}  "
                 f"mean_steps={checkpoint['mean_steps']:.2f}  "
                 f"margin={checkpoint['mean_action_margin']:.3f}"
             )
@@ -700,14 +875,33 @@ def main() -> None:
     print(brain.summary())
 
     print("\n" + "=" * 68)
-    if final_eval["success_rate"] >= 0.80 and final_eval["mean_success_steps"] < 10.0:
-        print("  OK: the brain learned a usable navigation policy.")
+    if final_eval["spike_only_success_rate"] >= 0.80 and final_eval["mean_success_steps"] < 10.0:
+        print("  OK: the brain learned a usable spike-driven navigation policy.")
     elif final_eval["success_rate"] >= 0.50:
         print("  PARTIAL: the agent often reaches the goal but is still inefficient.")
     else:
         print("  FAIL: no robust navigation policy emerged with this configuration.")
     print("=" * 68)
+    if hashes != {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() for p in sources}:
+        raise RuntimeError("Benchmark sources changed during the run")
+    payload.update(complete=True, finished_at=time.time(), source_unchanged=True)
+    publish()
+    return json_safe(payload)
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, help="New result/checkpoint directory; no CLI resume support")
+    parser.add_argument("--transmission-gain", type=float, default=READOUT_TRANSMISSION_GAIN,
+                        help="Experimental input-to-motor current gain; weight bounds and STDP amplitudes stay unchanged")
+    parser.add_argument("--motor-baseline-current", type=float, default=MOTOR_BASELINE_CURRENT)
+    parser.add_argument("--selection-metric", choices=("success_rate", "spike_only_success_rate"), default=SELECTION_METRIC)
+    parser.add_argument("--episodes", type=int, default=EPISODES)
+    parser.add_argument("--seed", type=int, default=SEED)
+    args = parser.parse_args()
+    READOUT_TRANSMISSION_GAIN = args.transmission_gain
+    MOTOR_BASELINE_CURRENT = args.motor_baseline_current
+    SELECTION_METRIC = args.selection_metric
+    EPISODES = args.episodes
+    SEED = args.seed
+    main(output=args.output)

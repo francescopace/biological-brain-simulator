@@ -34,8 +34,8 @@ from examples.mnist_benchmark import (
     present_sample,
     reset_brain_state,
     normalize_feedforward_weights,
-    build_response_templates,
-    predict_sample,
+    build_readout,
+    evaluate,
     _balanced_subset,
 )
 from src.device import DEVICE
@@ -108,14 +108,13 @@ def snn_fewshot(X_train, y_train, X_test, y_test, classes):
         normalize_feedforward_weights(brain, norm_target)
         reset_brain_state(brain, REST_STEPS)
 
-    spike_templates, voltage_templates = build_response_templates(brain, X_train, y_train)
-
-    correct = 0
-    for x, label in zip(X_test, y_test):
-        pred, _ = predict_sample(brain, x, spike_templates, voltage_templates, classes)
-        if pred == int(label):
-            correct += 1
-    return correct / len(y_test)
+    _, _, spike_templates, voltage_templates = build_readout(
+        brain, X_train, y_train, classes,
+    )
+    accuracy, _ = evaluate(
+        brain, X_test, y_test, spike_templates, voltage_templates, classes,
+    )
+    return accuracy
 
 
 # --- Main -------------------------------------------------------------------

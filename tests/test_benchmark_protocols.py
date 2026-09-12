@@ -11,6 +11,7 @@ import torch
 
 import examples.degradation_benchmark as degradation
 import examples.forgetting_benchmark as forgetting
+import examples.fewshot_benchmark as fewshot
 import examples.mnist_benchmark as mnist
 import examples.mnist_diagnosis as diagnosis
 from src.brain import Brain
@@ -197,3 +198,71 @@ def test_forgetting_mlp_uses_same_task_candidates_as_snn():
         W1=W1, b1=b1, W2=W2, b2=b2, epochs=0,
     )
     assert accuracy == 1.0
+
+
+def test_standard_inference_preserves_source_and_is_order_invariant(monkeypatch):
+    brain = tiny_brain()
+    brain.enable_oscillations()  # Only inference copies disable them.
+    for r in brain.regions.values():
+        r.theta[:r.n_neurons] = 0.3
+    original = copy.deepcopy(brain)
+    monkeypatch.setattr(mnist, "ASSIGN_PRESENT_STEPS", 12)
+    monkeypatch.setattr(mnist, "TEST_PRESENT_STEPS", 12)
+    monkeypatch.setattr(mnist, "TEST_REPEATS", 2)
+    monkeypatch.setattr(mnist, "REST_STEPS", 1)
+    X = np.array([[0., 1.], [1., 0.], [.5, .5], [1., 1.]])
+    y = np.array([0, 1, 0, 1])
+    a = mnist.build_readout(brain, X, y, (0, 1))
+    b = mnist.build_readout(brain, X[::-1], y[::-1], (0, 1))
+    for left, right in zip(a, b):
+        np.testing.assert_allclose(left, right, rtol=1e-6, atol=1e-6)
+    accuracy, preds = mnist.evaluate(brain, X, y, a[2], a[3], (0, 1))
+    backwards, rev = mnist.evaluate(brain, X[::-1], y[::-1], a[2], a[3], (0, 1))
+    assert accuracy == backwards
+    np.testing.assert_array_equal(preds, rev[::-1])
+    assert brain.time == original.time
+    assert brain.oscillators.enabled
+    for name, r in brain.regions.items():
+        for attr in ("v", "u", "theta", "spike_buffer", "syn_weight", "syn_resource"):
+            assert torch.equal(getattr(r, attr), getattr(original.regions[name], attr))
+
+
+def test_each_inference_repeat_resets_transients_but_training_does_not(monkeypatch):
+    brain = mnist._inference_brain(tiny_brain())
+    brain.regions["cortex"].theta[:3] = 0.7
+    source_present = mnist.present_sample
+    seen = []
+
+    def inspect_present(model, x, n_steps, learn=False):
+        for region in model.regions.values():
+            n = region.n_neurons
+            assert torch.all(region.v[:n] == -65.0)
+            assert not torch.any(region.spike_buffer)
+        assert torch.all(model.regions["cortex"].theta[:3] == 0.7)
+        seen.append(1)
+        return source_present(model, x, n_steps, learn)
+
+    monkeypatch.setattr(mnist, "present_sample", inspect_present)
+    for _ in range(2):
+        mnist.present_inference_sample(brain, np.ones(2), 5)
+    assert len(seen) == 2
+    monkeypatch.setattr(mnist, "present_sample", source_present)
+    monkeypatch.setattr(mnist, "reset_inference_state", lambda *args: pytest.fail("training reset"))
+    mnist.present_sample(brain, np.ones(2), 2, learn=True)
+
+
+def test_fewshot_uses_shared_frozen_readout_and_evaluation(monkeypatch):
+    model = object()
+    monkeypatch.setattr(fewshot, "build_brain", lambda **kwargs: model)
+    monkeypatch.setattr(fewshot, "compute_norm_target", lambda *args: 1.0)
+    monkeypatch.setattr(fewshot, "present_sample", lambda *args, **kwargs: None)
+    monkeypatch.setattr(fewshot, "normalize_feedforward_weights", lambda *args: None)
+    monkeypatch.setattr(fewshot, "reset_brain_state", lambda *args: None)
+    readout = Mock(return_value=(None, None, "spikes", "voltages"))
+    evaluation = Mock(return_value=(0.75, None))
+    monkeypatch.setattr(fewshot, "build_readout", readout)
+    monkeypatch.setattr(fewshot, "evaluate", evaluation)
+    X, y = np.ones((2, 2)), np.array([0, 1])
+    assert fewshot.snn_fewshot(X, y, X, y, (0, 1)) == 0.75
+    readout.assert_called_once_with(model, X, y, (0, 1))
+    evaluation.assert_called_once_with(model, X, y, "spikes", "voltages", (0, 1))

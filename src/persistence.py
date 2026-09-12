@@ -36,8 +36,8 @@ from .oscillator import FrequencyBand
 from .region import MAX_DELAY_STEPS, Region, RegionType, _SYN_SPECS
 from .stimulus import EncodingStrategy
 
-_VERSION = 5
-_SUPPORTED_VERSIONS = {4, 5}
+_VERSION = 6
+_SUPPORTED_VERSIONS = {4, 5, 6}
 _MORPHOLOGY_TO_CODE = {
     MorphologyTemplate.POINT: 0,
     MorphologyTemplate.PYRAMIDAL: 1,
@@ -99,6 +99,8 @@ def _save_brain_to_directory(brain: Brain, root: Path) -> None:
         "time": brain.time,
         "step_count": brain.step_count,
         "dt": brain.dt,
+        "integration_method": brain.integration_method,
+        "integration_max_step": brain.integration_max_step,
         "seed": brain.seed,
         "region_seed_counter": brain._region_seed_counter,
         "stats_interval": brain._stats_interval,
@@ -246,7 +248,11 @@ def load_brain(path: str | Path) -> Brain:
     if version not in _SUPPORTED_VERSIONS:
         raise ValueError(f"Unsupported save version: {version}")
 
-    brain = Brain(dt=meta["dt"], seed=meta.get("seed"))
+    brain = Brain(dt=meta["dt"], seed=meta.get("seed"),
+                  integration_method=(meta["integration_method"] if version >= 6
+                                      else meta.get("integration_method", "legacy_euler")),
+                  integration_max_step=(meta["integration_max_step"] if version >= 6
+                                        else meta.get("integration_max_step", 0.1)))
     brain.time = meta["time"]
     brain.step_count = meta["step_count"]
     brain._stats_interval = meta["stats_interval"]
@@ -264,7 +270,8 @@ def load_brain(path: str | Path) -> Brain:
         ]
     for item in region_info:
         name = item["name"]
-        region = _load_region(root / "regions" / item["file"], brain.dt, name=name)
+        region = _load_region(root / "regions" / item["file"], brain.dt, name=name,
+                              require_integration=version >= 6)
         brain.regions[name] = region
         brain.oscillators.add_region(name, region.region_type)
     brain._region_seed_counter = meta.get(
@@ -397,6 +404,8 @@ def _save_region(path: Path, region: Region) -> None:
         "n_neurons": n,
         "n_synapses": ns,
         "plasticity_enabled": region.plasticity_enabled,
+        "integration_method": region.integration_method,
+        "integration_max_step": region.integration_max_step,
         # Neuron arrays
         "v": region.v[:n],
         "u": region.u[:n],
@@ -428,7 +437,8 @@ def _save_region(path: Path, region: Region) -> None:
     torch.save(state, path)
 
 
-def _load_region(path: Path, dt: float, name: str | None = None) -> Region:
+def _load_region(path: Path, dt: float, name: str | None = None, *,
+                 require_integration: bool = False) -> Region:
     """Load region from torch checkpoint."""
     data = torch.load(path, map_location=DEVICE, weights_only=True)
 
@@ -442,6 +452,10 @@ def _load_region(path: Path, dt: float, name: str | None = None) -> Region:
         region_type=region_type,
         max_neurons=max_neurons,
         dt=dt,
+        integration_method=(data["integration_method"] if require_integration
+                            else data.get("integration_method", "legacy_euler")),
+        integration_max_step=(data["integration_max_step"] if require_integration
+                              else data.get("integration_max_step", 0.1)),
     )
 
     region.n_neurons = n

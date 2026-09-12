@@ -40,7 +40,7 @@ Morphology templates assign synapses to dendritic compartments and apply a stati
 
 This is an experimental research codebase, not a polished general-purpose framework. It supports controlled benchmarks and experiments with biologically inspired learning mechanisms. The benchmark scripts are the canonical reference for exact experimental settings.
 
-The repository contains supervised R-STDP, reward-modulated navigation, and unsupervised MNIST protocols. Historical results are documented, but the benchmarks must be rerun after the protocol and dynamics corrections described in `BENCHMARKS.md` before they are treated as current validated evidence.
+The repository contains supervised R-STDP, reward-modulated navigation, and unsupervised MNIST protocols. Current validation results and their limits are documented in `BENCHMARKS.md`. Historical scores should not be compared directly with runs made after the protocol and dynamics corrections.
 
 ## Quickstart
 
@@ -64,6 +64,7 @@ python examples/mnist_diagnosis.py     # short MNIST diagnosis sweeps
 src/
 ├── __init__.py      # Public API re-exports
 ├── neuron.py        # Neuron types and Izhikevich parameters
+├── integration.py   # Stable Heun dynamics, CPU loop and legacy Euler compatibility
 ├── synapse.py       # Neurotransmitter types and properties
 ├── device.py        # Compute device selection (CPU/MPS/CUDA)
 ├── region.py        # Brain region (vectorized PyTorch tensors)
@@ -170,15 +171,19 @@ The restriction applies to both existing eligibility and new spikes. Dopamine fo
 
 ## Experimental results
 
-The repository includes three reference benchmark protocols. Results from the corrected protocols are pending revalidation:
+The repository includes three reference benchmark protocols. Their validation status differs:
 
 | Benchmark | Script | Main question | Current status |
 |---|---|---|---|
-| Iris classification | `examples/iris_benchmark.py` | Can reward-modulated local plasticity solve a standard supervised classification task? | Held-out selection and separate spike/fallback metrics; revalidation pending |
-| Grid navigation | `examples/grid_nav_benchmark.py` | Can the simulator learn a usable control policy with reward-modulated spiking dynamics? | Minimal teacher-free one-hot state/action baseline with deterministic checkpoints; revalidation pending |
+| Iris classification | `examples/iris_benchmark.py` | Can reward-modulated local plasticity solve a standard supervised classification task? | Revalidated at 90% spike-only test accuracy (27/30), one seed; epoch selected on separate validation data |
+| Grid navigation | `examples/grid_nav_benchmark.py` | Can the simulator learn a usable control policy with reward-modulated spiking dynamics? | Calibrated readout solves all 24 starts entirely through spikes on three seeds; mean 4.25 steps across seeds in the fixed 5×5 world |
 | MNIST | `examples/mnist_benchmark.py` | Can the simulator scale to a non-trivial unsupervised vision benchmark? | Canonical MNIST split, train-only preprocessing, fixed WTA and adaptive theta; revalidation pending |
 
-`BENCHMARKS.md` contains the detailed benchmark notes, including research setup, caveats, runtime observations, and interpretation. Use the benchmark scripts themselves as the source of truth for exact hyperparameters.
+A smaller MNIST study trained three networks on 1,000 images and fitted each ridge readout on 100 labelled images from that training set. Centering each image's voltage features across excitatory neurons raised mean accuracy from 61.54% to 63.04%, a gain of 1.50 percentage points. Both decoders used the same 800 additional validation images for every network, excluding the source studies' training and prior validation images. The canonical test set was not used in this comparison. See the [voltage-centering results](BENCHMARKS.md#decoder-only-voltage-centering-screen) for per-seed scores and checks.
+
+`examples/mnist_learning_check.py` reports the centered-voltage ridge alongside its three existing decoders. The gain comes from the readout on fixed networks; it does not establish better STDP learning. The main MNIST benchmark retains its template classifier. Its full 50,000-image training run and canonical test evaluation remain to be repeated with the corrected simulator.
+
+`BENCHMARKS.md` records the protocols, results and limitations. The benchmark scripts define the exact hyperparameters.
 
 ## Computational performance
 
@@ -187,16 +192,17 @@ The simulator is implemented as a vectorized research codebase rather than a neu
 Key techniques:
 
 - **PyTorch tensors** on CPU: profiling through 3200 neurons and 2.9M synapses showed CPU outperforming MPS. GPU kernel launch overhead dominates the tested conditional operations, `torch.compile` falls back because of dynamic shapes, and masked full-tensor approaches process the roughly 95-99% of inactive synapses. See [BENCHMARKS.md](BENCHMARKS.md) for measurements. Use `BRAIN_DEVICE=mps` to profile other network sizes or densities.
-- **Vectorized Izhikevich integration** with configurable sub-stepping (`dt / 0.5`)
+- **Vectorized Izhikevich integration**: new networks use second-order Heun integration with stability-limited internal steps, capped at `0.1ms` by default. The external timestep still controls synapses, plasticity and spike timestamps. Version 4/5 checkpoints retain their legacy Euler dynamics; version 6 saves the method and step cap for each region. See [BENCHMARKS.md](BENCHMARKS.md) for the numerical checks and remaining validation work.
+- **CPU Heun loop**: compatible float32/float64 CPU arrays use NumPy operations in the same order as the PyTorch reference. GPU, autograd, scalar and mixed-dtype inputs retain the PyTorch loop. Whole-training state/RNG and inference responses are checked for exact equality; the measured speedups are relative to Heun, not the former Euler model.
 - **Ring buffer** for spike delays: `index_add_` deposits postsynaptic currents into future slots; each timestep reads and clears the current slot
-- **Event-driven STDP**: nearest-neighbor pairing updates only synapses whose pre or post neuron fired this step, rather than the entire weight matrix. The implementation avoids synchronization on each timestep.
-- **Sparse scatter/gather propagation**: synapses are stored as COO-style parallel arrays, and spike delivery filters on `fired[syn_pre]`. At 1-5% neuron activity per step, the tested network touches roughly 30-150k active elements instead of all 2.9M synapses.
+- **Event-driven STDP**: nearest-neighbor pairing updates synapses whose pre or post neuron fired this step. Large, sparsely active CPU pathways use checked adjacency indices; other cases retain the PyTorch scan. Indexed updates preserve the original synapse and LTP/LTD order.
+- **Sparse scatter/gather propagation**: synapses remain in COO-style parallel arrays. CPU adjacency lookup avoids gathering every connection's firing flag, while comparing endpoint arrays with a cached snapshot to detect topology edits. This validity check still scans all endpoints; transmission updates only the selected live synapses. Small pathways, dense activity and non-CPU devices use `fired[syn_pre]` filtering.
 - **Vectorized stimulus encoding**: rate, temporal, and population coding run in a single tensor operation instead of per-neuron Python loops
 - **Vectorized synaptogenesis**: co-activity scoring uses `torch.outer` instead of nested Python loops
 - **Pre-allocated neuron arrays** up to `max_neurons`; synapse arrays grow via capacity-doubling when needed
 - **Dead flags** (`syn_alive`, `neuron_alive`) for pruning and apoptosis without array compaction
 
-Run-specific timing numbers live in [BENCHMARKS.md](BENCHMARKS.md) alongside the corresponding benchmark results.
+Reusing responses in independent evaluation reduced median Iris evaluation time from 10.27 to 1.70 seconds (6.03x) and Grid evaluation time from 11.56 to 2.92 seconds (3.96x). The checks reproduced the reference outputs and preserved the source model and random number generator state. In a separate compact MNIST comparison, the CPU Heun loop was 1.44x faster for training and 1.56x faster for inference than the PyTorch Heun loop. These measurements depend on the workload and host load; their ratios do not estimate a combined speedup. [BENCHMARKS.md](BENCHMARKS.md) documents the timing protocols and subsequent CPU optimizations.
 
 ## License
 
