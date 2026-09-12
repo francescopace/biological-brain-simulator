@@ -62,6 +62,44 @@ def test_split_rejects_missing_samples_and_invalid_readout_budget(learning_setup
         prepare_dataset(raw, labels, replace(config, train_per_class=20), classes=(0, 1), train_boundary=30)
 
 
+def test_fresh_split_excludes_prior_rows_and_is_order_independent(learning_setup):
+    _, original, config, raw, labels = learning_setup
+    excluded = original.manifest["train_ids"] + original.manifest["validation_ids"]
+    fresh = prepare_dataset(raw, labels, config, classes=(0, 1), train_boundary=30,
+                            excluded_ids=excluded)
+    again = prepare_dataset(raw, labels, config, classes=(0, 1), train_boundary=30,
+                            excluded_ids=excluded[::-1] + excluded[:2])
+    assert fresh.manifest == again.manifest
+    assert fresh.manifest["excluded_ids"] == sorted(set(excluded))
+    train, validation = set(fresh.manifest["train_ids"]), set(fresh.manifest["validation_ids"])
+    assert not (train | validation) & set(excluded)
+    assert not train & validation
+    assert set(fresh.manifest["readout_ids"]) <= train
+    np.testing.assert_array_equal(np.bincount(fresh.train_y), [3, 3])
+    np.testing.assert_array_equal(np.bincount(fresh.validation_y), [2, 2])
+    altered = raw.copy()
+    altered[list(validation | set(excluded))] = 0
+    changed = prepare_dataset(altered, labels, config, classes=(0, 1), train_boundary=30,
+                              excluded_ids=excluded)
+    assert changed.manifest["intensity_target_l1"] == fresh.manifest["intensity_target_l1"]
+    np.testing.assert_array_equal(changed.train_X, fresh.train_X)
+
+
+@pytest.mark.parametrize("excluded", [[-1], [30], [1.5], [True], ["1"], {"rows": [1]}])
+def test_split_rejects_invalid_exclusions(learning_setup, excluded):
+    _, _, config, raw, labels = learning_setup
+    with pytest.raises(ValueError, match="Excluded rows"):
+        prepare_dataset(raw, labels, config, classes=(0, 1), train_boundary=30,
+                        excluded_ids=excluded)
+
+
+def test_exclusions_cannot_silently_reduce_sample_budget(learning_setup):
+    _, _, config, raw, labels = learning_setup
+    with pytest.raises(ValueError, match="Not enough"):
+        prepare_dataset(raw, labels, config, classes=(0, 1), train_boundary=30,
+                        excluded_ids=list(range(25)))
+
+
 @pytest.mark.parametrize("condition", ["normalization_only", "stdp_normalized"])
 @pytest.mark.parametrize("normalization", ["population_mean", "initial_per_neuron"])
 @pytest.mark.parametrize("stdp_scale", [.2, 2.])
@@ -348,6 +386,34 @@ def test_normalization_control_is_identical_for_both_learning_rules(learning_set
                                    5, "normalization_only", tmp_path / "trace", {})
     assert simulation_digest(pair) == simulation_digest(trace)
     assert left["weight_deltas"] == right["weight_deltas"]
+
+
+def test_cli_freezes_exclusions_and_rejects_changed_rows_on_resume(learning_setup, monkeypatch, tmp_path):
+    import examples.mnist_learning_check as study
+    monkeypatch.setattr(mn, "CLASSES", tuple(range(10)))
+    raw = np.random.default_rng(1).integers(0, 256, size=(60020, 4))
+    monkeypatch.setattr(mn, "fetch_openml", lambda *args, **kwargs: SimpleNamespace(
+        data=raw, target=np.arange(60020) % 10))
+    exclusion_file, output = tmp_path / "excluded.json", tmp_path / "run"
+    exclusion_file.write_text(json.dumps(list(range(100))))
+    options = ["learning_check", "--output", str(output), "--exclude-rows", str(exclusion_file),
+               "--seeds", "5", "--train-per-class", "1", "--readout-per-class", "1",
+               "--validation-per-class", "1", "--train-steps", "2", "--inference-steps", "2",
+               "--rest-steps", "0"]
+    monkeypatch.setattr("sys.argv", options)
+    study.main()
+    result = json.loads((output / "summary.json").read_text())
+    assert result["complete"]
+    assert result["signature"]["excluded_ids"] == list(range(100))
+    assert result["dataset"]["excluded_ids"] == list(range(100))
+    assert min(result["dataset"]["train_ids"] + result["dataset"]["validation_ids"]) >= 100
+    monkeypatch.setattr(study, "cached_responses", lambda *args: pytest.fail("completed condition repeated"))
+    monkeypatch.setattr("sys.argv", options + ["--resume"])
+    study.main()
+    exclusion_file.write_text(json.dumps(list(range(101))))
+    monkeypatch.setattr(mn, "fetch_openml", lambda *args, **kwargs: pytest.fail("resumed with changed exclusions"))
+    with pytest.raises(ValueError, match="Cannot resume"):
+        study.main()
 
 
 @pytest.mark.parametrize("changes", [{"learning_rule": "pair"}, {"trace_tau": 10.}, {"trace_target": .1}])

@@ -87,7 +87,16 @@ class Dataset:
     manifest: dict
 
 
-def prepare_dataset(raw_X, labels, config, *, classes=tuple(range(10)), train_boundary=60000):
+def validate_excluded_ids(values, train_boundary=60000):
+    """Canonicalize explicit row exclusions without accepting lossy coercions."""
+    if (not isinstance(values, (list, tuple))
+            or any(type(i) is not int or not 0 <= i < train_boundary for i in values)):
+        raise ValueError("Excluded rows must be integer IDs in the canonical training split")
+    return sorted(set(values))
+
+
+def prepare_dataset(raw_X, labels, config, *, classes=tuple(range(10)), train_boundary=60000,
+                    excluded_ids=()):
     """Split raw canonical training rows before fitting intensity equalization."""
     config.validate()
     if len(raw_X) != len(labels) or len(labels) < train_boundary:
@@ -95,8 +104,11 @@ def prepare_dataset(raw_X, labels, config, *, classes=tuple(range(10)), train_bo
     rng = np.random.default_rng(config.split_seed)
     train_ids, validation_ids = [], []
     canonical_y = np.asarray(labels[:train_boundary], dtype=np.int64)
+    excluded_ids = validate_excluded_ids(excluded_ids, train_boundary)
+    eligible = np.ones(train_boundary, dtype=bool)
+    eligible[excluded_ids] = False
     for cls in classes:
-        available = np.flatnonzero(canonical_y == cls)
+        available = np.flatnonzero((canonical_y == cls) & eligible)
         needed = config.train_per_class + config.validation_per_class
         if len(available) < needed:
             raise ValueError(f"Not enough canonical training samples for class {cls}")
@@ -122,6 +134,8 @@ def prepare_dataset(raw_X, labels, config, *, classes=tuple(range(10)), train_bo
         "validation_sha256": array_digest(validation_X, validation_y),
         "readout_sha256": array_digest(train_X[readout], train_y[readout]),
     }
+    if excluded_ids:
+        manifest["excluded_ids"] = excluded_ids
     return Dataset(train_X, train_y, readout, validation_X, validation_y, manifest)
 
 
@@ -331,11 +345,14 @@ def main():
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument("--seeds", nargs="+", type=int, default=[101, 102, 103])
+    parser.add_argument("--exclude-rows", type=Path,
+                        help="JSON list of canonical training row IDs excluded from both splits")
     for name, field in LearningConfig.__dataclass_fields__.items():
         parser.add_argument("--" + name.replace("_", "-"), type=type(field.default), default=field.default)
     args = parser.parse_args()
     config = LearningConfig(**{name: getattr(args, name) for name in LearningConfig.__dataclass_fields__})
     config.validate()
+    excluded_ids = validate_excluded_ids(json.loads(args.exclude_rows.read_text())) if args.exclude_rows else []
     if len(set(args.seeds)) != len(args.seeds):
         parser.error("Seeds must be distinct")
     if args.output.exists() != args.resume:
@@ -351,6 +368,8 @@ def main():
     source_hashes = {name: hashlib.sha256(content).hexdigest() for name, content in source_bytes.items()}
     signature = {"config": asdict(config), "seeds": args.seeds, "source_sha256": source_hashes,
                  "torch": torch.__version__, "sklearn": sklearn.__version__, "numpy": np.__version__}
+    if excluded_ids:
+        signature["excluded_ids"] = excluded_ids
     if args.resume:
         payload = json.loads((args.output / "summary.json").read_text())
         if payload["signature"] != signature:
@@ -372,7 +391,8 @@ def main():
     print(f"LEARNING CHECK pid={os.getpid()} seeds={args.seeds}", flush=True)
     raw = mn.fetch_openml("mnist_784", version=1, as_frame=False, parser="liac-arff",
                          data_home=str(root / ".sklearn_data"))
-    data = prepare_dataset(raw.data, np.asarray(raw.target, dtype=np.int64), config)
+    data = prepare_dataset(raw.data, np.asarray(raw.target, dtype=np.int64), config,
+                           excluded_ids=excluded_ids)
     del raw
     if "dataset" in payload and payload["dataset"] != data.manifest:
         raise ValueError("Cannot resume with changed dataset rows or values")

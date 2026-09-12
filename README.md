@@ -183,6 +183,10 @@ A smaller MNIST study trained three networks on 1,000 images and fitted each rid
 
 `examples/mnist_learning_check.py` reports the centered-voltage ridge alongside its three existing decoders. The gain comes from the readout on fixed networks; it does not establish better STDP learning. The main MNIST benchmark retains its template classifier. Its full 50,000-image training run and canonical test evaluation remain to be repeated with the corrected simulator.
 
+A subsequent fixed-budget check varied 100-label readout subsets on three frozen networks and reused 800 validation images. The STDP condition averaged **62.54% with centered-voltage ridge** and **36.02% with spike-only ridge**; neither comparison showed a consistent STDP benefit over its matched control. These are validation sensitivity measurements, not a new canonical test score. See the [fixed-budget results](BENCHMARKS.md#readout-sensitivity-at-a-fixed-100-label-budget).
+
+An [isolated conductance-LIF reference pilot](BENCHMARKS.md#isolated-conductance-lif-reference-pilot) tests the triplet-STDP variant in Diehl and Cook's released code. Its completed paired experiment found a consistent STDP benefit in spike-based classification across three seeds. A subsequent [train-only decoder selection](BENCHMARKS.md#train-only-spikevoltage-decoder-selection) improved the combined spike/voltage readout without retraining the network, though voltage alone accounts for most of its accuracy. The linked reports distinguish the fixed-decoder comparison, decoder tuning and numerical limits. This experimental implementation leaves Iris and the production simulator unchanged and does not reproduce the paper's 87% power-law result.
+
 `BENCHMARKS.md` records the protocols, results and limitations. The benchmark scripts define the exact hyperparameters.
 
 ## Computational performance

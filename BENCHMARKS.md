@@ -329,6 +329,152 @@ Mean accuracy rose from 61.54% to 63.04%, a gain of 1.50 points. Paired wins/los
 
 The learning check now reports `ridge_spikes_centered_voltage` alongside its original three decoders. The shared transform in `examples/mnist_readout_features.py` is read-only and uses the same float64 arithmetic as the verified candidate. No SNN training rule, coupling, template classifier or existing decoder was replaced. An integration check preserved every original prediction and accuracy across all nine cached source conditions and reproduced both raw and centered predictions on all additional images. It required no further SNN simulation; results are in `results/20260912-readout-integration-verification.json`.
 
+### Fresh-split STDP replication
+
+The CPU replication uses new network seeds 201, 202 and 203 with coupling 64, pair STDP at scale 0.2, input density 0.15 and weight boost 4. Each seed has matched initial, normalization-only and STDP-plus-normalization conditions. The common split has 1,000 training images, a 100-image labelled readout subset and 800 validation images, balanced across digits. Presentation/rest settings remain 100/25 steps for training and 50 steps for independent inference. The intensity target is fitted only on the new training images.
+
+`--exclude-rows PATH` accepts a JSON list of canonical-training row IDs to exclude from both splits. The normalized exclusion set is recorded in the run signature and dataset manifest; changing it rejects a resume. This replication excludes the 2,000 distinct rows used by the listed preceding controlled studies and the additional-image voltage-centering check. The exclusions do not cover every historical experiment. All three workers use split seed 20260914, and none selects a canonical test row.
+
+Before execution, `results/20260912-wta64-fresh-replication/plan.json` fixed the configuration, excluded-source hashes and primary endpoint: the paired STDP-minus-normalization accuracy gain with spike-only ridge. A positive result requires a positive gain for each seed and a positive lower bound of a 95% stratified-image bootstrap interval. The bootstrap averages the three correctness differences within each shared image before 5,000 class-stratified resamples, using seed 20260915. Its interval is conditional on these fixed networks and this training split; 800 shared validation images are not 2,400 independent observations. Initialization comparisons and the other three decoders are secondary. The protocol does not select a replacement primary decoder, change defaults or increase the training budget after seeing these results.
+
+The workers use separate single-threaded CPU processes and save checkpoints every 100 training images. `examples.mnist_replication_summary` verifies source hashes, exclusion and split identities, all nine final checkpoints, response-cache identities and recomputed decoder predictions before aggregating the paired results.
+
+All nine conditions completed. Mean accuracies over the three new seeds were:
+
+| Condition | Templates | Ridge on spikes | Ridge on spikes + voltage | Ridge with centered voltage |
+|---|---:|---:|---:|---:|
+| Initial network | 52.71% | 38.13% | 61.54% | 64.29% |
+| Normalization only | 51.58% | 37.63% | 63.00% | 65.17% |
+| STDP + normalization | 51.42% | 37.17% | 62.33% | 65.13% |
+
+The primary STDP/control gains were -1.00, -0.50 and +0.125 percentage points for seeds 201, 202 and 203. Their mean was **-0.46 points**, with a conditional 95% interval of **-1.92 to +1.08 points**. Against initialization, the mean spike-ridge difference was -0.96 points, with an interval of -3.29 to +1.33. Neither comparison met the previously fixed positive-result criterion. The centered-voltage decoder was also effectively tied with its normalization control: -0.04 points on average, with a conditional interval of -1.125 to +0.958. These intervals include zero; the study does not establish either a reliable STDP benefit or a definite harmful effect.
+
+There were no silent validation images in any condition. All nine checkpoint integrity and round-trip state checks passed, cached decoder predictions reproduced exactly, and source/checkpoint contents were unchanged. The final CPU suite passed 776 tests with two accelerator probes skipped. Per-seed studies, the fixed plan and `verification.json` are in `results/20260912-wta64-fresh-replication`; `tests.xml` contains the test report. The raw scores should not be compared directly with the earlier split, since the training, labelled readout and validation images all changed. The earlier positive spike-ridge result did not replicate here, so this candidate does not yet justify a larger training run or a default change.
+
+### Diagnosing the failed replication without retraining
+
+The follow-up fixes the old seeds 101–103, their normalization-only and STDP checkpoints, their respective fitted decoders and their original training-fitted intensity target. It changes only the evaluation rows, using the same 800 validation IDs as the new replication. Before scoring those rows, all six source networks reproduced the original readout and validation response bytes exactly under the current simulator. This is a post-hoc diagnostic on reused validation data, not another independent confirmation.
+
+| Fixed old pipelines, mean spike-ridge accuracy | Original 200 validation images | New 800 validation images |
+|---|---:|---:|
+| Normalization only | 38.83% | 39.63% |
+| STDP + normalization | 44.33% | 38.71% |
+| Paired STDP gain | +5.50 pp | -0.92 pp |
+
+The transferred per-seed gains were -2.125, -0.875 and +0.25 points. Their conditional image-bootstrap 95% interval was -2.46 to +0.67 points. The centered-voltage decoder's STDP/control difference also changed from +0.50 to -1.33 points, with a conditional interval of -2.42 to -0.29. Thus new network seeds are not required for the earlier benefit to disappear: it already fails to generalize to these rows with the old pipelines held fixed. This does not identify a specific image-distribution mechanism or establish that STDP is generally harmful. The new-model comparison still changes network seeds, training data and readout data together.
+
+A separate cache-only intervention fits decoders on either condition's 100 labelled responses and evaluates them on either condition's validation responses, preserving neuron-column identities. On the old split, keeping the normalization decoder fixed while switching validation responses to STDP adds only 0.33 points. Refitting that decoder on the STDP readout responses adds another 5.17 points, summing to the original 5.50. These are components along one chosen intervention order, not a unique attribution of the gain. On the new split the corresponding components are -0.04 and -0.42 points. The old gain depends strongly on the fitted readout; that alone does not make it spurious.
+
+To test a small readout perturbation, 100 fixed resamples omit one labelled example per digit and refit the two decoders on the same remaining 90 images. The old spike-ridge mean gain falls from +5.50 to +2.39 points; the 5th–95th percentile range of the three-seed mean is +0.50 to +4.01. The new cohort averages -0.27 points, with a range of -1.34 to +0.54. These are sensitivity ranges over smaller readout subsets, not confidence intervals or independent replications with 100 new labels. No subset was selected as a replacement protocol.
+
+The state audit found similar STDP/control feedforward differences in both cohorts: 0.155–0.167% of the control's L1 weight sum in the old seeds and 0.160–0.161% in the new seeds. The new models had 11–15 weights at the lower bound and at most one at the upper bound, out of roughly 47,000 live feedforward synapses. Only 0.18–0.21% of validation spike-count entries changed, but those entries affected 33.5–36% of images. The stored per-image updates do not show total cancellation by normalization: excluding the first image, median net/raw L1 ratios are 1.22–1.24 and median update/normalization cosines are about -0.15. These diagnostics neither prove useful learning nor rule out an interaction with normalization or adaptive thresholds.
+
+These diagnostics motivated the fixed-100-label check below, which separates readout-selection sensitivity from the 90-label budget change above. Increasing training length or STDP amplitude is not supported by these results; the earlier tenfold-amplitude test also failed to improve the source study. No training rule, decoder default or source checkpoint was changed here.
+
+`examples.mnist_readout_transfer_check` reproduces the fixed-pipeline transfer, and `examples.mnist_cached_diagnosis` reproduces the state, cross-readout and label-deletion checks. Their outputs are in `results/20260912-stdp-generalization-analysis`, including `transfer-summary.json` and `cached-diagnosis.json`. Source models, checkpoints and input caches passed preservation checks. The 12 new diagnostic tests passed; the full CPU suite finished with 788 passed and two accelerator probes skipped.
+
+### Readout sensitivity at a fixed 100-label budget
+
+The follow-up keeps the nine fresh-replication networks frozen: initial, normalization-only and STDP-plus-normalization for seeds 201–203. Before extracting or scoring new responses, `plan.json` fixes 100 balanced random subsets of the existing 1,000 training images, using subset seed 20260917. Every fit uses 100 distinct labels, ten per digit. The subsets are identical across seeds and conditions; they can overlap between fits and collectively cover all 1,000 training rows. This is a 100-label budget per decoder, not a study that uses only 100 labels in total.
+
+Each network supplies one frozen response extraction for the full training pool. Selecting the original 100 readout rows from that pool reproduces their saved spike and voltage bytes exactly, including row and neuron order. The corresponding original decoder predictions also reproduce exactly in all nine conditions. Evaluation reuses the existing 800-image validation caches; source preprocessing parameters remain unchanged, and the SNN is never trained. Each new decoder fits its own `StandardScaler` and ridge classifier on its selected 100 rows, with alpha fixed at 1. Spike-only ridge remains primary; centered-voltage ridge is secondary. No subset is chosen by validation accuracy, and no canonical test rows are used.
+
+Mean validation accuracies over the 100 subsets and three seeds were:
+
+| Frozen network | Ridge on spikes | Ridge with centered voltage |
+|---|---:|---:|
+| Initial | 36.87% | 62.72% |
+| Normalization only | 35.91% | 62.57% |
+| STDP + normalization | 36.02% | 62.54% |
+
+For spike ridge, the mean paired STDP/control difference is **+0.105 points**. The 5th–95th percentile range of the three-seed mean across subsets is **-1.21 to +1.38 points**: 47 subsets favor STDP, 51 favor the control and two tie. Only 13 subsets favor STDP in all three seeds. The per-seed mean gains are +0.055, +0.573 and -0.311 points. Against initialization, STDP averages -0.858 points, with a subset range of -3.60 to +1.71.
+
+The centered-voltage STDP/control difference is **-0.030 points**, with a subset range of **-1.00 to +0.96**; 49 subsets favor STDP, 47 favor the control and four tie. Against initialization its mean difference is -0.182 points. The original 100-label subset's STDP/control differences, reproduced here, were -0.458 points for spike ridge and -0.042 for centered-voltage ridge.
+
+Changing the readout rows at the same budget can change the sign of the spike-ridge comparison, but it does not reveal a consistent STDP advantage in this cohort. These ranges describe sensitivity to the chosen subsets, not confidence intervals. All fits share the same validation images and fixed networks, and overlapping subsets are not independent replications. The validation data have already informed earlier diagnostics; any subsequent confirmation needs separate data and a fixed protocol. These results do not justify a larger training run or a default change.
+
+The runner saves pool responses, all 1,800 new decoder prediction arrays, per-seed results and source snapshots in `results/20260912-fixed100-readout-sensitivity`. Its summary verifies source, checkpoint and input-cache preservation. All nine original-response and original-prediction checks passed. The 14 new unit tests passed, and the full CPU suite finished with **802 passed and two accelerator probes skipped**; its report is `tests.xml` in that directory.
+
+To reproduce the check, choose a new output directory, create its plan, run each planned seed with one CPU thread, then aggregate after all workers finish:
+
+```bash
+BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_readout_subset_check plan --study-root results/20260912-wta64-fresh-replication --output results/fixed100-repeat
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_readout_subset_check run --output results/fixed100-repeat --seed 201
+# Repeat the run command for seeds 202 and 203.
+BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_readout_subset_check summarize --output results/fixed100-repeat
+```
+
+### Isolated conductance-LIF reference pilot
+
+`examples.mnist_paper_reference` implements a separate NumPy conductance-LIF network using the equations and parameters of the [authors' released MNIST code](https://github.com/peter-u-diehl/stdp-mnist/blob/master/Diehl%26Cook_spiking_MNIST.py) and [connection generator](https://github.com/peter-u-diehl/stdp-mnist/blob/master/Diehl%26Cook_MNIST_random_conn_generator.py). That code uses triplet STDP. It is not the power-law variant associated with the paper's 87.0% result, and this implementation has not established trajectory equivalence with Brian 1. No production `src/` file, Iris setting or existing MNIST default is changed.
+
+The reference has 784 independent pixel-rate Poisson inputs, 400 excitatory and 400 inhibitory LIF cells, dense input connectivity, matched E→I connections and lateral inhibition excluding each matched excitatory cell. It uses the released demo's 0.5 ms grid, 350 ms presentations, 150 ms quiet periods, 100/10 ms excitatory/inhibitory membrane constants and a 10,000-second adaptive-threshold decay. Raw pixel values set the input rates; there is no L1 image equalization. Arrival and postsynaptic traces implement the demo's bounded triplet updates. Input columns are normalized before each training attempt, including the initial state used for comparison.
+
+This is an equation-level reconstruction with explicit implementation differences. Voltage uses exponential-midpoint integration with exact conductance decay. Input delays are floored to the grid, refractory voltage is clamped, and divisive normalization enforces weight bounds. The low-activity intensity retry has a ten-attempt limit; exhaustion fails the run instead of dropping an image. Frozen evaluation resets transient state before each image and uses per-row keyed Poisson draws. Unlike the demo's default assignment, neurons silent on the readout set remain unassigned; a silent class response abstains. These choices are recorded in the plan and prevent treating the pilot as reproduction of the published accuracy.
+
+Before scoring, 31 new unit tests checked passive dynamics, convergence against an independent DOP853 integration, input-rate statistics, delayed-event scheduling, triplet traces and bounds, inhibitory recruitment, refractoriness, frozen evaluation, source preservation and exact checkpoint continuation with pending events. The full CPU suite passed 833 tests with two accelerator probes skipped (`results/20260912-paper-triplet-tests.xml`). An eight-training-image normalized preflight produced 117 excitatory spikes at 0.5 ms and 109 at 0.25 ms with matched input events. Individual neuron counts changed, so network-level grid convergence is not established. The earlier unnormalized-initialization preflight also remains archived. Neither preflight fitted a decoder or selected parameters by validation accuracy.
+
+`examples.mnist_paper_check` fixes seeds 201–203 and reuses the preceding study's 1,000 training, 100 labelled readout and 800 validation row IDs. Its reference conditions are initialization, normalization plus theta adaptation without STDP, and the same mechanisms with triplet STDP. The no-STDP arm receives the identical training spike tapes and every retry selected by the STDP arm. Both keep state and traces during rest. Class-average spike decoding is primary; spike-only ridge and centered-voltage ridge, both with alpha 1, are secondary. All classifiers fit only the 100 readout labels.
+
+The existing Izhikevich response caches are scored with those same classifiers and rows. This matches data and readout budgets, not preprocessing, input randomness, synaptic dynamics or simulated presentation time: the old protocol uses L1 equalization, sparse current-based input, 100/25 ms training/rest and 50 ms inference. Any difference between architectures therefore does not identify one causal mechanism. The 800 validation rows have already been used for diagnostics, and no canonical test evaluation or long training run is part of this pilot.
+
+The immutable plan and source snapshots are in `results/20260912-paper-triplet-pilot/plan.json`; the normalized preflight is `results/20260912-paper-triplet-normalized-preflight.json`. Workers publish separate checkpoints every 250 training images and preserve their source studies and caches. Use `python -m examples.mnist_paper_check plan --output NEW_DIR`, then `run --output NEW_DIR --seed SEED` for each planned seed, then `summarize --output NEW_DIR`. Prefix commands with `OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu` for the measured single-threaded CPU setup. The default source studies and recorded preflight must be present locally. Checkpoints support model-state continuation; this pilot CLI does not yet resume an interrupted training loop.
+
+All three seeds completed. The primary result is **51.88% class-average accuracy with triplet STDP versus 30.63% without STDP**, a mean gain of **21.25 percentage points**. Each seed improved: +18.875, +22.250 and +22.625 points. These are validation results after 1,000 training images, not canonical MNIST test accuracy.
+
+| Model and condition | Class-average spikes (primary) | Spike ridge | Spikes + centered-voltage ridge |
+| --- | ---: | ---: | ---: |
+| Conductance-LIF, initial | 27.67% | 25.08% | 59.04% |
+| Conductance-LIF, normalization + theta, no STDP | 30.63% | 27.92% | 54.33% |
+| Conductance-LIF, normalization + theta + triplet STDP | **51.88%** | **45.63%** | 62.79% |
+| Cached Izhikevich, initial | 32.88% | 38.13% | 64.29% |
+| Cached Izhikevich, normalization only | 35.21% | 37.63% | 65.17% |
+| Cached Izhikevich, normalized STDP | 35.42% | 37.17% | 65.13% |
+
+Each cell averages seeds 201–203 with the same original 100 readout rows and 800 validation rows. The Izhikevich centered-voltage figure is 65.13% here because this comparison uses one fixed readout set. The preceding 62.54% result averages 100 alternative readout sets; it is a different experiment, not a later regression or an improvement measured by this pilot.
+
+Adding triplet STDP also improved the reference's two secondary decoders over its no-STDP control in every seed: mean gains were +17.71 points for spike ridge and +8.46 points for centered-voltage ridge. The cached Izhikevich gains against its own normalization control were +0.21, −0.46 and −0.04 points for the three respective decoders. This establishes an STDP benefit within the reference pilot's paired protocol. It does not establish which difference from the Izhikevich model caused the benefit, or an overall accuracy win: the old model scores higher with these fixed centered-voltage decoder settings.
+
+Reference weights changed by 5.81–6.11% in relative L1 distance from the no-STDP control. No weights reached zero or the upper bound. Mean column cosine and weight entropy increased slightly, so these summaries do not establish sharply differentiated digit receptive fields. After STDP, 58–66 of 400 neurons remained silent on the 100-row readout set, versus 60–71 in the no-STDP control. The gain therefore is not accompanied by a large difference in the number of readout-active neurons.
+
+Training needed 1,056–1,062 presentations per arm, including retries. Three concurrent single-threaded CPU workers finished in about 22.1 minutes wall time; each spent 14.4–14.5 minutes training its paired arms and 7.6–7.7 minutes extracting all three conditions. These are timings under concurrent load, not isolated performance benchmarks. All workers exited successfully. The aggregate replayed all 27 reference decoder outputs and verified source, checkpoint and cache preservation; an independent class-average calculation also reproduced all 7,200 primary predictions and checked their labels. The complete aggregate is `results/20260912-paper-triplet-pilot/summary.json`.
+
+This pilot supports continuing work on the isolated reference. Numerical equivalence and grid sensitivity still need checking before a paper-replication claim or long training run. The shared validation set, one small readout set and three initialization seeds also limit generalization. No production default or Iris behavior was changed, and the 180,000-presentation paper schedule was not launched.
+
+### Train-only spike/voltage decoder selection
+
+On the frozen triplet-reference caches, selecting the relative feature weight and ridge regularization raised the STDP condition from **62.79% to 70.38% mean validation accuracy**, a gain of **7.58 percentage points**. No network was retrained and no new responses or labelled examples were collected. Seeds 201, 202 and 203 reached 68.00%, 70.63% and 72.50%, improving over their respective fixed decoders by 6.75, 8.75 and 7.25 points.
+
+`examples.mnist_paper_readout_tuning` records its grid and folds before selection. Each network uses the same 100 labelled readout rows, ten per digit, with five-fold stratified cross-validation repeated three times. Each fold fits on 80 rows and predicts 20; the scaler is fitted only on its 80 training rows. Voltage features are centered within each image. The relative block weights are applied after standardization so the scaler cannot undo them.
+
+The fixed grid contains 49 candidates: voltage/spike feature multipliers of 0, 0.25, 0.5, 1, 2 and 4, plus voltage-only, crossed with ridge alpha values 0.01, 0.1, 1, 10, 100, 1,000 and 10,000. Exact CV-count ties prefer stronger regularization, then weights closest to equal balance, then the recorded candidate order. Initial, no-STDP and STDP conditions receive identical folds and search budgets. Each chooses its own parameters; these are not new universal defaults.
+
+The selection command loads only the readout arrays and saves all nine selections before the evaluation command accesses validation features or labels. It also fixes three diagnostic choices using the same CV scores: equal weights with alpha selection, spike-only with alpha selection, and voltage-only with alpha selection. Each chosen decoder is then refitted on all 100 readout rows and evaluated once on the existing 800 validation rows. Validation accuracy never chooses a candidate, diagnostic method or seed. The reported CV scores are selection scores, not unbiased estimates of generalization.
+
+| Decoder | Initial network | Normalization + theta, no STDP | Normalization + theta + STDP |
+| --- | ---: | ---: | ---: |
+| Fixed equal weights, alpha 1 | 59.04% | 54.33% | 62.79% |
+| Equal weights, CV-selected alpha | 66.13% | 61.25% | 67.96% |
+| Spike-only, CV-selected alpha | 30.79% | 30.75% | 46.58% |
+| Voltage-only, CV-selected alpha | 70.00% | 67.17% | 69.83% |
+| Joint CV selection of weight and alpha | 69.83% | 67.17% | **70.38%** |
+
+For STDP seed 201, joint selection chose voltage multiplier 2 and alpha 1,000; seeds 202 and 203 chose multiplier 4 and alpha 10,000. Spike weight remains 1. Changing alpha alone reaches 67.96%, so much of the gain over the old 62.79% decoder does not require a different balance between the signals.
+
+Combining the signals adds only 0.54 points on average over the voltage-only diagnostic. Its per-seed differences are −0.75, −0.50 and +2.875 points, so this pilot does not establish a consistent advantage from adding spikes to a tuned voltage decoder. The jointly selected STDP decoder also exceeds the jointly selected initial network by only 0.54 points, and its no-STDP control by 3.21 points. Thus the larger spike-only STDP effect in the preceding pilot should not be confused with the source of the roughly 70% combined accuracy. The old Izhikevich model was not retuned in this experiment; its earlier 65.13% fixed-decoder result is not an equal-search architecture comparison.
+
+Selection took 12.9 seconds and evaluation 2.0 seconds with one CPU thread, while the test suite also ran. These are decoder-only timings, excluding process startup and initial provenance checks. The output directory `results/20260912-paper-readout-tuning` contains `plan.json`, `selection.json`, the complete `summary.json`, fold predictions, source snapshots and pickle-free fitted decoder states. Each state includes the scaler, feature-block weights, linear coefficients, intercept and classes, together with its source-network identity. All nine original baseline prediction arrays reproduced exactly, and all 45 exported decoders reproduced their saved predictions after reload. Independent scikit-learn refits verified 36,000 validation predictions and 465 selected-candidate CV folds. Source, response-cache and checkpoint hashes were preserved.
+
+All 22 new tests passed, including fold-local scaling, train-only selection without validation arrays, endpoint weights, deterministic ties, baseline equivalence and decoder-state replay. The full CPU suite passed **855 tests with two accelerator probes skipped**; the report is `results/20260912-paper-readout-tuning-tests.xml`.
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_readout_tuning plan --output results/paper-readout-repeat
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_readout_tuning select --output results/paper-readout-repeat
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_readout_tuning evaluate --output results/paper-readout-repeat
+```
+
+Each stage refuses to overwrite an existing result. The source pilot must be available locally. This remains an exploratory analysis of a repeatedly inspected validation set, one small readout set and three fixed networks. The improvement should be checked on new evaluation images before adoption. No canonical test run, production change or Iris modification was made.
+
 ## Completed pre-correction full MNIST run
 
 The original process in `results/20260911-190006` completed successfully with 48.8% accuracy on 500 canonical test images, after training on 50,000 images and fitting its readout on 5,000 labelled training images. It reported 17,651.1 seconds for training, 1,192.3 seconds for readout construction and 101.4 seconds for evaluation; total wall time was 18,953 seconds, about 5h16m. The process was not interrupted or restarted.
@@ -395,6 +541,8 @@ The completed run retained the original 96/24/30 train/validation/test split and
 `python -m examples.iris_inference_check --study STUDY --output NEW_JSON --evaluate-test` reproduced the selected validation results and evaluated that checkpoint on the held-out test partition without further tuning. It classified 27/30 test samples correctly (90.0%), with no silent samples; voltage fallback therefore also scored 90.0%. Logistic regression, fitted on the same 96 training rows, scored 29/30 (96.67%). This is one seed and a small test set. It revalidates this corrected configuration; it does not isolate the accuracy effect of each correction or establish a general advantage over the baseline.
 
 The same check timed slow/fast/fast/slow evaluation on the 24 validation samples. Median time fell from 10.270 to 1.702 seconds (6.03x), with identical spike counts and both prediction vectors. The saved checkpoint and complete source model/RNG state were unchanged. This speedup compares two implementations of the independent protocol, not independent versus historical sequential evaluation. The timing run followed training with no other benchmark launched concurrently by this task. Results and the one final test evaluation are in `results/20260912-iris-inference-and-test.json`.
+
+A later read-only CPU replay after the MPS compatibility changes reproduced the full saved validation and test responses and predictions exactly: 24/24 validation and 27/30 test, with no silent samples. The source model, checkpoint and input files were unchanged. This checks the existing trained checkpoint under the newer code; it is not a new training run or an independent test sample.
 
 The final test suite passed with 601 tests and two device-dependent skips. Source hashes matched at the end of both Iris runs.
 
@@ -547,7 +695,9 @@ Historical results pending revalidation:
 | v2 | 1600 exc | 300 | 25 | 3 | 225k | **51.8%** | More neurons hurt with insufficient data |
 | v3 | 400 exc | 6000 | 200 | 1 | 15M | **64.6%** | Full MNIST, near-paper regime |
 | v4 | 400 exc | 6000 | 200 | 1 | 15M | **66.0%** | Same as v3 + `INH_LATERAL_WEIGHT=12.0` |
-| Paper | 400 exc | 6000 | 350 | 1 | 21M | **87%** | Diehl & Cook 2015 reference |
+| Paper | 400 exc | 6000 | 350 | 3 | — | **87%** | Diehl & Cook 2015, power-law STDP; different model and readout |
+
+The paper's [Results section](https://www.frontiersin.org/journals/computational-neuroscience/articles/10.3389/fncom.2015.00099/full) specifies three passes over the 60,000 training examples for the 400-neuron result: 180,000 presentations before low-activity retries. The earlier one-epoch/21M entry was incorrect. No directly comparable timestep count is given here; the small current studies and the historical full runs also differ in data, dynamics and classification protocol.
 
 The v1→v2 regression (62%→52%) occurred when the network grew from 400 to 1600 excitatory neurons without additional training data. That comparison does not isolate network size from data exposure per neuron. The v3 run also changed several variables at once, including data volume and presentation time, and reached 64.6%. Relative to v3, the v4 inhibition change raised accuracy to 66.0% and produced a more balanced neuron-label distribution. These runs identify competition and plasticity calibration as variables for controlled follow-up experiments; they do not isolate the remaining error source.
 
