@@ -145,6 +145,23 @@ After these corrections, the full CPU-configured suite passed 758 tests in 36.57
 
 These are software regression checks. They do not establish equal trajectories between CPU and MPS, GPU speedups, or new benchmark accuracy results. Test-suite elapsed times are not paired performance measurements. CPU remains the default backend.
 
+## CPU versus MPS after the fixes
+
+The bounded comparison on an Apple M2 with 16 GiB RAM, macOS 26.6.2 and PyTorch 2.12.0 favors CPU for the current MNIST learning studies. It uses the corrected Heun dynamics from commit `c049515`, 1,584 neurons, 207,254 synapses and excitatory-to-inhibitory coupling 64. Each trial processes ten training images at 100 presentation steps plus 25 rest steps, then ten independent inference images at 50 steps. These are the reduced learning-study settings, not the full benchmark's 200-step training schedule.
+
+All four processes ran outside the sandbox, sequentially in CPU/MPS/MPS/CPU order, with four CPU threads. Each warmed a disposable training and inference copy before timing. MPS was synchronized before and after each measured segment. Setup, model copies and diagnostics were excluded; training includes STDP, normalization and rest, while inference includes response transfer to CPU. Other applications were active, so the host was not isolated.
+
+| Workload, ten images | CPU median (range) | MPS median (range) | MPS / CPU |
+|---|---:|---:|---:|
+| Training | 1.411 s (1.385–1.437) | 43.419 s (42.663–44.175) | 30.77x |
+| Inference | 0.526 s (0.524–0.529) | 15.147 s (14.414–15.880) | 28.79x |
+
+The fixture hashes verify identical initial neuron/synapse tensors and images. Training retains native backend noise at level 0.02, so equal seeds do not imply equal noise draws. Each inference trial instead starts from the common initialized network with learning and noise disabled, not from independently trained weights. All 4,000 excitatory spike-count entries matched across the four inference trials. The largest cross-backend mean-voltage difference was 0.0000458 mV. CPU state and response hashes repeated exactly; MPS hashes did not, including small voltage differences between its two trials. These checks do not establish long-run accuracy or bitwise backend equivalence.
+
+Use `python -m examples.device_timing_check --prepare --output results/NEW_RUN` with `BRAIN_DEVICE=cpu` to create a local fixture. Then run `--trial NAME --output results/NEW_RUN` in separate processes with `BRAIN_DEVICE=cpu` or `BRAIN_DEVICE=mps`, following the same alternating order. Only load fixtures generated locally by this script. Three harness tests passed on each backend. Raw trials, input-row IDs, source hashes and the aggregate report are in `results/20260912-cpu-mps-timing-01/summary.json` and its sibling files.
+
+Keep CPU for the next controlled learning runs. MPS now passes the software checks, but this workload gains no throughput from it. Larger networks, batched execution and trained-network inference would need separate measurements; this short comparison does not justify a full-run duration forecast.
+
 ## Learning controls after the dynamics correction
 
 The three-seed study was repeated with Heun integration and newly generated excitatory-only feedforward wiring. It retained 200 training images, 100 labelled readout images and the same 200 train-only validation images. Mean accuracies were:
