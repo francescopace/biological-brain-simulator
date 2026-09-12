@@ -487,7 +487,8 @@ def _load_region(path: Path, dt: float, name: str | None = None, *,
 
     # RNG state
     if "rng_state" in data:
-        region._rng.set_state(data["rng_state"])
+        # Generator state is a CPU ByteTensor, including for GPU generators.
+        region._rng.set_state(data["rng_state"].cpu())
 
     if data.get("morphology_enabled", False):
         region.morphology_manager = MorphologyManager()

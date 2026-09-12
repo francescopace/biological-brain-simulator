@@ -329,6 +329,14 @@ class Region:
         count = len(pre_idx)
         self._ensure_synapse_capacity(count)
 
+        # Public callers may supply CPU tensors to a region on an accelerator.
+        device = self.syn_weight.device
+        pre_idx = pre_idx.to(device=device, dtype=torch.int32)
+        post_idx = post_idx.to(device=device, dtype=torch.int32)
+        weights = weights.to(device=device, dtype=torch.float32)
+        delays_ms = delays_ms.to(device=device, dtype=torch.float32)
+        nt_values = nt_values.to(device=device)
+
         s = self.n_synapses
         e = s + count
 

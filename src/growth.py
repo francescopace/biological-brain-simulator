@@ -147,9 +147,9 @@ class GrowthController:
                 if trace.region_name != region.name:
                     retained.append(trace)
                     continue
-                keep = ~torch.isin(trace.neuron_indices, dead)
+                keep = ~torch.isin(trace.neuron_indices, dead.to(trace.neuron_indices.device))
                 trace.neuron_indices = trace.neuron_indices[keep]
-                trace.activity_snapshot = trace.activity_snapshot[keep]
+                trace.activity_snapshot = trace.activity_snapshot[keep.to(trace.activity_snapshot.device)]
                 if len(trace.neuron_indices) >= 3:
                     retained.append(trace)
             memory.traces = retained

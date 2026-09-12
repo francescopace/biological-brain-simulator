@@ -126,9 +126,10 @@ def prepare_dataset(raw_X, labels, config, *, classes=tuple(range(10)), train_bo
 
 
 def weight_delta_metrics(before, after_stdp, after_normalization):
-    raw = (after_stdp - before).to(torch.float64)
-    norm = (after_normalization - after_stdp).to(torch.float64)
-    total = (after_normalization - before).to(torch.float64)
+    # Retain device-side subtraction, then accumulate diagnostics in CPU float64.
+    raw = (after_stdp - before).detach().cpu().to(torch.float64)
+    norm = (after_normalization - after_stdp).detach().cpu().to(torch.float64)
+    total = (after_normalization - before).detach().cpu().to(torch.float64)
     raw_l1, norm_l1, total_l1 = (float(d.abs().sum()) for d in (raw, norm, total))
     denominator = float(torch.linalg.vector_norm(raw) * torch.linalg.vector_norm(norm))
     return {
@@ -144,9 +145,10 @@ def weight_summary(projection, reference=None):
     """Describe live weights and exact bound occupancy without changing state."""
     ns = projection.n_synapses
     live = projection.syn_alive[:ns]
-    weights = projection.syn_weight[:ns][live].to(torch.float64)
+    weights = projection.syn_weight[:ns][live].detach().cpu().to(torch.float64)
     count = weights.numel()
-    lower, upper = projection.syn_min_weight[:ns][live], projection.syn_max_weight[:ns][live]
+    lower = projection.syn_min_weight[:ns][live].detach().cpu()
+    upper = projection.syn_max_weight[:ns][live].detach().cpu()
     result = {
         "live_synapses": count, "at_min": int((weights == lower).sum()),
         "at_max": int((weights == upper).sum()),
@@ -160,7 +162,7 @@ def weight_summary(projection, reference=None):
                                                               getattr(reference, key)[:ns])
                                             for key in ("syn_pre", "syn_post", "syn_alive")):
             raise ValueError("Weight comparison requires identical live topology")
-        old = reference.syn_weight[:ns][live].to(torch.float64)
+        old = reference.syn_weight[:ns][live].detach().cpu().to(torch.float64)
         delta = weights - old
         denominator = float(old.abs().sum())
         result.update(l1_change_from_reference=float(delta.abs().sum()),

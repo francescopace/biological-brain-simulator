@@ -56,7 +56,10 @@ def test_replay_cross_checks_sparse_event_indices(brain, monkeypatch):
     before = projection.syn_weight[:projection.n_synapses].clone()
     _, combined = replay_arms(brain, before)
     mn.apply_feedforward_stdp(brain)
-    assert projection._post_events._endpoints is not None
+    if projection.syn_weight.device.type == "cpu":
+        assert projection._post_events._endpoints is not None
+    else:
+        assert projection._post_events._endpoints is None
     assert torch.equal(combined, projection.syn_weight[:projection.n_synapses])
 
 

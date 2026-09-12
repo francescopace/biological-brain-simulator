@@ -49,7 +49,8 @@ def test_quiet_region_still_checks_invalid_dead_presynaptic_endpoints():
     region.populate(4, connectivity=0.0)
     region.add_one_synapse(0, 1, 1.0)
     region.syn_pre[0], region.syn_alive[0] = 4, False
-    with pytest.raises(IndexError):
+    error = IndexError if region.v.device.type == "cpu" else RuntimeError
+    with pytest.raises(error, match="out of bounds"):
         region.step(1.0, 1)
 
 

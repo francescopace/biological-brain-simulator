@@ -129,6 +129,22 @@ The completed ABBA comparison at coupling 64 reduced median training time from 2
 
 The final suite passed with 590 tests and two device-dependent skips. It includes 46 preflight/gradient checks and 12 separate-arm audit checks.
 
+## MPS regression checks
+
+On the macOS 26.6.2 arm64 host with PyTorch 2.12.0, `torch.backends.mps.is_available()` returned false inside the sandbox and true outside it. Run GPU checks from a process with access to Metal:
+
+```bash
+BRAIN_DEVICE=mps python -m pytest -q -ra
+```
+
+The first full MPS-configured suite finished with 655 passed, 97 failed, four setup errors and one CUDA skip. Most failures came from restoring regional RNG state after moving it to MPS, requesting unsupported float64 tensors in diagnostics, or mixing CPU inputs with accelerator state. Some tests also assumed CPU-only event caches, NumPy views or exception classes.
+
+Checkpoint loading restores generator state from a CPU ByteTensor. Diagnostic reductions use CPU float64 while retaining the original order of subtraction and conversion; simulation state stays on its configured device. Batched synapse creation moves input tensors to the region's device, and memory replay and apoptosis align indices and masks with the tensors they access. Tests check CPU event caches and the accelerator fallback separately, retaining exact-state and continuation checks. Three additional regressions cover CPU float64 synapse inputs, mixed-device memory traces and diagnostic precision without source mutation.
+
+After these corrections, the full CPU-configured suite passed 758 tests in 36.57 seconds, with the two accelerator probes skipped inside the sandbox. The full MPS-configured suite passed 759 tests in 668.81 seconds outside it, skipping only CUDA. Neither run had failures or setup errors. Both collected the same 760 cases, including explicit CPU kernel reference tests. The 182 targeted MPS checks also passed. Reports are in `results/mps-validation.ZyNJLm/cpu-after-fixes.xml`, `mps-after-fixes.xml` and `targeted-after-fixes.xml`; `report.xml` records the original failures.
+
+These are software regression checks. They do not establish equal trajectories between CPU and MPS, GPU speedups, or new benchmark accuracy results. Test-suite elapsed times are not paired performance measurements. CPU remains the default backend.
+
 ## Learning controls after the dynamics correction
 
 The three-seed study was repeated with Heun integration and newly generated excitatory-only feedforward wiring. It retained 200 training images, 100 labelled readout images and the same 200 train-only validation images. Mean accuracies were:

@@ -188,7 +188,10 @@ def test_simulation_growth_edits_and_save_load_match_dense_path(monkeypatch, tmp
                 if step == 35:
                     cortex.syn_alive[:cortex.n_synapses:3] = False
                 if step == 45:
-                    cortex.syn_pre.numpy()[0] = 3
+                    if cortex.syn_pre.device.type == "cpu":
+                        cortex.syn_pre.numpy()[0] = 3
+                    else:
+                        cortex.syn_pre[0] = 3
                     cortex.syn_post.data[1] = 4
                     cortex.add_one_synapse(2, 4, weight=3.0, delay_ms=3.0)
                 model.stimulate("input", np.linspace(0.0, 1.0, 16))
@@ -197,7 +200,11 @@ def test_simulation_growth_edits_and_save_load_match_dense_path(monkeypatch, tmp
                 model.step()
         assert simulation_digest(models[0]) == simulation_digest(models[1])
     assert models[1].growth.history
-    assert models[1].regions["cortex"]._pre_events._endpoints is not None
+    cortex = models[1].regions["cortex"]
+    if cortex.syn_pre.device.type == "cpu":
+        assert cortex._pre_events._endpoints is not None
+    else:
+        assert cortex._pre_events._endpoints is None
     assert models[1].regions["cortex"].n_neurons > 16
     # Derived caches are not checkpoint state and are rebuilt on load/copy.
     saved = tmp_path / "brain"

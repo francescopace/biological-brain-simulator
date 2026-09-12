@@ -25,7 +25,8 @@ class TestPopulation:
         assert not torch.any(region.neuron_alive[region.n_neurons:])
 
     def test_initial_membrane_potential(self, region):
-        assert torch.allclose(region.v[:region.n_neurons], torch.full((20,), -65.0), atol=1.0)
+        assert torch.allclose(region.v[:region.n_neurons],
+                              torch.full_like(region.v[:region.n_neurons], -65.0), atol=1.0)
 
     def test_populate_respects_max_neurons(self):
         r = Region("small", RegionType.SENSORY, max_neurons=5)

@@ -72,8 +72,8 @@ def test_stronger_builder_changes_only_matched_weights_and_bounds(tiny_brain):
     assert simulation_digest(variant) == simulation_digest(built)
     assert simulation_digest(tiny_brain) == before
     cortex = built.regions["cortex"]
-    assert torch.equal(cortex.syn_weight[:4], torch.full((4,), 64.))
-    assert torch.equal(cortex.syn_max_weight[:4], torch.full((4,), 64.))
+    assert torch.equal(cortex.syn_weight[:4], torch.full_like(cortex.syn_weight[:4], 64.))
+    assert torch.equal(cortex.syn_max_weight[:4], torch.full_like(cortex.syn_max_weight[:4], 64.))
     assert torch.equal(cortex.syn_weight[4:], tiny_brain.regions["cortex"].syn_weight[4:])
 
 

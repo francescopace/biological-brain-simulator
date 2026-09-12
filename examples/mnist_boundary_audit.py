@@ -61,8 +61,8 @@ def audit(brain, images, *, train_steps, rest_steps, learning_rule="pair"):
             censored = censored_update(model, before, start)
             difference = weights - censored
             changed = int(torch.count_nonzero(difference))
-            row["observed_update_l1"] += float((weights - before).abs().double().sum())
-            row["pre_image_history_difference_l1"] += float(difference.abs().double().sum())
+            row["observed_update_l1"] += float((weights - before).abs().detach().cpu().double().sum())
+            row["pre_image_history_difference_l1"] += float(difference.abs().detach().cpu().double().sum())
             row["changed_weight_step_pairs"] += changed
             row["steps_with_history_effect"] += bool(changed)
         mn.normalize_feedforward_weights(model, norm_target)

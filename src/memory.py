@@ -76,7 +76,7 @@ class MemorySystem:
 
         for previous in reversed(self.traces):
             if previous.region_name == region.name:
-                if torch.equal(previous.neuron_indices, indices):
+                if torch.equal(previous.neuron_indices.to(indices.device), indices):
                     previous.activity_snapshot = region.activity[indices].clone()
                     return previous
                 break
@@ -121,11 +121,12 @@ class MemorySystem:
             if region is None:
                 continue
 
+            trace_indices = trace.neuron_indices.to(region.neuron_alive.device)
             valid = (
-                (trace.neuron_indices < region.n_neurons)
-                & region.neuron_alive[trace.neuron_indices]
+                (trace_indices < region.n_neurons)
+                & region.neuron_alive[trace_indices]
             )
-            live_idx = trace.neuron_indices[valid]
+            live_idx = trace_indices[valid]
             if len(live_idx) > 0:
                 region.current[live_idx] += self.replay_strength
 
