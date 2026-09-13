@@ -45,7 +45,9 @@ INTERPRETATION = (
     "and scheduler are not asserted to match Brian-1 trajectories. The grid uses "
     "Bernoulli Poisson draws, floored input delays, clamped refractory voltages, "
     "bounded divisive normalization and a fail-fast retry cap of ten. Silent readout "
-    "neurons are unassigned instead of assigned to digit zero. No defaults change."
+    "neurons are unassigned instead of assigned to digit zero. New plans pin "
+    "reference dynamics v2: eight complete internal steps per .5ms input interval "
+    "and integer refractory release ticks. Production Brain defaults are unchanged."
 )
 
 
@@ -157,7 +159,7 @@ def make_plan(source_root, output, seeds):
         "interpretation": INTERPRETATION,
         "preflight": {"path": "results/20260912-paper-triplet-normalized-preflight.json",
             "sha256": sha256(REPO / "results/20260912-paper-triplet-normalized-preflight.json"),
-            "finding": "Eight normalized initial-network training images: 117 spikes at dt=.5ms versus 109 at .25ms with matched input events. Counts and neuron identities are not grid-converged; this pilot uses the released demo's .5ms grid without claiming Brian equivalence."},
+            "finding": "Historical v1 preflight: eight normalized initial-network training images gave 117 spikes at dt=.5ms versus 109 at .25ms with matched input events. This does not validate v2. New v2 plans retain the .5ms input grid but integrate the full event and learning dynamics at .0625ms; MNIST convergence is still unmeasured."},
         "references": ["https://doi.org/10.3389/fncom.2015.00099",
             "https://github.com/peter-u-diehl/stdp-mnist/blob/master/Diehl%26Cook_spiking_MNIST.py",
             "https://github.com/peter-u-diehl/stdp-mnist/blob/master/Diehl%26Cook_MNIST_random_conn_generator.py"]}
@@ -193,7 +195,7 @@ def run_seed(output, seed):
     train, valid, data = dataset(study)
     assert array_digest(train, data.train_y) == plan["raw_train_sha256"]
     assert array_digest(valid, data.validation_y) == plan["raw_validation_sha256"]
-    models = {"initial": ReferenceNetwork(ReferenceConfig(**plan["reference_config"]), seed=seed)}
+    models = {"initial": ReferenceNetwork(ReferenceConfig.from_dict(plan["reference_config"]), seed=seed)}
     models["initial"].normalize()
     models["normalization_only"] = copy.deepcopy(models["initial"])
     models["stdp_normalized"] = copy.deepcopy(models["initial"])

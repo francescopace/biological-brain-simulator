@@ -406,6 +406,8 @@ BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_readout_subset_check summari
 
 ### Isolated conductance-LIF reference pilot
 
+The reference pilot, decoder studies and grid diagnostics below report historical v1 dynamics. New reference networks now default to [v2](#corrected-reference-dynamics-v2); none of these MNIST scores or training timings validates that version. Old checkpoint state remains loadable as v1, but source-pinned historical CLI plans require their archived source tree. Creating a new pilot plan with current code selects v2 and is a new experiment, not an exact rerun of this pilot.
+
 `examples.mnist_paper_reference` implements a separate NumPy conductance-LIF network using the equations and parameters of the [authors' released MNIST code](https://github.com/peter-u-diehl/stdp-mnist/blob/master/Diehl%26Cook_spiking_MNIST.py) and [connection generator](https://github.com/peter-u-diehl/stdp-mnist/blob/master/Diehl%26Cook_MNIST_random_conn_generator.py). That code uses triplet STDP. It is not the power-law variant associated with the paper's 87.0% result, and this implementation has not established trajectory equivalence with Brian 1. No production `src/` file, Iris setting or existing MNIST default is changed.
 
 The reference has 784 independent pixel-rate Poisson inputs, 400 excitatory and 400 inhibitory LIF cells, dense input connectivity, matched E→I connections and lateral inhibition excluding each matched excitatory cell. It uses the released demo's 0.5 ms grid, 350 ms presentations, 150 ms quiet periods, 100/10 ms excitatory/inhibitory membrane constants and a 10,000-second adaptive-threshold decay. Raw pixel values set the input rates; there is no L1 image equalization. Arrival and postsynaptic traces implement the demo's bounded triplet updates. Input columns are normalized before each training attempt, including the initial state used for comparison.
@@ -514,6 +516,222 @@ OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .ven
 ```
 
 The commands require the source pilot, exported decoder artifacts, archived historical-run evidence and its Git revision locally. Repeating the fixed plan reproduces the same cohort; it does not create another independent fresh evaluation. Results and checkpoints remain local under the ignored `/results/` directory. Iris, production defaults and the reference's timestep/integrator are unchanged, so this experiment does not resolve the numerical-equivalence questions identified above.
+
+### Frozen-inference timestep sensitivity
+
+On the 100-image diagnostic subset, the frozen combined STDP decoder scored 65.67%, 65.00% and 65.33% at 0.5, 0.25 and 0.125 ms respectively, with input exposure held fixed. This small net accuracy change does not imply unchanged responses: 8.67% of paired predictions differ between the coarsest and finest grids. The paired accuracy change is −0.33 percentage points, with a conditional 95% interval of −2.67 to +2.00. These subset scores do not replace the preceding 69.27% measurement on all 1,000 images.
+
+| Frozen decoder and network | 0.5 ms | 0.25 ms | 0.125 ms |
+| --- | ---: | ---: | ---: |
+| Joint, initial | 62.67% | 64.67% | 64.00% |
+| Joint, no STDP | 60.33% | 61.67% | 62.33% |
+| Joint, STDP | 65.67% | 65.00% | 65.33% |
+| Class-average spikes, no STDP | 29.67% | 29.00% | 32.67% |
+| Class-average spikes, STDP | 53.00% | 48.00% | 49.67% |
+
+The table uses `fixed_exposure` and averages three seeds on the same 100 images. STDP's combined-readout margin over the no-STDP control decreases from 5.33 to 3.00 points; the finest-grid interval is 0.00 to +6.33. Its margin over initialization is 1.33 points at the finest grid, with an interval of −1.67 to +4.67. The class-average spike benefit survives refinement: +17.00 points over no STDP at 0.125 ms, interval +11.00 to +23.00, positive in each seed. The combined-readout evidence remains much weaker than the spike-based learning effect.
+
+Spike responses remain sensitive to timestep. In the STDP condition, the mean total excitatory spikes per scored presentation decreases from 16.61 to 13.95 to 12.64, a 23.92% reduction from the coarsest to finest grid. Adjacent-grid spike-count L1 differences decrease from 74.78% to 58.09%, normalized by the source grid's total spike count; this measures count redistribution across neurons, not a percentage of missing spikes. Centered-voltage RMSE decreases from 0.331 to 0.219 mV. Despite these smaller differences, 29.67% of class-average predictions still change between 0.25 and 0.125 ms. The aggregate combined score is less sensitive than the underlying spike patterns; numerical convergence has not been established.
+
+Retry changes have a smaller effect on the combined decoder. At 0.125 ms, eight of the 300 STDP seed-image pairs produce fewer than five spikes under fixed exposure. The adaptive policy accepts a different attempt on ten pairs, with no exhausted budgets, and scores 65.00% rather than 65.33%. Total extra attempts increase from 14 at 0.5 ms to 20 at 0.125 ms. No condition or grid exhausts the retry cap.
+
+`examples.mnist_paper_grid_check` compares 0.5, 0.25 and 0.125 ms timesteps on the existing reference networks and frozen decoders. It uses 100 images, ten per digit, selected from the preceding 1,000-row cohort using seed 20260914. Selection depends only on labels and the declared random seed, not predictions. These are reused diagnostic images, not another fresh accuracy evaluation. All three network seeds and their initial, no-STDP and STDP conditions share the selected rows.
+
+The diagnostic generates the original 0.5 ms Bernoulli-Poisson tape for each image and attempt, then inserts empty timesteps to replay those events at identical physical times on finer grids. Integer input-delay indices are multiplied by the refinement factor, keeping physical delays unchanged. Presentation and rest durations, weights, theta, neuron assignments and every fitted decoder parameter stay fixed. No learning, theta adaptation, decoder refitting or hyperparameter selection occurs.
+
+Two retry policies distinguish changes in the neural response from changes in input exposure. The primary `fixed_exposure` policy runs the same number of attempts used by the original 0.5 ms evaluation and scores that final presentation on every grid, even if it produces fewer than five excitatory spikes. The secondary `adaptive_retry` policy scores each grid's first presentation with at least five spikes, retaining state between attempts as before. Both policies share the same trajectory until their scoring points differ. An exhausted adaptive retry budget is recorded as an abstention and counted as an error; the image is never dropped. The original runner would raise on such exhaustion.
+
+Before accepting results, both policies at 0.5 ms must reproduce the selected cached spike counts, mean voltages, attempt counts and all six decoder predictions exactly. The study pins the source cohort, prior summaries, response caches, checkpoints, decoder artifacts and source files in its plan. The summarizer checks hashes and replays predictions from each saved response. It reports paired accuracy changes, prediction disagreement, spike-count L1 differences, centered-voltage RMSE and retry effects. Conditional intervals use 5,000 within-digit image-bootstrap samples, keeping network seeds paired; they do not describe uncertainty across new training runs.
+
+All nine network/condition combinations completed; the three concurrent CPU workers took 150.8–151.9 seconds each. These are whole-diagnostic timings under concurrent load, with part of the test suite overlapping the run, not per-grid speed comparisons. All 900 coarse-grid responses and their 5,400 decoder predictions reproduce the earlier caches exactly under both retry policies. An independent NumPy calculation reproduced all 32,400 saved predictions across grids and policies. Source, checkpoint and decoder hashes remained unchanged. The 22 new tests cover coupled event timing, physical delays, frozen-state preservation, exact coarse replay, retry-policy separation, exhaustion, balanced selection, response metrics and worker/summary integration. The full CPU suite passed **894 tests with two accelerator probes skipped** in 46.59 seconds, recorded in `results/20260913-paper-grid-check-tests.xml`.
+
+The experiment directory is `results/20260913-paper-grid-check`, including the complete `summary.json`. To reproduce the protocol in a new directory:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_grid_check plan --output results/paper-grid-repeat
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_grid_check run --output results/paper-grid-repeat --seed 201
+# Repeat the run command for seeds 202 and 203, then summarize.
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_grid_check summarize --output results/paper-grid-repeat
+```
+
+The commands require the preceding fresh-evaluation artifacts and their source lineage locally. Plans and worker directories cannot be overwritten, and an interrupted worker has no resume support. Raw artifacts remain under the ignored `/results/` directory.
+
+This tests the timestep sensitivity of frozen inference, including threshold, refractory, recurrent-event and voltage-sampling discretization. The networks and decoder coefficients were fitted at 0.5 ms; the study does not test numerical convergence of STDP training, independent continuous-time Poisson input or equivalence to Brian or the published model. The finest grid is not ground truth, and no convergence tolerance is asserted. The following diagnostic examines timestep sensitivity during the first 50 training images; longer-training convergence remains untested. Iris, the production simulator and reference defaults remain unchanged.
+
+### Early-training timestep sensitivity
+
+After 50 training images, changing timestep alters the learned weight changes by an amount comparable to the learning signal itself. The STDP-minus-control weight L1 difference averages 0.399%, 0.349% and 0.327% of control weight at 0.5, 0.25 and 0.125 ms respectively. Between the two finest grids, the trained weights differ by 0.432% of source-grid weight, while their STDP-minus-control components differ by 124.13% of the source-grid learning component. The absolute weight difference is small, but it is not small relative to the early STDP effect. This does not measure an accuracy loss or improvement.
+
+| Training-grid comparison | Trained-weight L1 difference | Difference relative to learning component | Trained-theta RMSE |
+| --- | ---: | ---: | ---: |
+| 0.5 → 0.25 ms | 0.526% | 131.70% | 0.259 mV |
+| 0.25 → 0.125 ms | 0.432% | 124.13% | 0.223 mV |
+| 0.5 → 0.125 ms | 0.480% | 121.24% | 0.219 mV |
+
+Entries are arithmetic means of the three per-seed metrics after 50 images, not independent replications of each individual synapse. For the 0.25 → 0.125 ms comparison, the learning-component difference is 121.96%, 128.12% and 122.32% for seeds 201, 202 and 203. The adjacent-grid weight differences decrease with refinement, but remain large relative to the early learned component. These measurements do not establish convergence or identify the finest grid as correct.
+
+The common-grid probes also expose a contribution from adaptive thresholds. No-STDP weights, physical input delays and probe configurations match exactly across training grids; after transient reset, theta is the only differing parameter used by the probe. Nevertheless, the 0.25 → 0.125 ms training comparison gives a mean centered-voltage RMSE of 0.256 mV and a normalized spike-count L1 difference of 87.69% in that control. Threshold history alone therefore changes these responses. In the STDP arm, where both weights and theta differ, the corresponding measurements are 0.338 mV and 92.58%. This comparison does not separate the relative contributions of weights and theta within the STDP arm; the following frozen-swap experiment tests those response changes separately.
+
+`examples.mnist_paper_training_grid` compares early learning at 0.5, 0.25 and 0.125 ms, using the first 50 images of each original seed's 1,000-image training permutation. Seeds 201, 202 and 203 retain their original initialization and image order. Each timestep has a matched no-STDP arm, with normalization and adaptive theta active in both arms. The six arms within a seed receive identical input events and physical delays, including the original coarse STDP arm's retry count and intensity for every image. Fine grids do not choose extra attempts when their responses fall below the acceptance threshold.
+
+Training preserves electrical and trace state between presentations, through rest and across images. The initial checkpoint's below-rest membrane voltages are preserved when refining the grid; the transient reset used for independent inference would change the training protocol. Each arm normalizes weights before every attempt. The STDP arm learns during presentation and rest, while the control has learning disabled throughout. Both retain theta adaptation. The coarse pair must exactly reproduce the original run's accepted excitatory/inhibitory spike counts, control spike counts and retry decisions on all 50 images.
+
+The study records weight and theta differences after 10, 25 and 50 images. Weight L1 differences between trained grids are normalized by the source grid's total absolute weight. A separate ratio compares the difference between grids' STDP-minus-control weight changes with the size of that learning component on the source grid. This ratio can exceed 100%; it is not an error rate or an accuracy score. No-STDP weights must remain exactly equal across grids because they undergo the same normalization operations. Their theta values may differ because spiking activity differs.
+
+After training, the initial network and all six learned states respond to the same 20 probe images on a common 0.125 ms inference grid. The probe set contains two images per digit, selected with seed 20260915 from the preceding 100-image diagnostic subset; it is disjoint from the 1,000-row training pool but has already been inspected in earlier evaluations. Each probe uses the same coarse-grid Poisson events, one 350 ms presentation and 150 ms rest, frozen weights and theta, and transient reset per image. There are no retries or omitted low-activity images. The common inference grid separates the effect of learned weights and theta from a change in inference timestep. No classifier is fitted and no accuracy is calculated.
+
+The plan pins source files, original training records and checkpoints, input snapshots and probe IDs before execution. Final checkpoints contain the complete network state. The summarizer verifies checkpoint and probe-cache hashes and recomputes final weight/theta and probe metrics from the saved arrays. All 18 trained/control checkpoints completed, along with 420 probe responses. The coarse training pair exactly reproduced the original records for all 150 seed-image pairs. Seeds 201, 202 and 203 used 56, 58 and 54 presentation attempts respectively, with identical physical exposure in every arm of each seed. Two of the 150 fine-grid STDP final presentations fell below five spikes; both remained in the matched-exposure experiment.
+
+The three concurrent CPU workers completed in 87.4–90.4 seconds each, including probes and checkpoint verification. The test suite overlapped training, so these are diagnostic completion times, not isolated performance comparisons. A separate check reloaded every final checkpoint, verified physical exposure and delays, checked all coarse records, and exactly replayed two probes per state: 42 response replays including the initial networks. Source hashes and initial checkpoints stayed unchanged. The 14 new tests cover preservation of initial voltages, full-state coarse-training replay, zero-rate controls, fixed exposure, rejection of mismatched records, common-grid probes, retained silent rows and saved-artifact aggregation. The full CPU suite passed **908 tests with two accelerator probes skipped** in 43.39 seconds; its report is `results/20260913-paper-training-grid-tests.xml`.
+
+Artifacts, including the complete `summary.json`, remain local in `results/20260913-paper-training-grid` under the ignored `/results/` directory.
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_training_grid plan --output results/paper-training-grid-repeat
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_training_grid run --output results/paper-training-grid-repeat --seed 201
+# Repeat the run command for seeds 202 and 203, then summarize.
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_training_grid summarize --output results/paper-training-grid-repeat
+```
+
+These commands require the preceding inference diagnostic and its source lineage locally. Existing plans and worker directories cannot be overwritten; interrupted workers have no resume support. Fifty training images test only an early prefix, not convergence over 1,000 or 50,000 images. All grids retain coarse-quantized input events and delays, and the common 0.125 ms probe grid is not ground truth. The experiment does not establish equivalence to Brian or the paper, select a production timestep, change Iris or alter simulator defaults.
+
+### Frozen weight and threshold swaps
+
+Holding theta fixed does not remove response differences between the STDP training grids. In the primary 0.25 → 0.125 ms comparison, changing only the weights gives a mean normalized spike-count L1 difference of 134.82% and centered-voltage RMSE of 0.362 mV. Changing both weights and theta gives 92.58% and 0.338 mV. Thus the learned weight differences still affect responses when the theta vector at inference is held constant; theta at inference is not their sole cause. This does not exclude theta's earlier influence on weight learning.
+
+| STDP response change, 0.25 → 0.125 ms training grids | Spike-count L1 / baseline count | Centered-voltage RMSE |
+| --- | ---: | ---: |
+| Weights only, theta held at the 0.25 ms checkpoint | 134.82% | 0.362 mV |
+| Theta only, weights held at the 0.25 ms checkpoint | 131.71% | 0.279 mV |
+| Weights and theta together | 92.58% | 0.338 mV |
+| Factorial interaction | 223.36% | 0.436 mV |
+
+Entries are arithmetic means of the three per-seed response norms on the same 20 images. The spike percentages measure summed changes in per-neuron counts relative to the original response count, not accuracy loss, the fraction of erroneous spikes or shares of a causal effect. The weight-only spike differences exceed the joint differences in all three seeds. Holding theta at the other endpoint also leaves a large weight effect: 148.31% spike L1 and 0.344 mV voltage RMSE, using the same baseline denominator. The interaction is substantial; individual swaps do not predict the jointly changed response by simple addition. These results do not support fixing theta as a numerical remedy for the STDP network.
+
+The no-STDP control behaves differently. At fixed theta, all three weight sources produce exactly identical spikes and mean voltages for every probe and seed. Weight-only terms and interactions are exactly zero. Its joint 0.25 → 0.125 ms difference is fully reproduced by changing theta alone: 87.69% spike L1 and 0.256 mV voltage RMSE. This verifies the earlier inference that theta is the only differing probe parameter in that control, without extending that conclusion to the trained STDP weights.
+
+`examples.mnist_paper_theta_swap` separates the effects of weights and adaptive thresholds in the completed 50-image training diagnostic. For each seed and each STDP/no-STDP condition, it evaluates all nine combinations of weights and theta from the three training grids. Swaps stay within the same seed and condition. Theta is fixed to an existing learned vector during each probe, not removed or set to a newly selected value. No network is retrained and no classifier is fitted.
+
+The experiment reuses the same 20 balanced probe images, Poisson events, physical delays, 0.125 ms inference grid, single-presentation exposure and transient reset. Weights and theta remain frozen during inference, with no retries or omitted silent images. Every original weight/theta pairing must exactly replay its saved response. The no-STDP weights are identical across training grids, so every pairing with the same theta must also produce identical responses; this is checked on spike counts and mean voltages, not only summary norms.
+
+The primary comparison uses the 0.25 and 0.125 ms training checkpoints. Comparisons involving 0.5 ms are secondary. For each pair, let A be the source checkpoint's response, B the response after replacing only its weights, C the response after replacing only its theta, and D the response after replacing both. The report measures B−A, C−A and D−A, plus the interaction D−B−C+A. It also measures D−C and D−B, which test the weight and theta changes at the opposite endpoint. These signed response changes have an exact additive decomposition; their norms do not add and are not unique percentage shares of the joint effect.
+
+All spike L1 changes within a comparison use A's total spike count as the denominator. If A is entirely silent, that relative metric is undefined and the absolute change is retained. Centered-voltage RMSE removes the mean across neurons within each image. Results describe response sensitivity on these fixed, previously inspected images, not accuracy, independent training replications or evidence that a swapped network is better.
+
+The plan pins the 18 source checkpoints, original probes, images and source code before execution. The summarizer checks cache hashes, exact diagonal replay and fixed-theta control equality, then recomputes the factorial metrics from saved responses. All 54 parameter combinations completed, producing 1,080 responses; all 360 original-pairing responses exactly match their source caches. A separate check reconstructed the swaps from the saved checkpoints and replayed one image for each off-diagonal pairing, reproducing all 36 responses exactly. An independent contrast-matrix calculation verified all 108 spike-L1/voltage-RMSE contrast pairs. Source files and checkpoints remained unchanged.
+
+The three concurrent CPU workers took 78.6–79.4 seconds each, with the test suite overlapping the run; these are completion times, not isolated performance comparisons. The 12 new tests cover donor compatibility, source-state preservation, fixed-theta equality, signed factorial interactions, endpoint anchors, silent baselines, voltage centering, diagonal replay and worker/summary verification. The full CPU suite passed **920 tests with two accelerator probes skipped** in 41.14 seconds, recorded in `results/20260913-paper-theta-swap-tests.xml`. Artifacts, including the complete `summary.json`, remain under the ignored `/results/` directory in `results/20260913-paper-theta-swap`.
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_theta_swap plan --output results/paper-theta-swap-repeat
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_theta_swap run --output results/paper-theta-swap-repeat --seed 201
+# Repeat the run command for seeds 202 and 203, then summarize.
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_theta_swap summarize --output results/paper-theta-swap-repeat
+```
+
+The source training diagnostic and its earlier artifacts must be available locally. Existing plans and workers cannot be overwritten, and interrupted workers have no resume support. Swapping theta after training does not undo its influence on the weights learned during training, nor does it test training with theta adaptation disabled. The common probe grid is finite and the training prefix is short. This diagnostic does not establish convergence, identify a faulty equation or change Iris, the production simulator or any default.
+
+### Deterministic spike-timing and refractory audit
+
+`examples.mnist_paper_timing_check` distinguishes a refractory implementation defect from the reference's finite-grid timing errors. It explicitly selects historical v1 dynamics and uses isolated cells and a two-excitatory/two-inhibitory circuit with initial conductance pulses, no image dataset, no learning and frozen theta. The original audit made no model changes. The independent comparison integrates the frozen conductance equations with DOP853, locates threshold crossings as events, clamps voltage during the absolute refractory interval and delivers recurrence at each spike's timestamp.
+
+The recurrent test exposes a concrete route from timing error to a changed spike count. With initial excitatory conductances 80 and 35, the event-located solution fires the first excitatory cell at 0.327742 ms and its inhibitory partner at 0.843001 ms; the second excitatory cell is suppressed. The grid implementation produces:
+
+| Timing method | First inhibitory spike | Competing excitatory cell fires? |
+| --- | ---: | --- |
+| Event-located ODE | 0.843001 ms | No |
+| 0.5 ms grid | 1.5000 ms | Yes, at 1.5000 ms |
+| 0.25 ms grid | 1.2500 ms | Yes, at 1.2500 ms |
+| 0.125 ms grid | 1.0000 ms | No |
+| 0.0625 ms grid | 0.9375 ms | No |
+
+The first excitatory spike and its partner's inhibitory spike each acquire grid-timing error. At 0.25 ms, inhibition is delivered at the 1.25 ms boundary, after the competing cell has crossed threshold during the preceding interval. Step-by-step conductance checks confirm that recurrent delivery occurs at the boundary matching the emitted spike timestamp: there is no additional hidden transmission step. Agreement of spike counts at 0.125 ms in this example does not establish timing convergence; the first inhibitory spike remains about 0.157 ms later than the event-located result.
+
+Voltage integration error also matters near threshold. An isolated excitatory cell with initial conductance 25 crosses threshold at 2.393269 ms in the event-located solution, but first spikes at 3.0 ms on the 0.5 ms grid. This exceeds simple upward timestamp rounding, which would give 2.5 ms. In a separate unreset-voltage check at 2.5 ms, the high-accuracy solution is −51.893863 mV, above the −52 mV threshold; the 0.5 ms integration gives −52.011939 mV, still below it. Refining to 0.25, 0.125 and 0.0625 ms gives −51.923514, −51.901284 and −51.895718 mV. The smooth integration error decreases, but threshold detection turns a small voltage bias into a whole-step timing difference.
+
+There is also a reproducible decimal-grid refractory defect. The reference compares floating-point elapsed times with the refractory duration. Under a strong drive that forces a spike in the first unblocked interval, the expected inter-spike spacing is the refractory grid budget plus one integration interval. The dyadic 0.5, 0.25, 0.125 and 0.0625 ms grids meet that check exactly. At 0.2, 0.1 and 0.05 ms, rounding sometimes delays release by one extra step. For example, at 0.1 ms the release check subtracts a stored spike time of 20.500000000000004 ms from 25.5 ms and obtains 4.9999999999999964 ms, incorrectly retaining a 5 ms refractory block. Over the 40 ms test, excitatory/inhibitory interval mismatches number 1/1, 1/4 and 2/5 respectively. This defect does not explain the preceding MNIST differences, which used dyadic grids.
+
+The audit proposed integer grid accounting for refractory release and finer integration and threshold/event timing throughout the recurrent circuit. Relabelling an already-computed spike with an interpolated timestamp would not repair its downstream inhibition or learning history. These corrections were subsequently implemented in [reference v2](#corrected-reference-dynamics-v2), with separate checkpoint versions.
+
+The audit covers eleven deterministic pulse/circuit cases at four grids and seven strong-drive refractory grids. Each event-located case is repeated with tighter tolerances and a smaller integration step cap; per-cell counts match and the largest timestamp difference is below 2.1×10⁻¹⁴ ms. The oracle is also tested against the closed-form constant-conductance firing times and refractory intervals. Whole-chunk and one-step observation produce identical reference states. These checks support the toy comparison, not equivalence to Brian or a quantified explanation of the MNIST accuracy gap.
+
+The completed audit took 3.16 seconds on CPU. Its plan, source snapshots and results are in `results/20260913-paper-timing-check`, including `summary.json`. At that revision, the timing tests included 13 passing cases and three strict expected failures for the decimal-grid defect. The full CPU suite reported **933 passed, two accelerator probes skipped and three expected failures** in 38.97 seconds, recorded in `results/20260913-paper-timing-check-tests.xml`. A separate lineage check confirmed that the earlier experiment source files and all 18 learned checkpoints remained unchanged at audit completion.
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_timing_check --output results/paper-timing-repeat
+```
+
+The command uses the project's Python environment with SciPy but needs no MNIST cache or prior experiment artifacts. It refuses to overwrite an existing directory. Results remain under the ignored `/results/` directory. Running it still audits v1 without changing any checkpoint; no training, readout fitting or accuracy measurement is performed.
+
+### Corrected reference dynamics v2
+
+New `ReferenceConfig()` instances select `dynamics_version=2` and `integration_substeps=8`. The input grid remains `dt=0.5` ms: Poisson draws, initial weights, delay indices and physical input-arrival times are unchanged for a given seed. Each input interval now contains eight complete 0.0625 ms updates. Conductance and voltage integration, threshold detection, recurrent transmission, presynaptic and postsynaptic STDP, theta decay and spike-triggered adaptation all use that internal clock. External arrivals still occur only at their prescribed input-grid boundaries. This is finer fixed-step integration, not an event-root solver or a claim of Brian equivalence.
+
+Refractory release uses integer internal-tick deadlines for both populations, independently of the millisecond timestamps retained for STDP. Release occurs after exactly the configured refractory budget, without subtracting decimal floating-point spike times. Under the strong-drive test, the next spike occurs one integration interval after release. Tests cover seven input grids with both one and eight substeps: all fourteen configurations have zero incorrect refractory intervals.
+
+The deterministic v2 check compares eleven initial-pulse cases with v1 and the independent event-located ODE solution. V2 agrees with the oracle's per-cell spike counts in all eleven cases; its largest spike-time error is 0.099691 ms. In the 80/35 competition case, the extra excitatory spike disappears and the first inhibitory spike moves from 1.5 to 0.9375 ms, versus 0.843001 ms for the oracle. For isolated excitatory conductance 25, the first spike moves from 3.0 to 2.4375 ms, versus 2.393269 ms. The unreset voltage error at 2.5 ms falls from about 0.1181 to 0.00186 mV. These measurements verify the reproduced numerical problems; they do not establish convergence on MNIST.
+
+Substep tests also compare v2 bit-for-bit with an explicitly lifted fine-grid simulation, preserving every input event and physical delay. Both dyadic and decimal grids are checked, with learning and theta adaptation independently enabled and disabled. Counts, voltage features, weights, traces, conductances and integer release deadlines match. Checkpoint/resume and split-call tests retain queued arrivals and refractory state exactly, including recurrent events across call boundaries. Multiple spikes within a single outer input interval are counted separately.
+
+Checkpoint envelope version 2 stores the new configuration and release arrays. Loading an unversioned configuration through `ReferenceConfig.from_dict`, or loading a version-1 checkpoint, explicitly selects v1 with one substep; its original state hashes and dynamics are preserved, including the known historical refractory defect. Golden-state tests cover a legacy decimal-grid trajectory with delays and learning. An additional read-only comparison loaded seed 201's initial, no-STDP and 1,000-image STDP checkpoints with both the archived implementation and current loader, then reproduced a short continuation exactly. No existing checkpoint was rewritten or automatically converted.
+
+Old source-pinned experiment plans intentionally reject the modified source files. Replaying those plans requires their archived sources, not replacing their recorded hashes. The historical grid-study runners reject v2 inputs because their integration-grid labels assume one update per input step. A new v2 grid study needs an explicit substep-aware protocol. New pilot plans do record v2; previous decoder parameters and response caches must not be presented as v2 measurements. Mean-voltage features now average all internal endpoint samples, so that readout input has changed too.
+
+The completed deterministic check took 3.23 seconds on CPU; its plan, source snapshots and results are in `results/20260913-paper-dynamics-v2-check`. The final full CPU suite passed **972 tests**, with two accelerator probes skipped and no expected failures, in 42.43 seconds (`results/20260913-paper-dynamics-v2-final-tests.xml`). The former expected failures now explicitly characterize v1's retained defect; separate v2 tests require exact release. Run the deterministic comparison without MNIST data or training:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_dynamics_check --output results/paper-dynamics-v2-repeat
+```
+
+The 69.27% fresh-validation result remains a historical v1 score. This deterministic validation launched no MNIST training, readout fitting or accuracy evaluation. Eight internal steps increase simulation work. The following short study measures their cost and early-training sensitivity; Iris and the production `src/` simulator are unchanged.
+
+### Matched v1/v2 early-training check
+
+The 50-image comparison completed for all three seeds. V1 exactly reproduced both historical final checkpoint states per seed, but halving v2's internal step still changed its learned state and neuron-level responses substantially. The similar total spike counts at the two v2 resolutions do not establish stable activity patterns or an accuracy improvement. The 1,000-image pilot was not launched.
+
+`examples.mnist_paper_version_check` compares historical v1 with corrected v2 at 0.0625 ms and half-step v2 at 0.03125 ms. The input grid remains 0.5 ms in every condition. Each seed, 201–203, starts from its original normalized checkpoint, including the below-rest initial voltages, and replays its first 50 training images. The original v1 STDP arm fixes every retry: 56, 58 and 54 presentations respectively. All versions and no-STDP controls receive the same input events, physical delays, normalization operations and simulated duration. Theta adapts in both arms, and STDP remains active during rest in the trained arm. The finer versions do not choose their own exposure.
+
+The primary numerical comparison is v2 against half-step v2. Weight and theta diagnostics are saved at 10, 25 and 50 images. Training responses retain each neuron's spike count and mean voltage on the final prescribed attempt, including attempts below the usual minimum spike count. These voltage features use each version's own internal sampling grid. After training, the six learned states per seed are probed on the same 20 reused, class-balanced images at one common v2 0.03125 ms grid. Weights and theta are frozen; transient state resets before each image; there are no retries or omitted silent rows. The common-grid responses compare learned weights and theta without also changing the inference integrator. No classifier or accuracy metric is computed.
+
+The plan verifies historical code against archived source snapshots while separately pinning the current runner and reference. It does not replace old hashes or require historical source files to match the modified working tree. V1 must reproduce every original retry decision and accepted spike count, then match both complete 50-image checkpoint state hashes. Summarization reloads all new checkpoints and response caches and recomputes the final metrics. Existing inputs and checkpoints remain read-only; new output directories cannot be overwritten, and interrupted workers do not support CLI resume.
+
+Each worker records elapsed and process CPU time separately for every version/learning arm. The measured region includes normalization, presentation and rest, but excludes tape generation, diagnostics and checkpoint writes. Versions are interleaved within each image and the three seed workers may run concurrently. These measurements describe this short comparison, not isolated throughput or the cost of a 1,000-image run.
+
+The following metrics average the three seeds in the STDP arm. Spike distance is the L1 difference between per-neuron counts divided by the source model's total spike count, not a percentage of wrong classifications. The learning-component distance compares `W_STDP − W_control` between versions and divides by the source component's L1 norm.
+
+| Change after 50 training images | V1 → v2 | V2 → half-step v2 (primary) |
+| --- | ---: | ---: |
+| Weight L1 / source total weight | 0.4550% | 0.3194% |
+| Learning-component relative L1 | 114.57% | 102.80% |
+| Theta RMSE | 0.222 mV | 0.133 mV |
+| Common-probe spike distance | 98.42% | 78.40% |
+| Common-probe centered-voltage RMSE | 0.301 mV | 0.253 mV |
+| Exactly matching common-probe spike vectors | 0/60 | 5/60 |
+
+The v2-to-half-step weight distance is small compared with all incoming weights, but similar in size to the STDP-induced change itself: the trained/control weight distance averages 0.3093% for v2 and 0.3099% for half-step v2. The primary learning-component distance ranges from 87.45% to 112.97% across seeds; common-probe spike distance ranges from 70.98% to 84.72%. Meanwhile, total common-probe activity averages 11.533 and 11.517 excitatory spikes per image. Thus a nearly unchanged population count hides a redistribution across neurons.
+
+No-STDP weights are exactly identical across all versions. Its primary common-probe spike distance is still 78.92%, with centered-voltage RMSE 0.216 mV; with the electrical state reset and inference dynamics matched, those control differences come from learned theta. This does not assign a causal share to theta in the STDP arm, where weights and theta both change and interact.
+
+On the final prescribed training attempts, STDP activity averages 15.33 spikes per image in v1, 11.82 in v2 and 11.47 in half-step v2. V2 and half-step v2 finish below the usual five-spike minimum on 4/150 and 5/150 image/seed cases, respectively. Those responses are retained without extra retries so exposure remains matched; they are not discarded as failed samples.
+
+| Version | Internal step | Mean process CPU time for both training arms, 50 images/seed | Relative to v1 |
+| --- | ---: | ---: | ---: |
+| V1 | 0.5 ms | 11.47 s | 1.00× |
+| V2 | 0.0625 ms | 36.64 s | 3.19× |
+| Half-step v2 | 0.03125 ms | 65.56 s | 5.72× |
+
+Halving the v2 step costs another 1.79× in this measurement. Each worker's full training comparison took 112.5–118.8 seconds elapsed; probes took another 51.4–52.4 seconds. The three workers ran concurrently and completed in 166.2–171.5 seconds each, including checkpointing and verification. No long-run timing extrapolation was tested.
+
+The run produced 18 final checkpoints, 900 final-attempt training responses and 360 common-grid probe responses. Summarization reloaded the checkpoints and recomputed the metrics from saved arrays. An additional check independently recomputed all 36 response-contrast metric sets and exactly replayed one probe from each of the 18 checkpoints. Source and input hashes were unchanged. The full CPU suite passed **988 tests**, with two accelerator probes skipped, in 43.50 seconds before the workers started (`results/20260913-paper-version-tests.xml`).
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_version_check plan --output results/paper-version-repeat
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_version_check run --output results/paper-version-repeat --seed 201
+# Repeat run for seeds 202 and 203, then summarize.
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 MKL_NUM_THREADS=1 BRAIN_DEVICE=cpu .venv/bin/python -m examples.mnist_paper_version_check summarize --output results/paper-version-repeat
+```
+
+The default source is `results/20260913-paper-training-grid`, whose local image cache and checkpoint lineage must be available. The completed run is `results/20260913-paper-version-check`, including `plan.json`, `summary.json`, source snapshots and `verification.json`. These results do not demonstrate early-training convergence; they also do not show that v2 has worse classification accuracy, which was not measured. A next diagnostic should locate the first divergence on matched MNIST input and distinguish residual event-timing error from sensitivity of recurrent competition and theta. The study has no accuracy-based selection or declared numerical pass threshold; the half-step grid is finite, not ground truth. It does not trigger the 1,000-image pilot automatically.
 
 ## Completed pre-correction full MNIST run
 

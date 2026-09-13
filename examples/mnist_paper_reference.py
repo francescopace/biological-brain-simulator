@@ -59,8 +59,34 @@ class ReferenceConfig:
     eta_post: float = .01
     min_spikes: int = 5
     max_attempts: int = 10
+    dynamics_version: int = 2
+    integration_substeps: int = 8
+
+    @classmethod
+    def from_dict(cls, values):
+        """Unversioned historical protocols always select the original dynamics."""
+        values = dict(values)
+        if "dynamics_version" not in values:
+            if "integration_substeps" in values:
+                raise ValueError("Substeps require an explicit dynamics version")
+            values.update(dynamics_version=1, integration_substeps=1)
+        return cls(**values)
+
+    def state_config(self):
+        """Keep the original v1 checkpoint schema and state hashes unchanged."""
+        values = asdict(self)
+        if self.dynamics_version == 1:
+            values.pop("dynamics_version")
+            values.pop("integration_substeps")
+        return values
 
     def validate(self):
+        if type(self.dynamics_version) is not int or self.dynamics_version not in (1, 2):
+            raise ValueError("Unsupported dynamics version")
+        if type(self.integration_substeps) is not int or self.integration_substeps < 1:
+            raise ValueError("integration_substeps must be a positive integer")
+        if self.dynamics_version == 1 and self.integration_substeps != 1:
+            raise ValueError("Legacy dynamics require one integration substep")
         for name in ("n_input", "n_exc", "min_spikes", "max_attempts"):
             if type(getattr(self, name)) is not int or getattr(self, name) < 1:
                 raise ValueError(f"{name} must be a positive integer")
@@ -143,9 +169,14 @@ class ReferenceNetwork:
         self.pending_i = np.zeros(c.n_exc, dtype=bool)
         self.pending_times = np.empty(0, dtype=np.int64)
         self.pending_synapses = np.empty(0, dtype=np.int64)
+        if c.dynamics_version == 2:
+            # Integer release deadlines, in internal integration ticks. These
+            # are separate from the millisecond timestamps used by STDP.
+            self.release_e = np.zeros(c.n_exc, dtype=np.int64)
+            self.release_i = np.zeros(c.n_exc, dtype=np.int64)
 
     def state_digest(self):
-        digest = hashlib.sha256(json.dumps(asdict(self.config), sort_keys=True).encode())
+        digest = hashlib.sha256(json.dumps(self.config.state_config(), sort_keys=True).encode())
         digest.update(str(self.step_count).encode())
         for name, value in sorted(vars(self).items()):
             if isinstance(value, np.ndarray):
@@ -204,8 +235,12 @@ class ReferenceNetwork:
 
         At a grid boundary: recurrent and external arrivals, presynaptic STDP,
         voltage/conductance integration, threshold/reset, postsynaptic STDP.
-        Recurrent spikes affect the next grid boundary. Refractory voltage is
-        clamped to reset; conductances continue decaying. Rest retains all state.
+        In v2 this entire sequence runs on dt/integration_substeps, including
+        recurrence, STDP and theta. Input tapes, delays, pending arrival times
+        and step_count retain their outer dt units. Voltage features average
+        all internal endpoint samples. Calls finish only at outer boundaries.
+        V1 preserves the original single-step dynamics for historical replay.
+        Refractory voltage is clamped to reset; conductances keep decaying.
         """
         tape = np.asarray(tape)
         if tape.ndim != 2 or tape.shape[1] != self.config.n_input or tape.dtype != bool or not len(tape):
@@ -214,38 +249,54 @@ class ReferenceNetwork:
         synapses, bounds = self._events(tape)
         counts_e, counts_i = np.zeros(c.n_exc, dtype=np.int32), np.zeros(c.n_exc, dtype=np.int32)
         voltage_sum = np.zeros(c.n_exc)
-        for i in range(len(tape)):
-            now = self.step_count * c.dt
+        substeps = c.integration_substeps
+        dt = c.dt / substeps
+        refractory_e = round(c.refractory_e / dt)
+        refractory_i = round(c.refractory_i / dt)
+        for internal in range(len(tape) * substeps):
+            i, substep = divmod(internal, substeps)
+            tick = self.step_count * substeps + substep
+            now = self.step_count * c.dt if c.dynamics_version == 1 else tick * dt
             self.ge_i += self.pending_e * c.exc_to_inh
             self.gi_e += (self.pending_i.sum() - self.pending_i.astype(np.int64)) * c.inh_to_exc
-            self.triplet_pre(synapses[bounds[i]:bounds[i + 1]], now, learn=learn)
+            if substep == 0:
+                self.triplet_pre(synapses[bounds[i]:bounds[i + 1]], now, learn=learn)
             if adapt:
-                self.theta *= math.exp(-c.dt / c.theta_tau)
+                self.theta *= math.exp(-dt / c.theta_tau)
             self.v_e, self.ge_e, self.gi_e = conductance_step(self.v_e, self.ge_e, self.gi_e,
-                dt=c.dt, tau=c.tau_e, rest=c.rest_e, reversal_e=c.reversal_e,
+                dt=dt, tau=c.tau_e, rest=c.rest_e, reversal_e=c.reversal_e,
                 reversal_i=c.reversal_ie, tau_ge=c.tau_ge, tau_gi=c.tau_gi)
             self.v_i, self.ge_i, self.gi_i = conductance_step(self.v_i, self.ge_i, self.gi_i,
-                dt=c.dt, tau=c.tau_i, rest=c.rest_i, reversal_e=c.reversal_e,
+                dt=dt, tau=c.tau_i, rest=c.rest_i, reversal_e=c.reversal_e,
                 reversal_i=c.reversal_ii, tau_ge=c.tau_ge, tau_gi=c.tau_gi)
             # A spike is timestamped at this interval's end.
-            end = now + c.dt
-            blocked_e = now - self.last_post < c.refractory_e
-            blocked_i = now - self.last_inh < c.refractory_i
+            if c.dynamics_version == 1:
+                end = now + dt
+                blocked_e = now - self.last_post < c.refractory_e
+                blocked_i = now - self.last_inh < c.refractory_i
+            else:
+                end = (tick + 1) * dt
+                blocked_e = tick < self.release_e
+                blocked_i = tick < self.release_i
             self.v_e[blocked_e], self.v_i[blocked_i] = c.reset_e, c.reset_i
             self.pending_e = (~blocked_e) & (self.v_e > c.threshold_e + self.theta - c.theta_offset)
             self.pending_i = (~blocked_i) & (self.v_i > c.threshold_i)
             self.v_e[self.pending_e], self.v_i[self.pending_i] = c.reset_e, c.reset_i
             self.triplet_post(self.pending_e, end, learn=learn)
             self.last_inh[self.pending_i] = end
+            if c.dynamics_version == 2:
+                self.release_e[self.pending_e] = tick + 1 + refractory_e
+                self.release_i[self.pending_i] = tick + 1 + refractory_i
             if adapt:
                 self.theta[self.pending_e] += c.theta_plus
             counts_e += self.pending_e
             counts_i += self.pending_i
             voltage_sum += self.v_e
-            self.step_count += 1
+            if substep == substeps - 1:
+                self.step_count += 1
         if not np.isfinite(self.v_e).all() or not np.isfinite(self.weights).all():
             raise FloatingPointError("Nonfinite reference state")
-        return counts_e, counts_i, voltage_sum / len(tape)
+        return counts_e, counts_i, voltage_sum / (len(tape) * substeps)
 
     def rest(self, *, learn=False, adapt=False):
         steps = round(self.config.rest_ms / self.config.dt)
@@ -263,7 +314,7 @@ class ReferenceNetwork:
             staged.mkdir()
             arrays = {k: v for k, v in vars(self).items() if isinstance(v, np.ndarray)}
             np.savez_compressed(staged / "arrays.npz", **arrays)
-            envelope = {"version": 1, "config": asdict(self.config), "step_count": self.step_count,
+            envelope = {"version": self.config.dynamics_version, "config": self.config.state_config(), "step_count": self.step_count,
                 "state_sha256": self.state_digest(), "metadata": metadata,
                 "arrays_sha256": hashlib.sha256((staged / "arrays.npz").read_bytes()).hexdigest()}
             (staged / "metadata.json").write_text(json.dumps(envelope, indent=2, allow_nan=False) + "\n")
@@ -275,11 +326,13 @@ class ReferenceNetwork:
     def load(cls, path, expected_metadata):
         path = Path(path)
         envelope = json.loads((path / "metadata.json").read_text())
-        if envelope["version"] != 1 or envelope["metadata"] != expected_metadata:
+        if envelope["version"] not in (1, 2) or envelope["metadata"] != expected_metadata:
             raise ValueError("Reference checkpoint protocol mismatch")
         if hashlib.sha256((path / "arrays.npz").read_bytes()).hexdigest() != envelope["arrays_sha256"]:
             raise ValueError("Reference checkpoint integrity mismatch")
-        network = cls(ReferenceConfig(**envelope["config"]))
+        network = cls(ReferenceConfig.from_dict(envelope["config"]))
+        if network.config.dynamics_version != envelope["version"]:
+            raise ValueError("Reference checkpoint dynamics version mismatch")
         with np.load(path / "arrays.npz", allow_pickle=False) as arrays:
             expected = {k for k, v in vars(network).items() if isinstance(v, np.ndarray)}
             if set(arrays.files) != expected:

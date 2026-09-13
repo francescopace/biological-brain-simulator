@@ -145,7 +145,7 @@ def test_inhibitory_partner_is_recruited_and_excludes_its_paired_exc_cell():
 
 
 def test_refractory_prevents_immediate_refiring():
-    network = ReferenceNetwork(small())
+    network = ReferenceNetwork(small(integration_substeps=1))
     network.reset_transients()
     network.ge_e[:] = 10000.
     tape = np.zeros((1, 8), dtype=bool)
